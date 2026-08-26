@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mt-quality-baseline"
+version = "0.1.0"
+description = "Measure terminology adherence and glossary violation rate for the post-mt pipeline."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+
+dependencies = [
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Only needed to reach an AWS-managed OpenSearch/Elasticsearch domain, which rejects basic auth.
+aws = ["botocore>=1.34"]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+mt-quality-baseline = "sourcecode.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sourcecode"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
