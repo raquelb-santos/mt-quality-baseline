@@ -1,6 +1,4 @@
-"""Client for the post-mt async workflow API (``/api/workflow/async``)."""
-
-from __future__ import annotations
+"""Clients for the post-mt async workflow API (``/api/workflow/async``) and for Stanza."""
 
 import logging
 import time
@@ -13,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def extract_post_edited(segment: dict[str, Any]) -> str:
-    """The ``target_content`` fallback leaves a FAILED APE indistinguishable from an untouched segment; only :func:`segment_error` separates them."""
+    """The fallback makes a failed APE look untouched; `segment_error` tells them apart."""
     ape_results = segment.get("ape_results") or {}
     return ape_results.get("text") or segment.get("aped_text") or segment.get("target_content") or ""
 
@@ -25,7 +23,7 @@ def reported_has_glossary(segment: dict[str, Any]) -> bool | None:
 
 
 def segment_error(segment: dict[str, Any]) -> str | None:
-    """Errors are per segment, not per task: ``task["error"]`` stays null and the status stays "done"."""
+    """Errors are per segment, not per task: ``task["error"]`` stays null and the status "done"."""
     for key in ("ape_results", "aqe_results"):
         error = (segment.get(key) or {}).get("error")
         if error:
@@ -40,15 +38,19 @@ class PostMtError(RuntimeError):
 SUPPORTED_CAT_TOOLS = {"memsource", "phrase", "xtm"}
 
 
+def preflight_submission(parameters: dict[str, Any]) -> list[str]:
+    """Reasons post-mt would reject the task outright, whatever is being measured."""
+    return [
+        f"`{name}` is missing — post-mt rejects every segment with "
+        f"'Missing required parameters fields: {name}' and returns no post-edited text"
+        for name in ("tempo_task_id", "cat_project_id")
+        if not str(parameters.get(name) or "").strip()
+    ]
+
+
 def preflight_parameters(parameters: dict[str, Any]) -> list[str]:
     """Reasons post-mt would reject the task or silently retrieve no glossary, at full LLM cost."""
-    problems: list[str] = []
-
-    if not str(parameters.get("tempo_task_id") or "").strip():
-        problems.append(
-            "`tempo_task_id` is missing — post-mt rejects every segment with "
-            "'Missing required parameters fields: tempo_task_id' and returns no post-edited text"
-        )
+    problems = preflight_submission(parameters)
 
     provider = str(parameters.get("cat_tool_provider") or "").strip()
     if not provider:
@@ -62,10 +64,15 @@ def preflight_parameters(parameters: dict[str, Any]) -> list[str]:
     if not str(parameters.get("ecosystem_id") or "").strip():
         problems.append("`ecosystem_id` is missing or empty — post-mt skips glossary retrieval entirely")
 
-    if not str(parameters.get("cat_project_id") or "").strip():
-        problems.append("`cat_project_id` is missing — post-mt cannot look up term bases")
-
     return problems
+
+
+def raise_for_preflight(problems: list[str], message: str) -> None:
+    """Log every problem, then stop the run with the one line saying what it would have cost."""
+    if problems:
+        for problem in problems:
+            logger.error("[PREFLIGHT] %s", problem)
+        raise RuntimeError(message)
 
 
 @dataclass(frozen=True)
@@ -75,7 +82,7 @@ class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
-    def __add__(self, other: "Usage") -> "Usage":
+    def __add__(self, other: Usage) -> Usage:
         return Usage(
             self.cost + other.cost,
             self.tokens + other.tokens,
@@ -84,7 +91,7 @@ class Usage:
         )
 
     @classmethod
-    def from_task(cls, task: dict[str, Any]) -> "Usage":
+    def from_task(cls, task: dict[str, Any]) -> Usage:
         return cls(
             cost=float(task.get("totalCost") or 0),
             tokens=int(task.get("totalTokens") or 0),
@@ -109,9 +116,11 @@ class PostMtClient:
         timeout: float = 1800.0,
         api_key: str | None = None,
     ) -> None:
-        headers = {"X-API-KEY": api_key} if api_key else {}
-
-        self._client = httpx.Client(base_url=base_url.rstrip("/"), timeout=120.0, headers=headers)
+        self._client = httpx.Client(
+            base_url=base_url.rstrip("/"),
+            timeout=120.0,
+            headers={"X-API-KEY": api_key} if api_key else {},
+        )
         self.base_url = base_url
         self.poll_interval = poll_interval
         self.timeout = timeout
@@ -156,8 +165,10 @@ class PostMtClient:
     def submit(
         self, *, parameters: dict[str, Any], steps: Sequence[str], segments: Sequence[dict[str, Any]]
     ) -> str:
-        payload = {"parameters": parameters, "steps": list(steps), "segments": list(segments)}
-        response = self._client.post("/api/workflow/async", json=payload)
+        response = self._client.post(
+            "/api/workflow/async",
+            json={"parameters": parameters, "steps": list(steps), "segments": list(segments)},
+        )
         response.raise_for_status()
         task_id = response.json().get("taskId")
         if not task_id:
@@ -185,9 +196,8 @@ class PostMtClient:
         while time.monotonic() < deadline:
             status_body = self.get_status(task_id)
             status = status_body.get("status")
-            progress = status_body.get("progress") or {}
 
-            percent = progress.get("percent")
+            percent = (status_body.get("progress") or {}).get("percent")
             if percent is not None and percent != last_percent:
                 last_percent = percent
                 if on_progress:
@@ -244,6 +254,38 @@ class PostMtClient:
         if usage.cost:
             logger.info("[POST-MT] task %s cost $%.4f (%s tokens)", task_id, usage.cost, f"{usage.tokens:,}")
 
-        return RunResult(
-            task_id=task_id, segments=task.get("segments") or [], error=error, usage=usage
-        )
+        return RunResult(task_id=task_id, segments=task.get("segments") or [], error=error, usage=usage)
+
+
+class StanzaClient:
+    def __init__(self, base_url: str, timeout: float = 120.0) -> None:
+        self._client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
+
+    def close(self) -> None:
+        self._client.close()
+
+    def lemmatize_batch(self, texts: list[str], language: str) -> list[str]:
+        if not texts:
+            return []
+        response = self._client.post("/lemmatize/batch", json={"texts": texts, "language": language})
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            return payload.get("lemmatized_texts") or []
+        return payload or []
+
+    def lemmatize_batch_safe(self, texts: list[str], language: str) -> list[str] | None:
+        try:
+            lemmas = self.lemmatize_batch(texts, language)
+        except (httpx.HTTPError, ValueError) as error:
+            logger.warning("[STANZA] lemmatization unavailable for %s: %s", language, error)
+            return None
+
+        if len(lemmas) != len(texts):
+            logger.warning(
+                "[STANZA] returned %d lemmas for %d texts (%s) - ignoring",
+                len(lemmas), len(texts), language,
+            )
+            return None
+
+        return lemmas

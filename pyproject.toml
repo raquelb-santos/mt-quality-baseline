@@ -5,9 +5,9 @@ build-backend = "hatchling.build"
 [project]
 name = "mt-quality-baseline"
 version = "0.1.0"
-description = "Measure terminology adherence and glossary violation rate for the post-mt pipeline."
+description = "Benchmark the translation quality of the post-mt pipeline."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 license = { text = "Proprietary" }
 
 dependencies = [
@@ -23,7 +23,7 @@ dev = [
 ]
 
 [project.scripts]
-mt-quality-baseline = "sourcecode.cli:main"
+mt-quality-baseline = "sourcecode.run:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["sourcecode"]

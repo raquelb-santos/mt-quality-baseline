@@ -3,158 +3,214 @@
 Benchmarks the translation quality of the `post-mt` pipeline.
 
 A run takes segments with their source, their raw MT and the human translation delivered for them,
-sends them through post-mt, and scores two versions of every segment against one or more **quality
-components**:
+sends them through post-mt, and scores the translation against the human reference.
 
-* the **MT baseline** post-mt was given,
+| Name    | The text                                                    |
+| ------- | ----------------------------------------------------------- |
+| **SRC** | the source-language original that was sent to MT            |
+| **MT**  | the raw machine translation, the baseline post-mt was given |
+| **APE** | the post-edited output post-mt returned                     |
+| **REV** | the reverted output the DNT service returned (DNT only)     |
+| **REF** | the human translation delivered for the segment             |
 
-* the **post-edited output** it returned.
+Two components are implemented:
 
-Both are scored **against the human reference for the same segment**.
+**Terminology adherence** — how often each version uses the glossary terms the human used. **MT**
+and **APE** are both scored against **REF**.
 
-A run reports:
+**DNT preservation** — how often each version keeps the items that must not be translated. **APE**
+is sent to the DNT service's **revert endpoint**, which returns both the items it weighed in a
+segment and **REV**. **MT**, **APE** and **REV** are each scored against **REF**.
 
-* **the score for each version**, and the **delta** post-editing moved it by
-
-* **repairs and regressions** — what post-editing fixed, and what it broke
-
-* **a per-term worklist**, worst first, so a number traces back to the terms that produced it
-
-* **pooling by stratum** when a run covers several datasets
-
-## Components
-
-| Component                                       | Measures                                                        | Status      |
-| ----------------------------------------------- | --------------------------------------------------------------- | ----------- |
-| [Terminology adherence](#terminology-adherence) | how much of the glossary the human used each version reproduced | implemented |
-
-**Each component has its own dataset**. One run measures one component.
+It reports each version's score and the **delta** from post-editing, **repairs and regressions**, a
+worst-first **per-item worklist** tracing numbers back to segments, and **pooling by stratum**
+across datasets.
 
 ## Quick start
 
-Terminology reads the glossary from the term-bases index post-mt itself queries, so a run needs
+Terminology reads the glossary from the term-bases index post-mt itself queries, so it needs
 `SEARCH_ENGINE_URL` (and AWS SigV4 for the dev domain) in a `.env`.
 
-```bash
-# scores BENCH_DATASET, post-editing each segment through post-mt
-python sourcecode/cli.py
+DNT gets its items from the DNT service, so
+it needs `DNT_BASE_URL` and `DNT_API_KEY`.
 
-# the same, but scores the MT baseline only — never calls post-mt, so it costs nothing
-python sourcecode/cli.py --dry-run
+```bash
+# scores the configured dataset, post-editing each segment through post-mt
+python sourcecode/run.py
+
+# the same, but scores MT only — never calls post-mt
+python sourcecode/run.py --dry-run
 ```
 
 `pip install -e .` also puts the same entry point on the path as `mt-quality-baseline`.
 
-What gets scored is configured in `.env`, as `BENCH_DATASET`. A run prints its report and
-writes nothing: the numbers belong to the run that produced them.
+What a run scores is configured in `.env`, as `GLOSSARY_PATH` and `DNT_PATH`. Each may name a single
+dataset file (`.json`, `.csv`, `.mxliff`, `.xliff`, `.xlf`) or a folder of them; a CSV or XLIFF
+needs a `<name>.params.json` beside it giving its own `parameters`, `glossary_ids` and `steps`.
+Components are configured separately because pooling adds counts within a stratum.
 
-`BENCH_DATASET` may name a single dataset file, or a folder — a folder contributes every
-`.json` / `.csv` / `.mxliff` directly inside it, scored in one run and pooled by stratum.  If the files don't state which term bases they apply to, those
-ids have to be supplied with the `--glossary-ids` flag, along with the language pair the file also
-cannot state:
-
-```bash
-python sourcecode/cli.py --dry-run \
-    --glossary-ids 0xdsJEaDoENXui2rxMdZE3 \
-    --source-lang en-gb --target-lang fr-fr
-```
-
-Pass several ids as one comma-separated value (`--glossary-ids a,b,c`). The flag overrides a JSON
-descriptor's pinned ids too.Running `cli.py` prints the scorecard and the worklist. Under `--dry-run` the post-edited column mirrors the MT baseline and the APE (automatic
-post-editing) counters stay at zero, because post-mt was never called.
-
-***
+A run prints each component's scorecard as it is measured and writes one Markdown report under
+`reports/`, named for what was evaluated and when it ran — `glossary+dnt_20260826-142207.md`, with
+`_dry-run` in the name when it was one.
 
 ## How it works
 
 ```
- one component's dataset: source · raw MT · human reference · the component's own fields
+ one component's dataset: SRC · MT · REF · the component's own fields
      │
      ├─ 1. run segments ──────────────────────► post-mt  POST /api/workflow/async
-     │      (reference stripped from payload)            GET  /api/workflow/async/:id
-     │      returns: the raw MT it was given (the baseline)
-     │               the post-edited text
+     │      (REF stripped from payload)                  GET  /api/workflow/async/:id
+     │      returns: MT, the baseline it was given
+     │               APE, the post-edited text
      │               per-segment step failures
      │               whether a glossary reached the model
      │
-     ├─ 2. score MT and post-edited against the reference, with the dataset's component
+     ├─ 2. score every version against REF, with the dataset's component
      │      terminology ─ a. lemmatize ───────► Stanza        (as post-mt does)
      │                    b. resolve terms ───► term-bases    (same query post-mt sends)
      │                         (glossary ids pinned in the dataset)
-     │                    c. count each term in the reference, then in each version
+     │                    c. count each term in REF, then in MT and APE
      │
-     └─ 3. aggregate, pool by stratum, print
+     │      DNT ───────── a. detect and revert ► DNT service  POST /v1/revert
+     │                         (one call returns the items it weighed and REV,
+     │                          a third version to score)
+     │                    b. count each item in SRC and REF,
+     │                       then in MT, APE and REV
+     │
+     └─ 3. aggregate, pool by stratum, write the report
 ```
 
 Everything about the translation itself comes from post-mt's own API, so the benchmark measures the
-pipeline that actually runs rather than a reimplementation of it..
+pipeline that actually runs rather than a reimplementation of it.
 
 ***
 
 ## Terminology adherence
 
-How much of the glossary the human applied each version of the translation reproduced.
+Terms come from the **term-bases index**, selected with the same Elasticsearch query post-mt sends,
+so both resolve the same terms from the same data. Which term bases are queried is pinned per dataset
+as `glossary_ids`.
 
-Terms come from the **term-bases index**, selected with the same Elasticsearch query post-mt sends —
-so the benchmark scores against the terms the pipeline was actually shown. Which term bases are
-queried is pinned per dataset as `glossary_ids`.
+### Metrics
 
-### The metric
-
-For every glossary term matched in a segment:
-
-| Count   | Is                                                                                                                                     |
-| ------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| **`R`** | occurrences of the **target term in the human reference** — what the version owed, so a term used three times is not discharged by one |
-| **`T`** | occurrences in the **version being scored** — what it delivered against that demand, capped at `R`                                     |
-
+For every glossary term matched in a segment, the **REF count** is how often the target term
+appears in the **human reference** — so a term used three times is not discharged by one — and the
+**version count** is how often it appears in the **version being scored**, capped at the REF count.
 Summed over every term in every segment:
 
 ```
-expected_instances = sum of R
-adherent_instances = sum of T
+expected_instances = sum of the REF counts
+adherent_instances = sum of the version counts
 
 adherence_rate     = adherent_instances / expected_instances
-missed_instances   = expected_instances - adherent_instances
+
+violations         = expected_instances - adherent_instances
 ```
 
-The rate is over what the reference demanded, so it pools across datasets; the shortfall stays a
-count, which is what there is to go and fix. The rate is never averaged — at each grain, **per
-term**, **per segment** and **per stratum**, it is recomputed from the counts of the grain below, so
-a term matched once cannot outweigh one matched forty times. The per-term and per-segment counts
-each sum to the dataset total.
+The rate is never averaged. At every grain it is recomputed from the pooled counts, so a term
+matched once cannot outweigh the same term matched forty times. It is reported again **term by
+term** over that term's own REF count and its violation count.
 
-`missed_instances` is subtraction and says nothing about why. A **violation** is an instance missed
-where the segment has text but not the target term; an **omission** is one missed where the segment
-came back empty — reported, but never a violation. They sum to `missed_instances` at every grain and
-pool by addition. Keeping them apart is what stops a pipeline that returned nothing from reading
-like one that translated everything with the wrong words.
+The same terms are also counted **once each instead of per occurrence**, split four ways by how the
+version count compares with REF's:
 
-**Term breakdown.** The same terms counted **once each instead of per occurrence**, split four ways
-by how `T` compares with `R`. Exhaustive, so the buckets sum to the distinct terms scored; counts,
-not a rate.
+| Bucket                       | When                | Scored as                                    |
+| ---------------------------- | ------------------- | -------------------------------------------- |
+| **never used**               | none in the version | missed, adherence 0                          |
+| **used, not everywhere**     | fewer than REF      | missed, adherence partial                    |
+| **matched REF**              | as many as REF      | adherent                                     |
+| **used more than the human** | more than REF       | adherent — **never a violation but flagged** |
 
-| Bucket                       | When        | Scored as                                                                               |
-| ---------------------------- | ----------- | --------------------------------------------------------------------------------------- |
-| **never used**               | `T = 0`     | missed, adherence 0                                                                     |
-| **used, not everywhere**     | `0 < T < R` | missed, adherence partial — *used but not everywhere* is inconsistency inside a segment |
-| **matched the reference**    | `T = R`     | adherent                                                                                |
-| **used more than the human** | `T > R`     | adherent — never a violation, **flag for review**                                       |
+### What is reported
 
-**Strict and permissive slices.** The two kinds of glossary instruction, scored separately.
+Everything below is reported for **MT** and for **APE**:
 
-| Prompt rendering                         | Meaning              | Scored as                     |
-| ---------------------------------------- | -------------------- | ----------------------------- |
-| `` `X` should be translated to: `Y` ``   | one target term      | **strict** — only `Y` counts  |
-| `` `X` may be translated as: `Y`, `Z` `` | several target terms | **permissive** — *any* counts |
+* **Adherence rate** — the share of expected instances where the target term actually appears,
+  computed at three grains: **per term**, **per dataset** and **per stratum**.
 
-**Segment-level adherence.** The share of glossary-bearing segments with *zero* violations.
+* **Violations** — the sum of three failures, counted over the whole corpus rather than segment by
+  segment, because one of them is only visible once every segment has been read:
 
-**Repairs and regressions.** Counted separately rather than netted against each other: a **repair**
-is a term the raw MT got wrong and post-editing corrected, a **regression** one it got **right** and
-post-editing broke.
+  * **miss** — output carries no approved target, surface form nor lemma of reference term.
+
+  * **inconsistency** — output carries an approved target for a term the glossary proposed in
+    that segment, but not the wording the reference used there.
+
+  * **over-application** — output carries a target that the glossary did not propose in that
+    segment, and the reference did not use that wording there either.
+
+* **Violation rate** — segments carrying at least one violation, over *every* segment. Several
+  violations in one segment count once.
+
+* **Repairs and regressions** — counted separately rather than netted against each other: a
+  **repair** is a term MT got wrong and APE corrected; a **regression** is a term MT got **right**
+  and APE broke.
+
+**Strict and permissive** are the two kinds of glossary instruction, scored separately.
+`` `X` should be translated to: `Y` `` names one target term and is **strict**, so only `Y` counts;
+`` `X` may be translated as: `Y`, `Z` `` names several and is **permissive**, so any of them does.
 
 ***
+
+## DNT preservation
+
+Items come from the **DNT service**: `POST /v1/revert` per batch returns both the items it weighed
+in a segment and the text it produced after reverting them. Reversion is asked for over **APE**, so
+**REV** is a third scored column beside MT and APE. `--dry-run` skips post-mt but not the DNT
+service: reversion then runs over MT, and MT and APE read alike.
+
+The item must appear **verbatim in SRC** and **REF** must keep it. Failing either leaves the item
+flagged: **`not in SRC`** when the service named a string the source does not carry, and **`not in
+REF`** when the source carries it but the human translated it.
+
+### Metrics
+
+For every scored item in a segment, the **REF count** is how often it appears verbatim in the
+**human reference** — the number of times it had to survive — and the **version count** is how often
+it appears in the **version being scored**, capped at the REF count. Summed over every item in every
+segment:
+
+```
+expected_instances  = sum of the REF counts
+preserved_instances = sum of the version counts
+
+preservation_rate   = preserved_instances / expected_instances
+
+leaked_instances    = expected_instances - preserved_instances
+over_kept           = instances kept beyond the reference's own count
+```
+
+A leak can be a **case drift** — the item present but cased differently — or **translated**. An
+over-keep freezes a word the human legitimately translated.
+
+The same items counted **once each instead of per instance**, split four ways by how the version
+count compares with REF's:
+
+| Bucket          | When                | Meaning                                     |
+| --------------- | ------------------- | ------------------------------------------- |
+| **never kept**  | none in the version | REF kept it, the version has none of it     |
+| **kept partly** | fewer than REF      | kept in one place and translated in another |
+| **matched REF** | as many as REF      | preserved exactly as often as it was owed   |
+| **over-kept**   | more than REF       | frozen more often than the human froze it   |
+
+Unlike terminology, where using a term more than the human is legitimate and never scored,
+**over-keeping is an error here**: it is only ever measured on items the reference did keep
+somewhere, so it means the version froze an occurrence the human had translated.
+
+### What is reported
+
+Everything below is reported for **MT**, for **APE** and for **REV**:
+
+* **Preservation rate** — the share of expected instances the version kept verbatim, **per item**, **per dataset** and **per stratum**.
+
+* **Leaks and over-keeps** — counts beside the rate, each split by kind.
+
+* **Segments clean** — the share of item-bearing segments with no leak and no over-keep in either
+  direction.
+
+* **Repairs and regressions** — what post-editing moved preservation by and then what
+  reversion moved it by, with the items the next version broke and the ones it fixed counted
+  separately.
 
 ## Configuration
 
@@ -167,33 +223,17 @@ Create a `.env` in the repo root with the following variables:
 | `STANZA_BASE_URL`                                     | Stanza lemmatizer, `https://stanza.acolad.build` — no credential                                                                                                                        |
 | `SEARCH_ENGINE_URL`                                   | term-bases index                                                                                                                                                                        |
 | `SEARCH_ENGINE_USERNAME` / `SEARCH_ENGINE_PASSWORD`   | HTTP basic auth, if the cluster uses it                                                                                                                                                 |
-| `BENCH_DATASET`                                       | the single source of what gets scored: a dataset file, or a folder of one component's datasets                                                                                          |
-| `BENCH_LEMMA_MATCHING`                                | count inflected forms as matches (default `true`); `false` scores surface forms only                                                                                                    |
+| `GLOSSARY_PATH` / `DNT_PATH`                          | the single source of what each component scores: a dataset file, or a folder of that component's datasets                                                                               |
+| `BENCH_COMPONENT`                                     | which components a run measures, `glossary` and/or `dnt`                                                                                                                                |
+| `DNT_BASE_URL` / `DNT_API_KEY`                        | the DNT service and its key, sent as `X-Api-Key` — note the casing, post-mt's own key is not accepted                                                                                   |
 | `ES_AWS_SIGV4_ENABLED` / `AWS_REGION` / `AWS_PROFILE` | sign requests with AWS SigV4 instead — required by AWS-managed domains, which reject basic auth. Needs `pip install -e ".[aws]"` and a live login (`aws sso login --profile <profile>`) |
 
-The benchmark resolves the glossary itself, but the *post-edited* column is only meaningful if
-post-mt was also shown those terms. It looks them up by asking the CAT tool which term bases are
-attached to `cat_project_id`.
-
-***
-
-## CLI reference
-
-```bash
-python sourcecode/cli.py [options]
-```
-
-There is no dataset argument: what gets scored is `BENCH_DATASET` in `.env`. The options below
-change *behaviour*, not what is measured.
-
-| Option                            | Effect                                              |
-| --------------------------------- | --------------------------------------------------- |
-| `--source-lang` / `--target-lang` | language code or name, instead of a `--params` file |
-| `--domain D`                      | domain label, recorded in reports                   |
-| `--dry-run`                       | scores the MT baseline only; never calls post-mt    |
-| `--glossary-ids IDS`              | comma-separated, overrides the dataset              |
-| `--params FILE`                   | JSON parameters block for `.csv`/`.mxliff` inputs   |
-| `--steps STEPS`                   | pipeline steps (default `AQE,APE`)                  |
-| `--batch-size N`                  | segments per post-mt task                           |
-
-###
+The *APE* column only means anything if post-mt was shown the same terms, and it finds them by
+asking the CAT tool which term bases are attached to `cat_project_id`. Every component therefore
+requires **`tempo_task_id`** and **`cat_project_id`**. Terminology also
+requires **`cat_tool_provider`** and **`ecosystem_id`**, without which retrieval is skipped and APE
+runs blind. Since a well-formed `cat_project_id` naming no real project passes every field check and
+still retrieves nothing, terminology submits **one AQE-only segment** and reads `has_glossary` off
+the reply, stopping the run for the price of one segment rather than billing the dataset for a
+measurement that means nothing. Both ids come from the CAT tool and cannot be invented, and the term
+base named in `glossary_ids` has to be attached to that project.

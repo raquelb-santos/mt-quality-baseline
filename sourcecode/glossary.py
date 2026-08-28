@@ -1,15 +1,11 @@
 """Glossary resolution against the term-bases index, sending the same queries post-mt sends."""
 
-from __future__ import annotations
-
 import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 import httpx
-
-from .normalize import language_variants
 
 logger = logging.getLogger(__name__)
 
@@ -21,21 +17,17 @@ class GlossaryMatches:
     per_text_mappings: list[list[dict[str, str]]]
 
 
-def as_id_list(glossary_ids: str | Sequence[str]) -> list[str]:
-    if isinstance(glossary_ids, str):
-        return [part.strip() for part in glossary_ids.split(",") if part.strip()]
+def language_variants(language: str) -> list[str]:
+    """Full code and base code (en-us -> [en-us, en])."""
+    return list(dict.fromkeys([language, str(language).split("-")[0]]))
+
+
+def as_id_list(glossary_ids: Sequence[str]) -> list[str]:
     return [str(gid).strip() for gid in glossary_ids if str(gid).strip()]
 
 
-def dedup_mappings(per_text_mappings: Sequence[Sequence[dict[str, Any]]]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    flat: list[dict[str, Any]] = []
-    for mappings in per_text_mappings:
-        for mapping in mappings:
-            if mapping["target_content"] not in seen:
-                seen.add(mapping["target_content"])
-                flat.append(mapping)
-    return flat
+def _term_index(provider: str | None) -> str:
+    return "xtm-term-bases" if str(provider or "").lower() == "xtm" else "term-bases"
 
 
 class SigV4Auth(httpx.Auth):
@@ -64,8 +56,7 @@ class SigV4Auth(httpx.Auth):
         from botocore.auth import SigV4Auth as _SigV4Auth
         from botocore.awsrequest import AWSRequest
 
-        # Sign a copy carrying only the headers that are part of the signature; botocore returns
-        # Authorization plus the x-amz-* headers to copy back onto the real request.
+        # Sign a copy carrying only the signed headers, then copy botocore's result back on.
         signable = AWSRequest(
             method=request.method,
             url=str(request.url),
@@ -82,7 +73,6 @@ class SigV4Auth(httpx.Auth):
 
 
 class GlossaryClient:
-    source_label = "term-bases-index"
 
     def __init__(
         self,
@@ -118,21 +108,20 @@ class GlossaryClient:
         for body in bodies:
             lines.append(json.dumps({"index": index}))
             lines.append(json.dumps(body))
-        payload = "\n".join(lines) + "\n"
 
         response = self._client.post(
             "/_msearch",
-            content=payload.encode("utf-8"),
+            content=("\n".join(lines) + "\n").encode("utf-8"),
             headers={"Content-Type": "application/x-ndjson"},
         )
         response.raise_for_status()
         return response.json().get("responses", [])
 
-    def count_terms(self, glossary_ids: str | Sequence[str], provider: str | None = None) -> int:
+    def count_terms(self, glossary_ids: Sequence[str], provider: str | None = None) -> int:
         """Documents the index holds for these ids — 0 means the ids are not in this cluster."""
-        index = "xtm-term-bases" if str(provider or "").lower() == "xtm" else "term-bases"
         response = self._client.post(
-            f"/{index}/_count", json={"query": {"terms": {"glossary_id": as_id_list(glossary_ids)}}}
+            f"/{_term_index(provider)}/_count",
+            json={"query": {"terms": {"glossary_id": as_id_list(glossary_ids)}}},
         )
         response.raise_for_status()
         return int(response.json().get("count", 0))
@@ -140,7 +129,7 @@ class GlossaryClient:
     def fetch_matches(
         self,
         *,
-        glossary_ids: str | Sequence[str],
+        glossary_ids: Sequence[str],
         source_language: str,
         target_language: str,
         texts: Sequence[str],
@@ -148,26 +137,22 @@ class GlossaryClient:
     ) -> GlossaryMatches:
         """Resolve glossary matches for a batch of lemmatized texts."""
         ids = as_id_list(glossary_ids)
-        if not ids:
-            raise ValueError("No glossary IDs provided")
-        if not source_language:
-            raise ValueError("No source language provided")
-        if not target_language:
-            raise ValueError("No target language provided")
-        if not texts:
-            raise ValueError("No texts provided")
+        for value, label in (
+            (ids, "glossary IDs"), (source_language, "source language"),
+            (target_language, "target language"), (texts, "texts"),
+        ):
+            if not value:
+                raise ValueError(f"No {label} provided")
 
-        index = "xtm-term-bases" if str(provider or "").lower() == "xtm" else "term-bases"
-
-        term_filter = [
-            {"terms": {"glossary_id": ids}},
-            {"terms": {"language": language_variants(source_language)}},
-        ]
+        index = _term_index(provider)
         bodies = [
             {
                 "query": {
                     "bool": {
-                        "filter": term_filter,
+                        "filter": [
+                            {"terms": {"glossary_id": ids}},
+                            {"terms": {"language": language_variants(source_language)}},
+                        ],
                         "must": [{"percolate": {"field": "query", "document": {"content": str(text)}}}],
                     }
                 },
@@ -194,18 +179,20 @@ class GlossaryClient:
         if not all_concept_ids:
             return GlossaryMatches(mappings=[], per_text_mappings=[[] for _ in texts])
 
-        target_body = {
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"terms": {"concept_id": sorted(all_concept_ids)}},
-                        {"terms": {"language": language_variants(target_language)}},
-                    ]
-                }
+        response = self._client.post(
+            f"/{index}/_search",
+            json={
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"terms": {"concept_id": sorted(all_concept_ids)}},
+                            {"terms": {"language": language_variants(target_language)}},
+                        ]
+                    }
+                },
+                "size": 1000,
             },
-            "size": 1000,
-        }
-        response = self._client.post(f"/{index}/_search", json=target_body)
+        )
         response.raise_for_status()
 
         targets_by_concept: dict[str, list[str]] = {}
@@ -224,7 +211,9 @@ class GlossaryClient:
                         mappings.append({"source_content": source["term_text"], "target_content": target_text})
             per_text_mappings.append(mappings)
 
-        return GlossaryMatches(
-            mappings=dedup_mappings(per_text_mappings),
-            per_text_mappings=per_text_mappings,
-        )
+        flat: dict[str, dict[str, str]] = {}
+        for mappings in per_text_mappings:
+            for mapping in mappings:
+                flat.setdefault(mapping["target_content"], mapping)
+
+        return GlossaryMatches(mappings=list(flat.values()), per_text_mappings=per_text_mappings)
