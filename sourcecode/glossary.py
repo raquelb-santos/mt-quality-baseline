@@ -104,11 +104,7 @@ class GlossaryClient:
             return False
 
     def _msearch(self, index: str, bodies: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-        lines: list[str] = []
-        for body in bodies:
-            lines.append(json.dumps({"index": index}))
-            lines.append(json.dumps(body))
-
+        lines = [json.dumps(part) for body in bodies for part in ({"index": index}, body)]
         response = self._client.post(
             "/_msearch",
             content=("\n".join(lines) + "\n").encode("utf-8"),
@@ -211,9 +207,10 @@ class GlossaryClient:
                         mappings.append({"source_content": source["term_text"], "target_content": target_text})
             per_text_mappings.append(mappings)
 
-        flat: dict[str, dict[str, str]] = {}
+        # Keyed on the pair: two source terms sharing a target are two mappings, not one.
+        flat: dict[tuple[str, str], dict[str, str]] = {}
         for mappings in per_text_mappings:
             for mapping in mappings:
-                flat.setdefault(mapping["target_content"], mapping)
+                flat.setdefault((mapping["source_content"], mapping["target_content"]), mapping)
 
         return GlossaryMatches(mappings=list(flat.values()), per_text_mappings=per_text_mappings)

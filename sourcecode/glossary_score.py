@@ -50,13 +50,22 @@ class TermBreakdown:
         self.over_used += other.over_used
 
 
+MISS = "miss"                              # no sanctioned target form in the output
+INCONSISTENCY = "inconsistency"            # an approved target other than the one the reference used
+OVER_APPLICATION = "over-application"      # a target term used where its source term was not
+
+
 @dataclass(frozen=True)
 class Violation:
     source_content: str
-    expected_targets: list[str]
-    strictness: str
+    kind: str
+    expected_targets: list[str] = field(default_factory=list)
+    strictness: str = ""
     missed_occurrences: int = 1
     expected_occurrences: int = 1
+    # Corpus-level only: where it was found, and the rendering that triggered it.
+    segment_index: int = -1
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -136,7 +145,8 @@ def score_translation(
         ))
         if missed:
             result.violations.append(Violation(
-                source_content=source, expected_targets=expected_targets, strictness=strictness,
+                source_content=source, kind=MISS,
+                expected_targets=expected_targets, strictness=strictness,
                 missed_occurrences=missed, expected_occurrences=expected_n,
             ))
 
@@ -239,22 +249,7 @@ def pool(aggregates: Sequence[Aggregate]) -> Aggregate:
     )
 
 
-# ── corpus-level violations ──────────────────────────────────────────────────────────────────
 # Adherence asks what this version reproduced; this asks what it got wrong.
-
-MISS = "miss"                              # no sanctioned target form in the output
-INCONSISTENCY = "inconsistency"            # an approved target other than the one the reference used
-OVER_APPLICATION = "over-application"      # a target term used where its source term was not
-
-
-@dataclass(frozen=True)
-class TermViolation:
-    segment_index: int
-    source_content: str
-    kind: str
-    # The rendering that triggered it - the variant used, or "" for a miss.
-    detail: str = ""
-
 
 @dataclass
 class ViolationReport:
@@ -267,7 +262,7 @@ class ViolationReport:
     segments: int = 0
     segments_with_violation: int = 0
     violation_rate: float | None = None
-    items: list[TermViolation] = field(default_factory=list)
+    items: list[Violation] = field(default_factory=list)
 
 
 def _rendered_variants(
@@ -360,20 +355,22 @@ def find_violations(
                 continue
             used = found[source]
             if not used:
-                report.items.append(TermViolation(index, source, MISS))
+                report.items.append(Violation(source, MISS, segment_index=index))
                 continue
             # The reference settles the wording: a majority vote would let the version grade itself.
             intended = {normalize_text(variant) for variant in in_reference[source]}
             for variant in used:
                 if normalize_text(variant) not in intended:
-                    report.items.append(TermViolation(index, source, INCONSISTENCY, variant))
+                    report.items.append(
+                        Violation(source, INCONSISTENCY, segment_index=index, detail=variant))
 
         for source, used in found.items():
             if source in retrieved:
                 continue
             for variant in used:
                 if normalize_text(variant) not in licensed:
-                    report.items.append(TermViolation(index, source, OVER_APPLICATION, variant))
+                    report.items.append(
+                        Violation(source, OVER_APPLICATION, segment_index=index, detail=variant))
 
     report.items.sort(key=lambda item: (item.segment_index, str(item.source_content), item.kind))
     report.miss = sum(1 for item in report.items if item.kind == MISS)

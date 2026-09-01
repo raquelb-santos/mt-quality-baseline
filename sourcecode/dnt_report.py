@@ -4,7 +4,7 @@ from typing import Any, Sequence
 
 from . import dnt_score
 from .dnt_benchmark import DntResult
-from .report import Scorecard, by_stratum, cell, pct, rate, signed_pct
+from .report import Scorecard, by_stratum, cell, pct, rate, signed_pct, table
 
 # The versions a run scores, in delivery order.
 PIPELINE = (("mt", "MT"), ("ape", "APE"), ("rev", "REV"))
@@ -104,14 +104,16 @@ def item_rows(result: DntResult) -> list[dict[str, Any]]:
         for text, mt_score in columns["mt"].items():
             entry = pooled.setdefault(text, {
                 "in_src": 0,
+                "expected": 0,
                 **{f"{c}_{f}": 0 for c, _ in PIPELINE
-                   for f in ("expected", "preserved", "kept", "over_kept")},
+                   for f in ("preserved", "kept", "over_kept")},
             })
             # Once per segment: the count is a SRC property, so per-column adds would treble it.
             entry["in_src"] += mt_score.in_src
+            # REF's own count: the denominator, identical for every version scored.
+            entry["expected"] += mt_score.expected
             for column, scores in columns.items():
                 scored = scores[text]
-                entry[f"{column}_expected"] += scored.expected
                 entry[f"{column}_preserved"] += scored.preserved
                 entry[f"{column}_kept"] += scored.kept
                 entry[f"{column}_over_kept"] += scored.over_kept
@@ -120,14 +122,14 @@ def item_rows(result: DntResult) -> list[dict[str, Any]]:
         {
             "item": text,
             "in_src": entry["in_src"],
-            "ref_kept": entry["mt_expected"],
+            "ref_kept": entry["expected"],
             "mt_over_kept": entry["mt_over_kept"],
             "rev_over_kept": entry["rev_over_kept"],
             "rev_preserved": entry["rev_preserved"],
             **{f"{column}_kept": entry[f"{column}_kept"] for column, _ in PIPELINE},
             **{
                 f"{column}_preservation_rate":
-                    rate(entry[f"{column}_preserved"], entry[f"{column}_expected"])
+                    rate(entry[f"{column}_preserved"], entry["expected"])
                 for column, _ in PIPELINE
             },
         }
@@ -159,44 +161,22 @@ def render_dnt_items(result: DntResult) -> str:
     rows = item_cells(result)
     if not rows:
         return "No DNT items were reported.\n"
-
-    lines = [
-        "### Preservation by DNT item (preservation is REV against REF, worst first)",
-        "",
-        f"| DNT item | {' | '.join(ITEM_COLUMNS)} |",
-        f"| --- | {' | '.join('---:' for _ in ITEM_COLUMNS)} |",
-    ]
-    lines += [f"| {cell(item)} | {' | '.join(rates)} |" for item, rates in rows]
-    lines.append("")
-
-    return "\n".join(lines)
+    return table("Preservation by DNT item (preservation is REV against REF, worst first)",
+                 "DNT item", ITEM_COLUMNS, rows)
 
 
 def render_dnt_items_console(result: DntResult) -> str:
-    """The same rows, aligned for a terminal."""
     rows = item_cells(result)
     if not rows:
         return "\n".join(
             [f"Preservation by DNT item — {result.dataset}", "", "  No DNT items were reported.", ""]
         )
-
-    width = max(max(len(item) for item, _ in rows), len("DNT item"))
     # The counts need no more room than their headers; only the rate column is wide.
-    columns = [(label, max(len(label), 4)) for label in ITEM_COLUMNS]
-    lines = [
+    return table(
         f"Preservation by DNT item — {result.dataset}"
         " (preservation is REV against REF, worst first)",
-        "",
-        f"  {'DNT item'.ljust(width)}  {' '.join(f'{label:>{w}}' for label, w in columns)}",
-    ]
-    for item, cells in rows:
-        lines.append(
-            f"  {item.ljust(width)}"
-            f"  {' '.join(f'{value:>{w}}' for value, (_, w) in zip(cells, columns))}"
-        )
-    lines.append("")
-
-    return "\n".join(lines)
+        "DNT item", ITEM_COLUMNS, rows, console=True, width=4,
+    )
 
 
 def detection_rows(result: DntResult) -> list[dict[str, Any]]:
@@ -377,32 +357,10 @@ def render_dnt_strata(results: Sequence[DntResult]) -> str:
     if not rows:
         return ""
 
-    lines = [
-        "## Preservation by stratum",
-        "",
-        f"| Stratum | {' | '.join(label for _, label in PIPELINE)} |",
-        f"| --- | {' | '.join('---:' for _ in PIPELINE)} |",
-    ]
-    lines += [f"| {cell(label)} | {' | '.join(rates)} |" for label, rates in rows]
-    lines.append("")
-
-    return "\n".join(lines)
+    return table("Preservation by stratum", "Stratum",
+                 [label for _, label in PIPELINE], rows, heading="##")
 
 
 def render_dnt_strata_console(results: Sequence[DntResult]) -> str:
-    """The same rows, aligned for a terminal."""
-    rows = stratum_rate_rows(results)
-    if not rows:
-        return ""
-
-    width = max(max(len(label) for label, _ in rows), len("stratum"))
-    lines = [
-        "Preservation by stratum",
-        "",
-        f"  {'stratum'.ljust(width)}  {' '.join(f'{name:>8}' for _, name in PIPELINE)}",
-    ]
-    for label, rates in rows:
-        lines.append(f"  {label.ljust(width)}  {' '.join(f'{value:>8}' for value in rates)}")
-    lines.append("")
-
-    return "\n".join(lines)
+    return table("Preservation by stratum", "stratum", [name for _, name in PIPELINE],
+                 stratum_rate_rows(results), console=True)

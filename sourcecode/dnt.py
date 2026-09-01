@@ -8,9 +8,6 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# The keys a per-segment entry is recognised by when the response carries no envelope.
-SEGMENT_KEYS = ("terms", "reverted", "result")
-
 
 def base_language(code: str | None) -> str:
     """`en-gb` -> `en`. The service names languages without a region."""
@@ -59,7 +56,7 @@ def response_segments(body: Any) -> list[Mapping[str, Any]]:
             if isinstance(raw, list):
                 return [entry for entry in raw if isinstance(entry, Mapping)]
         # A single-segment body with no envelope around it.
-        if any(key in body for key in SEGMENT_KEYS):
+        if any(key in body for key in ("terms", "reverted", "result")):
             return [body]
 
     return []

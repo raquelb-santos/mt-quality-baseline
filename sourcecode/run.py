@@ -1,5 +1,4 @@
-"""Drives a whole run - what `.env` says to measure, the clients for it, what each component
-renders, and the exit code - and is the only module aware of every component."""
+"""Drives a whole run - the only module aware of every component - and sets the exit code."""
 
 import argparse
 import logging
@@ -166,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
                         glossary_report.glossary_scorecard(scored).as_console(),
                         glossary_report.render_term_adherence_console(scored),
                     ]
-                if component == "dnt":
+                elif component == "dnt":
                     data = dnt_benchmark.load_dataset(path, dry_run=args.dry_run)
                     scored = dnt_benchmark.DntBenchmark(postmt=postmt, dnt=dnt, config=config).run(
                         data, skip_pipeline=args.dry_run
@@ -186,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
             # After the datasets: pools every dataset that shares a stratum
             if component == "glossary" and results:
                 print(glossary_report.render_strata_console(results))
-            if component == "dnt" and results:
+            elif component == "dnt" and results:
                 print(dnt_report.render_dnt_strata_console(results))
 
         report_file = report.write_report(

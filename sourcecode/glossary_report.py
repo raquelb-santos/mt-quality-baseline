@@ -101,29 +101,31 @@ def term_rows(result: BenchmarkResult) -> list[dict[str, Any]]:
                 "expected_targets": " | ".join(term.expected_targets),
                 "strictness": term.strictness,
                 "segments": 0,
+                # REF's own count: the denominator, identical for every version scored.
+                "expected": 0,
                 **{f"{c}_{f}": 0 for c in ("mt", "ape")
-                   for f in ("expected", "adherent", "rendered", "violations")},
+                   for f in ("adherent", "rendered", "violations")},
             })
             entry["segments"] += 1
+            entry["expected"] += term.expected
             for column, scores in columns.items():
                 scored = scores.get(source)
                 if scored is not None:
-                    entry[f"{column}_expected"] += scored.expected
                     entry[f"{column}_adherent"] += scored.adherent
                     entry[f"{column}_rendered"] += scored.rendered
                     entry[f"{column}_violations"] += scored.violations
 
     rows = []
     for source, entry in pooled.items():
-        expected = entry["ape_expected"]
+        expected = entry["expected"]
         rows.append({
             "source_term": source,
             "expected_targets": entry["expected_targets"],
             "strictness": entry["strictness"],
             "segments": entry["segments"],
-            "ref_rendered": entry["mt_expected"],
+            "ref_rendered": expected,
             "mt_rendered": entry["mt_rendered"],
-            "mt_adherent": entry["mt_adherent"] if entry["mt_expected"] else "",
+            "mt_adherent": entry["mt_adherent"] if expected else "",
             # A zero denominator is a term REF never used, so the row reads as a review item.
             "ape_adherent": entry["ape_adherent"] if expected else "",
             "ape_rendered": entry["ape_rendered"],
@@ -197,9 +199,9 @@ def render_comparison(results: Sequence[BenchmarkResult]) -> str:
 
     lines = ["## Across datasets", ""]
     for result in results:
-        pair = f"{result.parameters['source_language']}>{result.parameters['target_language']}"
         lines.append(
-            f"- {result.dataset} · {pair} · {result.mt.expected} inst"
+            f"- {result.dataset} · {result.parameters['source_language']}"
+            f">{result.parameters['target_language']} · {result.mt.expected} inst"
             f"  ·  MT {pct(result.mt.adherence_rate)}"
             f" → APE {pct(result.ape.adherence_rate)}"
             f"  ({signed_pct(result.delta.adherence_rate)})"

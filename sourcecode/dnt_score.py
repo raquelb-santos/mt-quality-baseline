@@ -33,12 +33,6 @@ class LeakBreakdown:
     def total(self) -> int:
         return self.case_drift + self.translated
 
-    def record(self, kind: str, count: int) -> None:
-        if kind == CASE_DRIFT:
-            self.case_drift += count
-        else:
-            self.translated += count
-
     def add(self, other: LeakBreakdown) -> None:
         self.case_drift += other.case_drift
         self.translated += other.translated
@@ -155,8 +149,8 @@ def score_dnt(
             loose = count_item(text, item, target_language_code, casefold=True)
             drift = max(0, min(loose, expected) - preserved)
             leak_kind = CASE_DRIFT if drift == leaked else TRANSLATED
-            result.leaks.record(CASE_DRIFT, drift)
-            result.leaks.record(TRANSLATED, leaked - drift)
+            result.leaks.case_drift += drift
+            result.leaks.translated += leaked - drift
 
         # Classified on the counts, not presence: a hit cannot tell "as often" from "more often".
         if kept == 0:
@@ -177,34 +171,30 @@ def score_dnt(
 
 
 @dataclass
-class DntTallyReport:
+class DntAggregate:
     """Preservation is the only share, and it is a share of what the reference kept."""
 
-    expected: int
-    preserved: int
-    leaked: int
-    over_kept: int
-    leaks: LeakBreakdown
-    preservation_rate: float | None
+    expected: int = 0
+    preserved: int = 0
+    leaked: int = 0
+    over_kept: int = 0
+    leaks: LeakBreakdown = field(default_factory=LeakBreakdown)
+    preservation_rate: float | None = None
+    items: ItemBreakdown = field(default_factory=ItemBreakdown)
+    not_in_src: int = 0
+    not_in_ref: int = 0
+    distinct_items: int = 0
+    segments_with_items: int = 0
+    # Segments with no error in either direction, reported alongside the instance rate.
+    segments_fully_preserved: int = 0
+    segment_preservation_rate: float | None = None
+    # Segments the service never reported on, so they are outside every count above.
+    segments_unread: int = 0
 
     @property
     def errors(self) -> int:
         """Both directions, never netted: they are different failures with different fixes."""
         return self.leaked + self.over_kept
-
-
-@dataclass
-class DntAggregate(DntTallyReport):
-    items: ItemBreakdown
-    not_in_src: int
-    not_in_ref: int
-    distinct_items: int
-    segments_with_items: int
-    # Segments with no error in either direction, reported alongside the instance rate.
-    segments_fully_preserved: int
-    segment_preservation_rate: float | None
-    # Segments the service never reported on, so they are outside every count above.
-    segments_unread: int = 0
 
 
 def _build(
@@ -279,20 +269,20 @@ def pool(aggregates: Sequence[DntAggregate]) -> DntAggregate:
     not_in_src = not_in_ref = distinct_items = 0
     segments_with_items = segments_fully_preserved = segments_unread = 0
 
-    for item in aggregates:
-        if item is None:
+    for agg in aggregates:
+        if agg is None:
             continue
-        total.expected += item.expected
-        total.preserved += item.preserved
-        total.over_kept += item.over_kept
-        total.leaks.add(item.leaks)
-        items.add(item.items)
-        not_in_src += item.not_in_src
-        not_in_ref += item.not_in_ref
-        distinct_items += item.distinct_items
-        segments_with_items += item.segments_with_items
-        segments_fully_preserved += item.segments_fully_preserved
-        segments_unread += item.segments_unread
+        total.expected += agg.expected
+        total.preserved += agg.preserved
+        total.over_kept += agg.over_kept
+        total.leaks.add(agg.leaks)
+        items.add(agg.items)
+        not_in_src += agg.not_in_src
+        not_in_ref += agg.not_in_ref
+        distinct_items += agg.distinct_items
+        segments_with_items += agg.segments_with_items
+        segments_fully_preserved += agg.segments_fully_preserved
+        segments_unread += agg.segments_unread
 
     return _build(
         total, items,

@@ -94,10 +94,9 @@ def parse_mxliff(xml_string: str) -> list[dict[str, Any]]:
 
 
 def parse_csv(text: str) -> list[dict[str, Any]]:
-    reader = csv.DictReader(io.StringIO(text))
     segments: list[dict[str, Any]] = []
 
-    for index, row in enumerate(reader):
+    for index, row in enumerate(csv.DictReader(io.StringIO(text))):
         row = {(key or "").strip(): (value or "") for key, value in row.items()}
         segment = {
             "source_segment_id": row.get("source_segment_id") or row.get("segment_id") or str(index),
@@ -153,6 +152,7 @@ def load(path: str | Path, *, component: str) -> Dataset:
     path = Path(path)
     raw = path.read_text(encoding="utf-8")
     suffix = path.suffix.lower()
+    params = read_params(path)
 
     if suffix == ".json":
         body = json.loads(raw)
@@ -163,7 +163,6 @@ def load(path: str | Path, *, component: str) -> Dataset:
     else:
         raise ValueError(f"Unsupported dataset format: {suffix} (expected one of {', '.join(DATA_TYPES)})")
 
-    params = read_params(path)
     dataset = Dataset(
         name=params.get("name") or body.get("name") or path.stem,
         parameters=normalize_language(

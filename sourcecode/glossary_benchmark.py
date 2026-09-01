@@ -167,7 +167,6 @@ class Benchmark:
     def run(self, dataset: Dataset, *, skip_pipeline: bool = False) -> BenchmarkResult:
         started_at = datetime.now(timezone.utc).isoformat()
         target_language = dataset.parameters.get("clean_target_language_code")
-        source_language = dataset.parameters.get("clean_source_language_code")
 
         per_segment_mappings = self.resolve_glossary(
             dataset.segments, dataset.parameters, dataset.glossary_ids
@@ -285,7 +284,7 @@ class Benchmark:
             started_at=started_at,
             finished_at=datetime.now(timezone.utc).isoformat(),
             parameters={
-                "source_language": source_language,
+                "source_language": dataset.parameters.get("clean_source_language_code"),
                 "target_language": target_language,
                 "domain": dataset.parameters.get("domain"),
                 "cat_tool_provider": dataset.parameters.get("cat_tool_provider"),

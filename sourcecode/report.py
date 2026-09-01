@@ -29,6 +29,45 @@ def cell(value: Any) -> str:
     return str(value).replace("|", "\\|")
 
 
+def table(
+    title: str,
+    first: str,
+    columns: Sequence[str],
+    rows: Sequence[tuple[str, Sequence[str]]],
+    *,
+    console: bool = False,
+    heading: str = "###",
+    width: int = 8,
+) -> str:
+    """One table, in either destination: a Markdown grid, or columns aligned for a terminal."""
+    if not rows:
+        return ""
+
+    if not console:
+        lines = [
+            f"{heading} {title}",
+            "",
+            f"| {first} | {' | '.join(columns)} |",
+            f"| --- | {' | '.join('---:' for _ in columns)} |",
+            *(f"| {cell(name)} | {' | '.join(values)} |" for name, values in rows),
+        ]
+    else:
+        label_width = max(max(len(name) for name, _ in rows), len(first))
+        sized = [(label, max(len(label), width)) for label in columns]
+        lines = [
+            title,
+            "",
+            f"  {first.ljust(label_width)}  {' '.join(f'{c:>{w}}' for c, w in sized)}",
+            *(
+                f"  {name.ljust(label_width)}"
+                f"  {' '.join(f'{v:>{w}}' for v, (_, w) in zip(values, sized))}"
+                for name, values in rows
+            ),
+        ]
+
+    return "\n".join([*lines, ""])
+
+
 @dataclass(frozen=True)
 class Scorecard:
     """One dataset's headline results for both destinations; `detail` goes to the file only."""
@@ -86,9 +125,8 @@ def render_report(
     dry_run: bool,
     now: datetime,
 ) -> str:
-    measured = " + ".join(results_by_component) or "nothing"
     parts = [
-        f"# Quality baseline — {measured}\n\n"
+        f"# Quality baseline — {' + '.join(results_by_component) or 'nothing'}\n\n"
         f"{'dry run' if dry_run else 'full run'} · {now.strftime('%Y-%m-%d %H:%M UTC')}\n"
     ]
 
