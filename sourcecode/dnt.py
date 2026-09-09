@@ -9,11 +9,6 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-def base_language(code: str | None) -> str:
-    """`en-gb` -> `en`. The service names languages without a region."""
-    return str(code or "").split("-")[0].lower()
-
-
 def item_list(raw: Any) -> list[str] | None:
     """Arrays of strings; anything else is dropped rather than inflating the denominator."""
     if not isinstance(raw, list):
@@ -25,7 +20,7 @@ def item_list(raw: Any) -> list[str] | None:
 class Reversion:
     rev_text: str
     items: list[str] = field(default_factory=list)
-    # True when ``items`` holds only what the service repaired, so it cannot carry a denominator.
+    # True when `items` holds only what the service repaired, so it cannot carry a denominator.
     items_are_repairs_only: bool = False
 
 
@@ -204,9 +199,10 @@ class DntClient:
             ]
         }
 
-        # The service detects better for knowing the pair, sent as the base code its examples use.
+        # The service detects better for knowing the pair, sent as the base code its examples use:
+        # `en-gb` -> `en`.
         options = {
-            key: base_language(value)
+            key: str(value).split("-")[0].lower()
             for key, value in (
                 ("source_language", source_language),
                 ("target_language", target_language),

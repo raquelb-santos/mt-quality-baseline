@@ -296,9 +296,9 @@ def tokenize(text: object) -> list[str]:
     return [token for token in normalize_text(text).split(" ") if token]
 
 
-def count_surface(text: object, term: object, language_code: str | None) -> int:
-    haystack = normalize_text(text)
-    needle = normalize_text(term)
+def count_surface(text: object, term: object, language_code: str | None, *, casefold: bool = True) -> int:
+    haystack = normalize_text(text, casefold=casefold)
+    needle = normalize_text(term, casefold=casefold)
     if not haystack or not needle:
         return 0
     if is_unspaced_language(language_code):

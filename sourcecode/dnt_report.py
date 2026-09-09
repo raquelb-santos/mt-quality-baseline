@@ -1,10 +1,12 @@
 """Rendering for the DNT component: leaks and over-keeps get separate lines, never netted."""
 
+from collections import defaultdict
 from typing import Any, Sequence
 
-from . import dnt_score
 from .dnt_benchmark import DntResult
+from .dnt_score import pool
 from .report import Scorecard, by_stratum, cell, pct, rate, signed_pct, table
+from .text_processing import count_surface
 
 # The versions a run scores, in delivery order.
 PIPELINE = (("mt", "MT"), ("ape", "APE"), ("rev", "REV"))
@@ -92,22 +94,13 @@ def dnt_scorecard(result: DntResult) -> Scorecard:
 
 def item_rows(result: DntResult) -> list[dict[str, Any]]:
     """One row per distinct DNT item, with rates recomputed from the pooled counts, not averaged."""
-    pooled: dict[str, dict[str, Any]] = {}
+    pooled: dict[str, defaultdict[str, int]] = {}
 
     for segment in result.segments:
-        columns = {
-            "mt": {i.text: i for i in segment.mt.item_scores},
-            "ape": {i.text: i for i in segment.ape.item_scores},
-            "rev": {i.text: i for i in segment.rev.item_scores},
-        }
+        columns = {c: {i.text: i for i in getattr(segment, c).item_scores} for c, _ in PIPELINE}
         # One column's keys are all of them: an item is either scored in every column or in none.
         for text, mt_score in columns["mt"].items():
-            entry = pooled.setdefault(text, {
-                "in_src": 0,
-                "expected": 0,
-                **{f"{c}_{f}": 0 for c, _ in PIPELINE
-                   for f in ("preserved", "kept", "over_kept")},
-            })
+            entry = pooled.setdefault(text, defaultdict(int))
             # Once per segment: the count is a SRC property, so per-column adds would treble it.
             entry["in_src"] += mt_score.in_src
             # REF's own count: the denominator, identical for every version scored.
@@ -125,13 +118,9 @@ def item_rows(result: DntResult) -> list[dict[str, Any]]:
             "ref_kept": entry["expected"],
             "mt_over_kept": entry["mt_over_kept"],
             "rev_over_kept": entry["rev_over_kept"],
-            "rev_preserved": entry["rev_preserved"],
-            **{f"{column}_kept": entry[f"{column}_kept"] for column, _ in PIPELINE},
-            **{
-                f"{column}_preservation_rate":
-                    rate(entry[f"{column}_preserved"], entry["expected"])
-                for column, _ in PIPELINE
-            },
+            **{f"{c}_kept": entry[f"{c}_kept"] for c, _ in PIPELINE},
+            **{f"{c}_preservation_rate": rate(entry[f"{c}_preserved"], entry["expected"])
+               for c, _ in PIPELINE},
         }
         for text, entry in pooled.items()
     ]
@@ -147,7 +136,7 @@ def item_cells(result: DntResult) -> list[tuple[str, list[str]]]:
         (
             row["item"],
             [
-                str(row["mt_kept"]), str(row["ape_kept"]), str(row["rev_kept"]),
+                *(str(row[f"{column}_kept"]) for column, _ in PIPELINE),
                 str(row["ref_kept"]),
                 pct(row["rev_preservation_rate"]),
             ],
@@ -157,7 +146,6 @@ def item_cells(result: DntResult) -> list[tuple[str, list[str]]]:
 
 
 def render_dnt_items(result: DntResult) -> str:
-    """Every item weighed, worst first; REV alone hides the leaks reversion repaired."""
     rows = item_cells(result)
     if not rows:
         return "No DNT items were reported.\n"
@@ -199,24 +187,17 @@ def detection_rows(result: DntResult) -> list[dict[str, Any]]:
             continue
 
         for item in items:
-            in_src = dnt_score.count_item(segment.src_text, item, source_language)
-            in_ref = dnt_score.count_item(segment.ref_text, item, target_language)
+            in_src = count_surface(segment.src_text, item, source_language, casefold=False)
+            in_ref = count_surface(segment.ref_text, item, target_language, casefold=False)
             kept = {
-                column: dnt_score.count_item(text, item, target_language)
-                for column, text in (
-                    ("mt", segment.mt_text),
-                    ("ape", segment.ape_text),
-                    ("rev", segment.rev_text),
+                column: count_surface(
+                    getattr(segment, f"{column}_text"), item, target_language, casefold=False
                 )
+                for column, _ in PIPELINE
             }
 
             # The same gates `score_dnt` applies, so the row and the totals agree.
-            if not in_src:
-                flag = "not in SRC"
-            elif not in_ref:
-                flag = "not in REF"
-            else:
-                flag = ""
+            flag = "not in SRC" if not in_src else "not in REF" if not in_ref else ""
 
             rows.append({
                 "segment_id": segment.source_segment_id,
@@ -227,9 +208,9 @@ def detection_rows(result: DntResult) -> list[dict[str, Any]]:
                 "in_src": in_src,
                 "in_ref": in_ref,
                 **{f"in_{column}": value for column, value in kept.items()},
-                "expected": in_ref if not flag else 0,
+                "expected": 0 if flag else in_ref,
                 # The delivered version, so the ratio here is the one the report headlines.
-                "preserved": min(kept["rev"], in_ref) if not flag else 0,
+                "preserved": 0 if flag else min(kept["rev"], in_ref),
             })
 
     return rows
@@ -266,7 +247,6 @@ def render_dnt_detection(result: DntResult) -> str:
 
 
 def render_dnt_detection_console(result: DntResult) -> str:
-    """The same rows, aligned for a terminal."""
     rows = detection_rows(result)
     if not rows:
         return ""
@@ -314,9 +294,7 @@ def dnt_stratum_rows(results: Sequence[DntResult]) -> list[dict[str, Any]]:
     """One row per stratum, with the pooled counts its rates were computed from."""
     rows = []
     for (pair, domain), group in by_stratum(results).items():
-        mt = dnt_score.pool([r.mt for r in group])
-        ape = dnt_score.pool([r.ape for r in group])
-        rev = dnt_score.pool([r.rev for r in group])
+        mt, ape, rev = (pool([getattr(r, column) for r in group]) for column, _ in PIPELINE)
 
         rows.append({
             "language_pair": pair,
@@ -342,8 +320,7 @@ def stratum_rate_rows(results: Sequence[DntResult]) -> list[tuple[str, list[str]
     ]
 
     if len(rows) > 1:
-        pooled = [dnt_score.pool([getattr(r, attr) for r in results])
-                  for attr in ("mt", "ape", "rev")]
+        pooled = [pool([getattr(r, column) for r in results]) for column, _ in PIPELINE]
         rows.append(
             (f"ALL · {pooled[0].expected} inst", [pct(a.preservation_rate) for a in pooled])
         )

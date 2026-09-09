@@ -3,23 +3,12 @@
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
-from .text_processing import bounded_pattern, is_unspaced_language, normalize_text
+from .text_processing import count_surface
 from .report import rate
 
 
 CASE_DRIFT = "case_drift"
 TRANSLATED = "translated"
-
-
-def count_item(text: object, item: object, language_code: str | None, *, casefold: bool = False) -> int:
-    """Case-SENSITIVE, unlike `match`: different casing did not come through. No lemma fallback."""
-    haystack = normalize_text(text, casefold=casefold)
-    needle = normalize_text(item, casefold=casefold)
-    if not haystack or not needle:
-        return 0
-    if is_unspaced_language(language_code):
-        return haystack.count(needle)
-    return len(bounded_pattern(needle).findall(haystack))
 
 
 @dataclass
@@ -42,10 +31,10 @@ class LeakBreakdown:
 class ItemBreakdown:
     """Each item bucketed against the reference's count; exclusive and exhaustive."""
 
-    never_kept: int = 0         # none kept while the reference kept it
-    kept_partly: int = 0        # fewer than REF — kept in one place, translated in another
-    matched_ref: int = 0  # as many as REF, which kept it
-    over_kept: int = 0          # more than REF — kept more often than the human kept it
+    never_kept: int = 0     # none kept while the reference kept it
+    kept_partly: int = 0    # fewer than REF — kept in one place, translated in another
+    matched_ref: int = 0    # as many as REF, which kept it
+    over_kept: int = 0      # more than REF — kept more often than the human kept it
 
     @property
     def distinct_items(self) -> int:
@@ -58,28 +47,15 @@ class ItemBreakdown:
         self.over_kept += other.over_kept
 
 
-@dataclass
-class DntTally:
-    expected: int = 0
-    preserved: int = 0
-    over_kept: int = 0
-    leaks: LeakBreakdown = field(default_factory=LeakBreakdown)
-
-    @property
-    def leaked(self) -> int:
-        return self.expected - self.preserved
-
-
 @dataclass(frozen=True)
 class ItemScore:
     """The REF/version count pair every rate is built from, recorded even when fully preserved."""
 
     text: str
-    expected: int      # occurrences kept verbatim in REF
-    preserved: int     # occurrences kept verbatim in this version, bounded by REF's
-    kept: int          # occurrences kept verbatim in this version, unbounded
+    expected: int   # occurrences kept verbatim in REF
+    preserved: int  # occurrences kept verbatim in this version, bounded by REF's
+    kept: int       # occurrences kept verbatim in this version, unbounded
     in_src: int     # occurrences in SRC; the detector's own claim
-    # Meaningless without a shortfall.
     leak_kind: str = TRANSLATED
 
     @property
@@ -99,9 +75,8 @@ class DntScore:
     over_kept: int = 0
     leaks: LeakBreakdown = field(default_factory=LeakBreakdown)
     items: ItemBreakdown = field(default_factory=ItemBreakdown)
-    # Items the detector named that the source does not carry verbatim — a detector error.
+    # Named by the detector but absent from SRC; in SRC but not kept by REF.
     not_in_src: int = 0
-    # In the source but not kept by the reference: no expectation to measure against, so flagged.
     not_in_ref: int = 0
     item_scores: list[ItemScore] = field(default_factory=list)
 
@@ -119,14 +94,14 @@ def score_dnt(
     source_language_code: str | None,
     target_language_code: str | None,
 ) -> DntScore:
-    """Two language codes, not one: SRC is counted with the source, REF and the version with the target."""
+    """Two language codes: SRC is counted with the source, REF and the version with the target."""
     result = DntScore()
 
     # An item named twice for one segment is still one item.
     for item in dict.fromkeys(i for i in items if i):
-        expected = count_item(ref_text, item, target_language_code)
-        kept = count_item(text, item, target_language_code)
-        in_src = count_item(src_text, item, source_language_code)
+        expected = count_surface(ref_text, item, target_language_code, casefold=False)
+        kept = count_surface(text, item, target_language_code, casefold=False)
+        in_src = count_surface(src_text, item, source_language_code, casefold=False)
 
         # Tested in this order: a string the source lacks cannot be put to the reference at all.
         if in_src == 0:
@@ -146,7 +121,7 @@ def score_dnt(
         leak_kind = TRANSLATED
         if leaked:
             # The casefolding twin of the same count: what it finds beyond it is the drift.
-            loose = count_item(text, item, target_language_code, casefold=True)
+            loose = count_surface(text, item, target_language_code)
             drift = max(0, min(loose, expected) - preserved)
             leak_kind = CASE_DRIFT if drift == leaked else TRANSLATED
             result.leaks.case_drift += drift
@@ -197,96 +172,55 @@ class DntAggregate:
         return self.leaked + self.over_kept
 
 
-def _build(
-    tally: DntTally,
-    items: ItemBreakdown,
-    *,
-    not_in_src: int,
-    not_in_ref: int,
-    distinct_items: int,
-    segments_with_items: int,
-    segments_fully_preserved: int,
-    segments_unread: int,
-) -> DntAggregate:
-    return DntAggregate(
-        expected=tally.expected,
-        preserved=tally.preserved,
-        leaked=tally.leaked,
-        over_kept=tally.over_kept,
-        leaks=tally.leaks,
-        preservation_rate=rate(tally.preserved, tally.expected),
-        items=items,
-        not_in_src=not_in_src,
-        not_in_ref=not_in_ref,
-        distinct_items=distinct_items,
-        segments_with_items=segments_with_items,
-        segments_fully_preserved=segments_fully_preserved,
-        segment_preservation_rate=rate(segments_fully_preserved, segments_with_items),
-        segments_unread=segments_unread,
+def _with_rates(total: DntAggregate) -> DntAggregate:
+    total.leaked = total.expected - total.preserved
+    total.preservation_rate = rate(total.preserved, total.expected)
+    total.segment_preservation_rate = rate(
+        total.segments_fully_preserved, total.segments_with_items
     )
+    return total
 
 
 def aggregate(scores: Sequence[DntScore], *, segments_unread: int = 0) -> DntAggregate:
-    total = DntTally()
-    items = ItemBreakdown()
-    not_in_src = not_in_ref = distinct_items = 0
-    segments_with_items = segments_fully_preserved = 0
+    total = DntAggregate(segments_unread=segments_unread)
 
     for score in scores:
-        if score is None:
-            continue
-
-        not_in_src += score.not_in_src
-        not_in_ref += score.not_in_ref
-        distinct_items += len(score.item_scores)
+        total.not_in_src += score.not_in_src
+        total.not_in_ref += score.not_in_ref
+        total.distinct_items += len(score.item_scores)
 
         if not score.item_scores:
             continue
 
-        items.add(score.items)
         total.expected += score.expected
         total.preserved += score.preserved
         total.over_kept += score.over_kept
         total.leaks.add(score.leaks)
+        total.items.add(score.items)
 
         # Every scored item is kept at least once in REF, so a segment with any has a denominator.
-        segments_with_items += 1
+        total.segments_with_items += 1
         if score.preserved == score.expected and score.over_kept == 0:
-            segments_fully_preserved += 1
+            total.segments_fully_preserved += 1
 
-    return _build(
-        total, items,
-        not_in_src=not_in_src, not_in_ref=not_in_ref,
-        distinct_items=distinct_items, segments_with_items=segments_with_items,
-        segments_fully_preserved=segments_fully_preserved, segments_unread=segments_unread,
-    )
+    return _with_rates(total)
 
 
 def pool(aggregates: Sequence[DntAggregate]) -> DntAggregate:
     """Rates recomputed from the pooled totals; averaging would weight 3 instances like 300."""
-    total = DntTally()
-    items = ItemBreakdown()
-    not_in_src = not_in_ref = distinct_items = 0
-    segments_with_items = segments_fully_preserved = segments_unread = 0
+    total = DntAggregate()
 
     for agg in aggregates:
-        if agg is None:
-            continue
         total.expected += agg.expected
         total.preserved += agg.preserved
         total.over_kept += agg.over_kept
         total.leaks.add(agg.leaks)
-        items.add(agg.items)
-        not_in_src += agg.not_in_src
-        not_in_ref += agg.not_in_ref
-        distinct_items += agg.distinct_items
-        segments_with_items += agg.segments_with_items
-        segments_fully_preserved += agg.segments_fully_preserved
-        segments_unread += agg.segments_unread
+        total.items.add(agg.items)
+        total.not_in_src += agg.not_in_src
+        total.not_in_ref += agg.not_in_ref
+        total.distinct_items += agg.distinct_items
+        total.segments_with_items += agg.segments_with_items
+        total.segments_fully_preserved += agg.segments_fully_preserved
+        total.segments_unread += agg.segments_unread
 
-    return _build(
-        total, items,
-        not_in_src=not_in_src, not_in_ref=not_in_ref,
-        distinct_items=distinct_items, segments_with_items=segments_with_items,
-        segments_fully_preserved=segments_fully_preserved, segments_unread=segments_unread,
-    )
+    return _with_rates(total)

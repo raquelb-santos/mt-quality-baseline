@@ -3,10 +3,8 @@
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any
-
 from pathlib import Path
+from typing import Any
 
 from .text_processing import Dataset, load
 from .dnt_score import DntAggregate, DntScore, aggregate, score_dnt
@@ -32,8 +30,6 @@ def load_dataset(path: Path, *, dry_run: bool) -> Dataset:
 
 @dataclass
 class DntSegmentResult:
-    """One segment's five versions, named the same way everywhere: SRC, MT, APE, REV, REF."""
-
     source_segment_id: str
     src_text: str
     mt_text: str
@@ -63,8 +59,6 @@ class DntDelta:
 @dataclass
 class DntResult:
     dataset: str
-    started_at: str
-    finished_at: str
     parameters: dict[str, Any]
     totals: dict[str, int]
     mt: DntAggregate
@@ -95,9 +89,7 @@ def _failing(score: DntScore) -> set[str]:
     return {item.text for item in score.item_scores if item.leaked or item.over_kept}
 
 
-def _repairs(
-    results: list[DntSegmentResult], before: str, after: str, label: str
-) -> dict[str, int]:
+def _repairs(results: list[DntSegmentResult], before: str, after: str) -> dict[str, int]:
     """Fixed and broken counted separately: swapping one failure for the other is not a repair."""
     fixed = broken = 0
     for result in results:
@@ -105,7 +97,7 @@ def _repairs(
         now = _failing(getattr(result, after))
         fixed += len(was - now)
         broken += len(now - was)
-    return {f"items_fixed_by_{label}": fixed, f"items_broken_by_{label}": broken}
+    return {f"items_fixed_by_{after}": fixed, f"items_broken_by_{after}": broken}
 
 
 class DntBenchmark:
@@ -115,7 +107,6 @@ class DntBenchmark:
         self.config = config
 
     def run(self, dataset: Dataset, *, skip_pipeline: bool = False) -> DntResult:
-        started_at = datetime.now(timezone.utc).isoformat()
         source_language = dataset.parameters.get("clean_source_language_code")
         target_language = dataset.parameters.get("clean_target_language_code")
 
@@ -123,7 +114,6 @@ class DntBenchmark:
             self.postmt, dataset, batch_size=self.config.benchmark.batch_size
         )
         processed = outcome.segments
-        failures = [] if skip_pipeline else outcome.failures
 
         src_texts = [s.get("source_content") or "" for s in dataset.segments]
         ref_texts = [s.get("reference_content") or "" for s in dataset.segments]
@@ -165,13 +155,14 @@ class DntBenchmark:
         for index, segment in enumerate(processed):
             reversion = reversions[index]
             items = per_segment_items[index]
-            ape_text = ape_texts[index]
+            src_text, ref_text = src_texts[index], ref_texts[index]
+            mt_text, ape_text = mt_texts[index], ape_texts[index]
             rev_text = ape_text if reversion is None else reversion.rev_text
 
             common = dict(
                 items=items,
-                src_text=src_texts[index],
-                ref_text=ref_texts[index],
+                src_text=src_text,
+                ref_text=ref_text,
                 source_language_code=source_language,
                 target_language_code=target_language,
             )
@@ -182,21 +173,22 @@ class DntBenchmark:
                     or dataset.segments[index].get("source_segment_id")
                     or index
                 ),
-                src_text=src_texts[index],
-                mt_text=mt_texts[index],
+                src_text=src_text,
+                mt_text=mt_text,
                 ape_text=ape_text,
                 rev_text=rev_text,
-                ref_text=ref_texts[index],
-                changed_by_ape=mt_texts[index] != ape_text,
+                ref_text=ref_text,
+                changed_by_ape=mt_text != ape_text,
                 changed_by_rev=ape_text != rev_text,
                 items=items,
                 unread=reversion is None,
-                mt=score_dnt(text=mt_texts[index], **common),
+                mt=score_dnt(text=mt_text, **common),
                 ape=score_dnt(text=ape_text, **common),
                 rev=score_dnt(text=rev_text, **common),
-                ref=score_dnt(text=ref_texts[index], **common),
+                ref=score_dnt(text=ref_text, **common),
             ))
 
+        failures = outcome.failures
         if failures:
             logger.error(
                 "[DNT] %d/%d segments carry a post-mt error, so their APE text is just MT "
@@ -206,15 +198,13 @@ class DntBenchmark:
             )
 
         scored = [r for r in results if not r.unread]
-        mt_aggregate = aggregate([r.mt for r in scored], segments_unread=unread)
-        ape_aggregate = aggregate([r.ape for r in scored], segments_unread=unread)
-        rev_aggregate = aggregate([r.rev for r in scored], segments_unread=unread)
-        ref_aggregate = aggregate([r.ref for r in scored], segments_unread=unread)
+        mt = aggregate([r.mt for r in scored], segments_unread=unread)
+        ape = aggregate([r.ape for r in scored], segments_unread=unread)
+        rev = aggregate([r.rev for r in scored], segments_unread=unread)
+        ref = aggregate([r.ref for r in scored], segments_unread=unread)
 
         return DntResult(
             dataset=f"{dataset.name} (dry-run)" if skip_pipeline else dataset.name,
-            started_at=started_at,
-            finished_at=datetime.now(timezone.utc).isoformat(),
             parameters={
                 "source_language": source_language,
                 "target_language": target_language,
@@ -233,19 +223,15 @@ class DntBenchmark:
                 "segments_changed_by_ape": sum(1 for r in results if r.changed_by_ape),
                 "segments_changed_by_rev": sum(1 for r in results if r.changed_by_rev),
             },
-            mt=mt_aggregate,
-            ape=ape_aggregate,
-            rev=rev_aggregate,
-            ref=ref_aggregate,
+            mt=mt,
+            ape=ape,
+            rev=rev,
+            ref=ref,
             delta=DntDelta(
-                ape_preservation_rate=_delta(
-                    mt_aggregate.preservation_rate, ape_aggregate.preservation_rate
-                ),
-                rev_preservation_rate=_delta(
-                    ape_aggregate.preservation_rate, rev_aggregate.preservation_rate
-                ),
-                **_repairs(scored, "mt", "ape", "ape"),
-                **_repairs(scored, "ape", "rev", "rev"),
+                ape_preservation_rate=_delta(mt.preservation_rate, ape.preservation_rate),
+                rev_preservation_rate=_delta(ape.preservation_rate, rev.preservation_rate),
+                **_repairs(scored, "mt", "ape"),
+                **_repairs(scored, "ape", "rev"),
             ),
             segments=results,
         )

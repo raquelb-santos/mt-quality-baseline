@@ -20,7 +20,6 @@ from sourcecode.text_processing import (
     parse_mxliff,
 )
 from sourcecode.dnt import DntClient, Reversion
-from sourcecode.dnt_score import count_item
 from sourcecode.glossary import GlossaryClient
 from sourcecode.postmt import (
     extract_post_edited,
@@ -148,25 +147,17 @@ def test_unknown_languages_pass_through_rather_than_raising():
     assert out["clean_target_language_code"] == "klingon"
 
 
-# verbatim counting, for DNT
-# `count_item` is the odd one out: everything above casefolds and it does not.
+# verbatim counting, which DNT asks for
 
-def test_count_item_is_case_sensitive_unlike_neighbours():
-    assert count_item("Le iPhone est ici.", "iPhone", "fr-fr") == 1
-    assert count_item("Le iphone est ici.", "iPhone", "fr-fr") == 0
+def test_count_surface_can_be_case_sensitive():
+    assert count_surface("Le iPhone est ici.", "iPhone", "fr-fr", casefold=False) == 1
+    assert count_surface("Le iphone est ici.", "iPhone", "fr-fr", casefold=False) == 0
     assert count_surface("Le iphone est ici.", "iPhone", "fr-fr") == 1
 
 
-def test_count_item_has_no_lemma_fallback():
-    """There is no parameter to pass one: a lemma-matched DNT item is by definition a leak."""
-    import inspect
-
-    assert "lemma" not in str(inspect.signature(count_item))
-
-
-def test_count_item_inherits_underscore_boundary():
+def test_count_surface_inherits_underscore_boundary():
     """`_` is excluded from the boundary class, so it does not separate words."""
-    assert count_item("foo_BAR here", "BAR", "en-gb") == 1
+    assert count_surface("foo_BAR here", "BAR", "en-gb") == 1
 
 
 # dataset loading
