@@ -46,13 +46,19 @@ def _env_list(name: str) -> Any:
     return field(default_factory=lambda: parse_list(os.getenv(name) or ""))
 
 
+def _env_float(name: str) -> Any:
+    return field(default_factory=lambda: float(_required(name)))
+
+
+def _env_int(name: str) -> Any:
+    return field(default_factory=lambda: int(_required(name)))
 
 
 def _env_bool(name: str) -> Any:
     return field(default_factory=lambda: _required(name).lower() in {"1", "true", "yes", "on"})
 
 
-PATH_VARIABLES = {"glossary": "GLOSSARY_PATH", "dnt": "DNT_PATH"}
+PATH_VARIABLES = {"glossary": "GLOSSARY_PATH", "dnt": "DNT_PATH", "tm": "TM_PATH"}
 
 
 @dataclass(frozen=True)
@@ -89,6 +95,39 @@ class DntConfig:
     batch_size: int = 25
 
 
+@dataclass(frozen=True)
+class TmConfig:
+    # What a candidate must reach to be a fuzzy or a semantic match.
+    fuzzy_floor: float = _env_float("TM_FUZZY_FLOOR")
+    semantic_floor: float = _env_float("TM_SEMANTIC_FLOOR")
+    # How close a version must be to the entry to count as having used it.
+    reference_floor: float = _env_float("TM_REFERENCE_FLOOR")
+    reference_semantic_floor: float = _env_float("TM_REFERENCE_SEMANTIC_FLOOR")
+    # What an entry covering part of a segment must reach there, above the whole-segment floors.
+    partial_floor: float = _env_float("TM_PARTIAL_FLOOR")
+    length_guard: float = _env_float("TM_LENGTH_GUARD")
+    min_relevance: int = _env_int("TM_MIN_RELEVANCE")
+    hard_negatives: bool = _env_bool("TM_HARD_NEGATIVES")
+
+
+@dataclass(frozen=True)
+class TmIndexConfig:
+    index: str | None = _env("TM_INDEX")
+    node: str | None = _env("TM_SEARCH_ENGINE_URL")
+    source_field: str | None = _env("TM_SOURCE_FIELD")
+    target_field: str | None = _env("TM_TARGET_FIELD")
+    source_language_field: str | None = _env("TM_SOURCE_LANG_FIELD")
+    target_language_field: str | None = _env("TM_TARGET_LANG_FIELD")
+
+
+@dataclass(frozen=True)
+class TmEmbeddingConfig:
+    base_url: str | None = _env("TM_EMBEDDING_URL")
+    model: str | None = _env("TM_EMBEDDING_MODEL")
+    api_key: str | None = _env("TM_EMBEDDING_API_KEY")
+    timeout: float = 120.0
+
+
 @dataclass
 class BenchmarkConfig:
     batch_size: int = 50
@@ -109,4 +148,7 @@ class Config:
     stanza: StanzaConfig = field(default_factory=StanzaConfig)
     search_engine: SearchEngineConfig = field(default_factory=SearchEngineConfig)
     dnt: DntConfig = field(default_factory=DntConfig)
+    tm: TmConfig = field(default_factory=TmConfig)
+    tm_index: TmIndexConfig = field(default_factory=TmIndexConfig)
+    tm_embedding: TmEmbeddingConfig = field(default_factory=TmEmbeddingConfig)
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)

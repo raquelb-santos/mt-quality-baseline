@@ -11,10 +11,13 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sourcecode import dnt_benchmark, dnt_report, glossary_benchmark, glossary_report, report
-from sourcecode import text_processing
+from sourcecode import text_processing, tm_benchmark, tm_report
 from sourcecode.config import PATH_VARIABLES, Config
 from sourcecode.dnt import DntClient
 from sourcecode.glossary import GlossaryClient
+from sourcecode.search_engine import SearchClient
+from sourcecode.tm_embed import TmEmbedder
+from sourcecode.tm_index import TmFields, TmIndexClient
 from sourcecode.postmt import PostMtClient, StanzaClient
 
 
@@ -41,12 +44,25 @@ COMPONENT_SECTIONS = {
             dnt_report.render_dnt_strata(results),
         ],
     ),
+    "tm": (
+        "TM reference",
+        lambda results: [
+            *(part for result in results
+              for part in (tm_report.tm_scorecard(result).as_markdown(),
+                           tm_report.render_tm_bands(result),
+                           tm_report.render_tm_compliance(result),
+                           tm_report.render_tm_calibration(result),
+                           tm_report.render_tm_segments(result))),
+            tm_report.render_tm_strata(results),
+        ],
+    ),
 }
 
 # The pooled table the console gets once a component's datasets are all scored.
 STRATA_CONSOLE = {
     "glossary": glossary_report.render_strata_console,
     "dnt": dnt_report.render_dnt_strata_console,
+    "tm": lambda results: tm_report.render_tm_strata(results, console=True),
 }
 
 
@@ -94,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{', '.join(text_processing.COMPONENTS)}.", file=sys.stderr)
         return 2
 
-    if "glossary" in components:
+    if {"glossary", "tm"} & set(components):
         if config.search_engine.aws_sigv4 and not config.search_engine.aws_region:
             print("ES_AWS_SIGV4_ENABLED is set but AWS_REGION is not.", file=sys.stderr)
             return 2
@@ -107,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         "aws_profile": config.search_engine.aws_profile,
     }
 
-    stanza = glossary = dnt = postmt = None
+    stanza = glossary = dnt = postmt = tm_search = None
 
     try:
         if "glossary" in components:
@@ -136,6 +152,59 @@ def main(argv: list[str] | None = None) -> int:
                 fix = "Check DNT_API_KEY." if dnt.authenticated else "Set DNT_API_KEY."
                 print(f"Cannot use the DNT service at {config.dnt.base_url}. {fix}", file=sys.stderr)
                 return 1
+
+        if "tm" in components:
+            node = config.tm_index.node or config.search_engine.node
+            if not node:
+                print("Set SEARCH_ENGINE_URL (or TM_SEARCH_ENGINE_URL) to the cluster the TM index "
+                      "lives on.", file=sys.stderr)
+                return 2
+
+            fields = (config.tm_index.source_field, config.tm_index.target_field,
+                      config.tm_index.source_language_field, config.tm_index.target_language_field)
+            if not config.tm_index.index or not all(fields):
+                print("Set TM_INDEX and the TM_*_FIELD names the index uses.", file=sys.stderr)
+                return 2
+
+            tm_search = SearchClient(node, **search_credentials)
+            if not tm_search.ping():
+                print(f"Search engine unreachable at {node}.", file=sys.stderr)
+                return 1
+
+            embedder = None
+            if config.tm_embedding.api_key:
+                if not config.tm_embedding.base_url or not config.tm_embedding.model:
+                    print("Set TM_EMBEDDING_URL and TM_EMBEDDING_MODEL to embed with.",
+                          file=sys.stderr)
+                    return 2
+
+                embedder = TmEmbedder(
+                    config.tm_embedding.base_url,
+                    config.tm_embedding.model,
+                    config.tm_embedding.api_key,
+                    config.tm_embedding.timeout,
+                )
+                if not embedder.ping():
+                    print(f"Cannot embed with {config.tm_embedding.model} at "
+                          f"{config.tm_embedding.base_url}.", file=sys.stderr)
+                    return 1
+            else:
+                # Said plainly so the unmeasured semantic rows are not read as a cluster problem.
+                logging.warning(
+                    "[TM] no embedder is wired: set TM_EMBEDDING_API_KEY to measure the semantic "
+                    "band. Its rows read unmeasured and the match test stops at character proximity."
+                )
+
+            tm_index = TmIndexClient(
+                tm_search,
+                config.tm_index.index,
+                TmFields(
+                    source=config.tm_index.source_field,
+                    target=config.tm_index.target_field,
+                    source_language=config.tm_index.source_language_field,
+                    target_language=config.tm_index.target_language_field,
+                ),
+            )
 
         if not args.dry_run:
             if not config.postmt.base_url:
@@ -190,6 +259,17 @@ def main(argv: list[str] | None = None) -> int:
                         dnt_report.render_dnt_detection_console(scored),
                         dnt_report.render_dnt_items_console(scored),
                     ]
+                elif component == "tm":
+                    data = tm_benchmark.load_dataset(path, dry_run=args.dry_run)
+                    scored = tm_benchmark.TmBenchmark(
+                        postmt=postmt, index=tm_index, config=config, embedder=embedder
+                    ).run(data, skip_pipeline=args.dry_run)
+                    blocks = [
+                        tm_report.tm_scorecard(scored).as_console(),
+                        tm_report.render_tm_bands(scored, console=True),
+                        tm_report.render_tm_compliance(scored, console=True),
+                        tm_report.render_tm_segments_console(scored),
+                    ]
 
                 for block in blocks:
                     if block:
@@ -221,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("%s", error)
         return 1
     finally:
-        for client in (stanza, glossary, dnt, postmt):
+        for client in (stanza, glossary, dnt, postmt, tm_search):
             if client is not None:
                 client.close()
 

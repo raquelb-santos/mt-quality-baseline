@@ -18,6 +18,8 @@ dependencies = [
 [project.optional-dependencies]
 # Only needed to reach an AWS-managed OpenSearch/Elasticsearch domain, which rejects basic auth.
 aws = ["botocore>=1.34"]
+# Only needed for the TM semantic band and semantic match tier, which embed through LiteLLM.
+semantic = ["litellm>=1.60"]
 dev = [
     "pytest>=8.0",
 ]

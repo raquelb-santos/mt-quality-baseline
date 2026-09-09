@@ -12,12 +12,13 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-COMPONENTS = ("glossary", "dnt")
+COMPONENTS = ("glossary", "dnt", "tm")
 
 # What each component's folder is scanned for
 DATA_TYPES: dict[str, tuple[str, ...]] = {
     "glossary": (".json", ".csv", ".mxliff", ".xliff", ".xlf"),
     "dnt": (".json", ".csv", ".mxliff", ".xliff", ".xlf"),
+    "tm": (".jsonl",),
 }
 
 PARAMS_SUFFIX = ".params.json"

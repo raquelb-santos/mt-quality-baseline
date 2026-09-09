@@ -12,6 +12,7 @@ from sourcecode.text_processing import (
     count_lemma,
     count_occurrences,
     count_surface,
+    find_datasets,
     is_unspaced_language,
     load,
     normalize_language,
@@ -1160,6 +1161,33 @@ def test_missing_search_engine_url_is_config(
 
     assert code == 2
     assert "SEARCH_ENGINE_URL" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("component", ["glossary", "tm"])
+def test_sigv4_without_region_stops_every_search_component(
+    configure, stub_postmt, monkeypatch, capsys, component
+):
+    """Unguarded, the run falls back to basic auth and the managed domain's rejection reads as an
+    unreachable node - the wrong thing to go looking at."""
+    configure()
+    monkeypatch.setenv("BENCH_COMPONENT", component)
+    monkeypatch.setenv("ES_AWS_SIGV4_ENABLED", "true")
+    monkeypatch.delenv("AWS_REGION", raising=False)
+
+    code = run.main(["--dry-run"])
+
+    assert code == 2
+    assert "AWS_REGION" in capsys.readouterr().err
+
+
+def test_folder_scan_takes_only_types_component_reads(tmp_path):
+    """A `.jsonl` is a TM gold set; picking one up for glossary would hand it the wrong parser."""
+    (tmp_path / "d.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "gold.jsonl").write_text("{}", encoding="utf-8")
+
+    for component, expected in (("glossary", ["d.json"]), ("tm", ["gold.jsonl"])):
+        found = find_datasets(str(tmp_path), variable="X_PATH", component=component)
+        assert [path.name for path in found] == expected
 
 
 def test_pinned_ids_are_ones_queried(configure, stub_postmt, stub_glossary):
