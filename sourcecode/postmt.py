@@ -42,7 +42,7 @@ def preflight_submission(parameters: dict[str, Any]) -> list[str]:
     """Reasons post-mt would reject the task outright, whatever is being measured."""
     return [
         f"`{name}` is missing — post-mt rejects every segment with "
-        f"'Missing required parameters fields: {name}' and returns no post-edited text"
+        f"'Missing required parameters fields: {name}' and returns no APE text"
         for name in ("tempo_task_id", "cat_project_id")
         if not str(parameters.get(name) or "").strip()
     ]
@@ -68,7 +68,6 @@ def preflight_parameters(parameters: dict[str, Any]) -> list[str]:
 
 
 def raise_for_preflight(problems: list[str], message: str) -> None:
-    """Log every problem, then stop the run with the one line saying what it would have cost."""
     if problems:
         for problem in problems:
             logger.error("[PREFLIGHT] %s", problem)
@@ -175,11 +174,6 @@ class PostMtClient:
             raise PostMtError("submit returned no taskId")
         return task_id
 
-    def get_status(self, task_id: str) -> dict[str, Any]:
-        response = self._client.get(f"/api/workflow/async/{task_id}/status")
-        response.raise_for_status()
-        return response.json()
-
     def get_task(self, task_id: str) -> dict[str, Any]:
         response = self._client.get(f"/api/workflow/async/{task_id}")
         response.raise_for_status()
@@ -194,7 +188,9 @@ class PostMtClient:
         last_percent = -1
 
         while time.monotonic() < deadline:
-            status_body = self.get_status(task_id)
+            response = self._client.get(f"/api/workflow/async/{task_id}/status")
+            response.raise_for_status()
+            status_body = response.json()
             status = status_body.get("status")
 
             percent = (status_body.get("progress") or {}).get("percent")
@@ -264,23 +260,22 @@ class StanzaClient:
     def close(self) -> None:
         self._client.close()
 
-    def lemmatize_batch(self, texts: list[str], language: str) -> list[str]:
+    def lemmatize_batch_safe(self, texts: list[str], language: str) -> list[str] | None:
+        """None where lemmatization is unavailable or came back misaligned, so callers skip it."""
         if not texts:
             return []
-        response = self._client.post("/lemmatize/batch", json={"texts": texts, "language": language})
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict):
-            return payload.get("lemmatized_texts") or []
-        return payload or []
 
-    def lemmatize_batch_safe(self, texts: list[str], language: str) -> list[str] | None:
         try:
-            lemmas = self.lemmatize_batch(texts, language)
+            response = self._client.post(
+                "/lemmatize/batch", json={"texts": texts, "language": language}
+            )
+            response.raise_for_status()
+            payload = response.json()
         except (httpx.HTTPError, ValueError) as error:
             logger.warning("[STANZA] lemmatization unavailable for %s: %s", language, error)
             return None
 
+        lemmas = payload.get("lemmatized_texts") or [] if isinstance(payload, dict) else payload or []
         if len(lemmas) != len(texts):
             logger.warning(
                 "[STANZA] returned %d lemmas for %d texts (%s) - ignoring",

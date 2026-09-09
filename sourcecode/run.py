@@ -43,17 +43,11 @@ COMPONENT_SECTIONS = {
     ),
 }
 
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="mt-quality-baseline",
-        description="Measure the translation quality of the post-mt pipeline.",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="score the MT baseline only; never calls post-mt",
-    )
-    return parser
+# The pooled table the console gets once a component's datasets are all scored.
+STRATA_CONSOLE = {
+    "glossary": glossary_report.render_strata_console,
+    "dnt": dnt_report.render_dnt_strata_console,
+}
 
 
 def _force_utf8_output() -> None:
@@ -68,7 +62,15 @@ def _force_utf8_output() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = argparse.ArgumentParser(
+        prog="mt-quality-baseline",
+        description="Measure the translation quality of the post-mt pipeline.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="score the MT baseline only; never calls post-mt",
+    )
+    args = parser.parse_args(argv)
 
     _force_utf8_output()
 
@@ -92,6 +94,19 @@ def main(argv: list[str] | None = None) -> int:
               f"{', '.join(text_processing.COMPONENTS)}.", file=sys.stderr)
         return 2
 
+    if "glossary" in components:
+        if config.search_engine.aws_sigv4 and not config.search_engine.aws_region:
+            print("ES_AWS_SIGV4_ENABLED is set but AWS_REGION is not.", file=sys.stderr)
+            return 2
+
+    search_credentials = {
+        "username": config.search_engine.username,
+        "password": config.search_engine.password,
+        "timeout": config.search_engine.timeout,
+        "aws_region": config.search_engine.aws_region if config.search_engine.aws_sigv4 else None,
+        "aws_profile": config.search_engine.aws_profile,
+    }
+
     stanza = glossary = dnt = postmt = None
 
     try:
@@ -100,19 +115,13 @@ def main(argv: list[str] | None = None) -> int:
                 print("Set SEARCH_ENGINE_URL to the term-bases index post-mt queries.",
                       file=sys.stderr)
                 return 2
-            if config.search_engine.aws_sigv4 and not config.search_engine.aws_region:
-                print("ES_AWS_SIGV4_ENABLED is set but AWS_REGION is not.", file=sys.stderr)
+
+            if not config.stanza.base_url:
+                print("Set STANZA_BASE_URL to the lemmatizer.", file=sys.stderr)
                 return 2
 
             stanza = StanzaClient(config.stanza.base_url, config.stanza.timeout)
-            glossary = GlossaryClient(
-                config.search_engine.node,
-                config.search_engine.username,
-                config.search_engine.password,
-                config.search_engine.timeout,
-                aws_region=config.search_engine.aws_region if config.search_engine.aws_sigv4 else None,
-                aws_profile=config.search_engine.aws_profile,
-            )
+            glossary = GlossaryClient(config.search_engine.node, **search_credentials)
             if not glossary.ping():
                 print(f"Search engine unreachable at {config.search_engine.node}.", file=sys.stderr)
                 return 1
@@ -129,6 +138,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
         if not args.dry_run:
+            if not config.postmt.base_url:
+                print("Set POSTMT_BASE_URL to the post-mt instance to drive.", file=sys.stderr)
+                return 2
+
             postmt = PostMtClient(
                 config.postmt.base_url,
                 config.postmt.poll_interval,
@@ -144,8 +157,10 @@ def main(argv: list[str] | None = None) -> int:
 
         results_by_component: dict[str, list[Any]] = {}
         for component in components:
-            configured = config.benchmark.data_path(component)
-            datasets = text_processing.find_datasets(configured, variable=PATH_VARIABLES[component])
+            configured = config.benchmark.paths[component]
+            datasets = text_processing.find_datasets(
+                configured, variable=PATH_VARIABLES[component], component=component,
+            )
             logging.info("[BENCH] %s: %s", PATH_VARIABLES[component], configured)
             if len(datasets) > 1:
                 logging.info("[BENCH] %d %s datasets to score", len(datasets), component)
@@ -180,13 +195,10 @@ def main(argv: list[str] | None = None) -> int:
                     if block:
                         print(block)
                 results.append(scored)
-            results_by_component[component] = results
 
-            # After the datasets: pools every dataset that shares a stratum
-            if component == "glossary" and results:
-                print(glossary_report.render_strata_console(results))
-            elif component == "dnt" and results:
-                print(dnt_report.render_dnt_strata_console(results))
+            results_by_component[component] = results
+            if results:
+                print(STRATA_CONSOLE[component](results))
 
         report_file = report.write_report(
             results_by_component,

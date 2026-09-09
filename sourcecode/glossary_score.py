@@ -4,15 +4,17 @@ from typing import Iterable, Mapping, Sequence
 from .text_processing import count_occurrences, normalize_text
 from .report import rate
 
+MISS = "miss"                              # no sanctioned target form in the output
+INCONSISTENCY = "inconsistency"            # an approved target other than the one the reference used
+OVER_APPLICATION = "over-application"      # a target term used where its source term was not
+
 
 def build_glossary_map(mappings: Iterable[Mapping[str, str]] | None) -> dict[str, set[str]]:
     glossary_map: dict[str, set[str]] = {}
     for mapping in mappings or []:
-        source = mapping.get("source_content")
-        target = mapping.get("target_content")
-        if not source or not target:
-            continue
-        glossary_map.setdefault(source, set()).add(target)
+        source, target = mapping.get("source_content"), mapping.get("target_content")
+        if source and target:
+            glossary_map.setdefault(source, set()).add(target)
     return glossary_map
 
 
@@ -25,7 +27,11 @@ class Tally:
     def violations(self) -> int:
         return self.expected - self.adherent
 
-    def add(self, other: Tally | TallyReport | TranslationScore) -> None:
+    @property
+    def adherence_rate(self) -> float | None:
+        return rate(self.adherent, self.expected)
+
+    def add(self, other: Tally | TranslationScore) -> None:
         self.expected += other.expected
         self.adherent += other.adherent
 
@@ -48,11 +54,6 @@ class TermBreakdown:
         self.used_partly += other.used_partly
         self.used_everywhere += other.used_everywhere
         self.over_used += other.over_used
-
-
-MISS = "miss"                              # no sanctioned target form in the output
-INCONSISTENCY = "inconsistency"            # an approved target other than the one the reference used
-OVER_APPLICATION = "over-application"      # a target term used where its source term was not
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,22 @@ class TranslationScore:
     violations: list[Violation] = field(default_factory=list)
 
 
+def _count_renderings(
+    text: str,
+    targets: Sequence[str],
+    language_code: str | None,
+    text_lemmas: str | None,
+    term_lemmas: Mapping[str, str] | None,
+) -> int:
+    return sum(
+        count_occurrences(
+            text=text, term=target, language_code=language_code,
+            text_lemmas=text_lemmas, term_lemmas=(term_lemmas or {}).get(target),
+        )
+        for target in targets
+    )
+
+
 def score_translation(
     *,
     mappings: Iterable[Mapping[str, str]] | None,
@@ -105,7 +122,7 @@ def score_translation(
     ref_lemmas: str | None = None,
     term_lemmas: Mapping[str, str] | None = None,
 ) -> TranslationScore:
-    """Score one translation of a segment against the human reference for that same segment."""
+    """Score one translation of a segment against REF for that same segment."""
     result = TranslationScore()
 
     for source, targets in build_glossary_map(mappings).items():
@@ -153,44 +170,14 @@ def score_translation(
     return result
 
 
-def _count_renderings(
-    text: str,
-    targets: Sequence[str],
-    language_code: str | None,
-    text_lemmas: str | None,
-    term_lemmas: Mapping[str, str] | None,
-) -> int:
-    """How often any target term for one source term appears in `text`."""
-    return sum(
-        count_occurrences(
-            text=text, term=target, language_code=language_code,
-            text_lemmas=text_lemmas, term_lemmas=(term_lemmas or {}).get(target),
-        )
-        for target in targets
-    )
-
-
 @dataclass
-class TallyReport:
+class Aggregate:
     expected: int
     adherent: int
     violations: int
     adherence_rate: float | None
-
-
-def with_rates(tally: Tally) -> TallyReport:
-    return TallyReport(
-        expected=tally.expected,
-        adherent=tally.adherent,
-        violations=tally.violations,
-        adherence_rate=rate(tally.adherent, tally.expected),
-    )
-
-
-@dataclass
-class Aggregate(TallyReport):
-    strict: TallyReport
-    permissive: TallyReport
+    strict: Tally
+    permissive: Tally
     terms: TermBreakdown
     segments_with_glossary: int
     segments_fully_adherent: int
@@ -218,8 +205,8 @@ def _combine(
         adherent=total.adherent,
         violations=total.violations,
         adherence_rate=rate(total.adherent, total.expected),
-        strict=with_rates(strict),
-        permissive=with_rates(permissive),
+        strict=strict,
+        permissive=permissive,
         terms=terms,
         segments_with_glossary=segments_with_glossary,
         segments_fully_adherent=segments_fully_adherent,
@@ -249,16 +236,13 @@ def pool(aggregates: Sequence[Aggregate]) -> Aggregate:
     )
 
 
-# Adherence asks what this version reproduced; this asks what it got wrong.
-
 @dataclass
 class ViolationReport:
-    """The rate is over every segment: one with no term retrieved can still over-apply one."""
-
     miss: int = 0
     inconsistency: int = 0
     over_application: int = 0
     total: int = 0
+    # Every segment, not just the glossary-bearing ones: one with no term retrieved can over-apply.
     segments: int = 0
     segments_with_violation: int = 0
     violation_rate: float | None = None
@@ -384,15 +368,10 @@ def find_violations(
 
 def pool_violations(reports: Sequence[ViolationReport]) -> ViolationReport:
     """`items` is left empty: a segment index only means something inside its own dataset."""
+    items = [r for r in reports if r is not None]
     pooled = ViolationReport()
-    for item in reports:
-        if item is None:
-            continue
-        pooled.miss += item.miss
-        pooled.inconsistency += item.inconsistency
-        pooled.over_application += item.over_application
-        pooled.total += item.total
-        pooled.segments += item.segments
-        pooled.segments_with_violation += item.segments_with_violation
+    for name in ("miss", "inconsistency", "over_application", "total",
+                 "segments", "segments_with_violation"):
+        setattr(pooled, name, sum(getattr(r, name) for r in items))
     pooled.violation_rate = rate(pooled.segments_with_violation, pooled.segments)
     return pooled

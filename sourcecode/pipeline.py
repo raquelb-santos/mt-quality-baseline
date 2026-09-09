@@ -1,4 +1,4 @@
-"""Driving post-mt over a dataset's segments, shared by every quality component."""
+"""Driving post-mt over a dataset's segments, shared by every component."""
 
 import logging
 from dataclasses import dataclass, field
@@ -34,7 +34,7 @@ def run_pipeline(postmt: Any, dataset: Dataset, *, batch_size: int) -> PipelineO
 
         result = postmt.run(
             parameters=dataset.parameters,
-            # The human reference is the answer key: stripped so it can never reach post-mt.
+            # REF is the answer key: stripped so it can never reach post-mt.
             segments=[
                 {k: v for k, v in segment.items() if k != "reference_content"}
                 for segment in batch
@@ -69,7 +69,7 @@ def run_pipeline(postmt: Any, dataset: Dataset, *, batch_size: int) -> PipelineO
 
 
 def stub_pipeline(dataset: Dataset) -> PipelineOutcome:
-    """The dry-run stand-in: the post-edited column mirrors the MT baseline, so every delta is zero."""
+    """The dry-run stand-in: the APE column mirrors MT, so every delta is zero."""
     return PipelineOutcome(
         segments=[
             {**segment, "ape_results": {"text": segment.get("target_content", "")}}

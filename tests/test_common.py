@@ -5,6 +5,7 @@ import json
 import httpx
 import pytest
 
+from sourcecode import config
 from sourcecode import run
 from sourcecode import dnt
 from sourcecode.text_processing import (
@@ -19,7 +20,6 @@ from sourcecode.text_processing import (
     parse_mxliff,
 )
 from sourcecode.dnt import DntClient, Reversion
-from sourcecode.dnt import Reversion
 from sourcecode.dnt_score import count_item
 from sourcecode.glossary import GlossaryClient
 from sourcecode.postmt import (
@@ -30,11 +30,9 @@ from sourcecode.postmt import (
 )
 
 
-# ================================================================================================
 # matching and counting
-# ================================================================================================
 
-# --- does the term appear at all -------------------------------------------------------------------
+# does the term appear at all
 
 def test_word_boundary_prevents_substring_false_positives():
     assert count_surface("a category of things", "cat", "en-us") == 0
@@ -95,7 +93,7 @@ def test_lemma_fallback_is_skipped_for_unspaced_languages():
     ) == 0
 
 
-# --- how many times it appears ----------------------------------------------------------------------
+# how many times it appears
 # Double-counting one rendering would read as consistency that is not there.
 
 def test_count_surface_is_boundary_aware():
@@ -128,7 +126,7 @@ def test_surface_and_lemma_never_double_count():
     ) == 1
 
 
-# --- languages --------------------------------------------------------------------------------------
+# languages
 
 @pytest.mark.parametrize(
     "source,target,expected_source,expected_target",
@@ -150,7 +148,7 @@ def test_unknown_languages_pass_through_rather_than_raising():
     assert out["clean_target_language_code"] == "klingon"
 
 
-# --- verbatim counting, for DNT -----------------------------------------------------------------------
+# verbatim counting, for DNT
 # `count_item` is the odd one out: everything above casefolds and it does not.
 
 def test_count_item_is_case_sensitive_unlike_neighbours():
@@ -171,9 +169,7 @@ def test_count_item_inherits_underscore_boundary():
     assert count_item("foo_BAR here", "BAR", "en-gb") == 1
 
 
-# ================================================================================================
 # dataset loading
-# ================================================================================================
 
 PARAMETERS = {
     "cat_project_id": "P1",
@@ -324,13 +320,9 @@ def test_load_mxliff_end_to_end(tmp_path):
     assert len(dataset.segments) == 2
 
 
-# ================================================================================================
 # the HTTP boundary
-# ================================================================================================
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Term bases - pinned queries: drift means scoring against a glossary production never sent.
-# ══════════════════════════════════════════════════════════════════════════════
 
 PERCOLATE = {
     "responses": [
@@ -372,7 +364,8 @@ def _glossary_client(percolate=PERCOLATE, concepts=CONCEPTS, capture=None):
         return httpx.Response(200, json=concepts)
 
     client = GlossaryClient("http://search.test")
-    client._client = httpx.Client(
+    # The transport is the shared SearchClient's; the glossary owns the queries, not the wire.
+    client.search._client = httpx.Client(
         base_url="http://search.test", transport=httpx.MockTransport(handler)
     )
     return client
@@ -386,7 +379,7 @@ def _fetch(client, **overrides):
     return client.fetch_matches(**kwargs)
 
 
-# ── request shape, pinned to what production sends ───────────────────────────
+# request shape, pinned to what production sends
 
 def test_percolate_request_matches_post_mt():
     capture = {}
@@ -445,7 +438,7 @@ def test_glossary_ids_are_trimmed_and_blanks_dropped():
     assert {"terms": {"glossary_id": ["tb1", "tb2"]}} in body["query"]["bool"]["filter"]
 
 
-# ── result assembly ──────────────────────────────────────────────────────────
+# result assembly
 
 def test_per_text_mappings_align_with_texts():
     matches = _fetch(_glossary_client())
@@ -505,7 +498,7 @@ def test_percolate_error_spares_rest(caplog):
     assert [m["target_content"] for m in matches.per_text_mappings[1]] == ["moteur", "bloc moteur"]
 
 
-# ── validation ───────────────────────────────────────────────────────────────
+# validation
 
 @pytest.mark.parametrize(
     "overrides, message",
@@ -521,7 +514,7 @@ def test_missing_inputs_are_rejected(overrides, message):
         _fetch(_glossary_client(), **overrides)
 
 
-# ── term counting, backing the CLI preflight ─────────────────────────────────
+# term counting, backing the CLI preflight
 
 def test_count_terms_asks_right_index_for_ids():
     seen = {}
@@ -532,7 +525,8 @@ def test_count_terms_asks_right_index_for_ids():
         return httpx.Response(200, json={"count": 42})
 
     client = GlossaryClient("http://search.test")
-    client._client = httpx.Client(
+    # The transport is the shared SearchClient's; the glossary owns the queries, not the wire.
+    client.search._client = httpx.Client(
         base_url="http://search.test", transport=httpx.MockTransport(handler)
     )
 
@@ -542,9 +536,7 @@ def test_count_terms_asks_right_index_for_ids():
     assert client.count_terms(["tb1"], provider="XTM") == 42
     assert seen["path"] == "/xtm-term-bases/_count"
 
-# ══════════════════════════════════════════════════════════════════════════════
 # post-mt - which text gets scored, and what would make the number meaningless.
-# ══════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize(
     "segment,expected",
@@ -561,7 +553,7 @@ def test_extract_post_edited_handles_every_pipeline_version(segment, expected):
     assert extract_post_edited(segment) == expected
 
 
-# ── preflight: refuse runs that would cost money and measure nothing ──────────
+# preflight: refuse runs that would cost money and measure nothing
 
 GOOD = {
     "cat_project_id": "P1",
@@ -598,12 +590,12 @@ def test_preflight_reports_every_problem_at_once():
 
 
 def test_preflight_requires_tempo_task_id():
-    """Without it post-mt fails every segment before any step runs, returning no post-edited text."""
+    """Without it post-mt fails every segment before any step runs, returning no APE text."""
     problems = preflight_parameters({**GOOD, "tempo_task_id": ""})
     assert any("tempo_task_id" in p for p in problems)
 
 
-# ── per-segment failures ─────────────────────────────────────────────────────
+# per-segment failures
 
 def test_segment_error_is_found_on_ape_and_aqe():
     assert segment_error({"ape_results": {"text": "", "error": "boom"}}) == "boom"
@@ -619,7 +611,7 @@ def test_failed_ape_looks_untouched():
     assert segment_error(failed) == "boom"              # ...so only this can tell them apart
 
 
-# ── has_glossary ─────────────────────────────────────────────────────────────
+# has_glossary
 
 def test_has_glossary_is_read_from_aqe_results():
     """post-mt nests it under aqe_results; the top level left the warning permanently dead."""
@@ -629,9 +621,7 @@ def test_has_glossary_is_read_from_aqe_results():
     assert reported_has_glossary({"aqe_results": {}}) is None
     assert reported_has_glossary({}) is None
 
-# ══════════════════════════════════════════════════════════════════════════════
 # The DNT service - request shape, batching, and the normalizers that accept its response.
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _dnt_client(handler, api_key="k"):
     """Reach into the private client, as the glossary tests do: the transport is the seam."""
@@ -647,7 +637,7 @@ def _dnt_client(handler, api_key="k"):
 PAIR = {"id": "0", "source": "AcoladPro is here.", "target": "Le Pro Acolad est ici."}
 
 
-# --- the header, which is the likeliest thing to get wrong -------------------------------------
+# the header, which is the likeliest thing to get wrong
 
 def test_api_key_header_spelling():
     """post-mt sends `X-API-KEY`, DNT wants `X-Api-Key`; invisible until every call 401s."""
@@ -668,7 +658,7 @@ def test_api_key_header_spelling():
     assert captured["headers"]["x-api-key"] == "secret"
 
 
-# --- request shape ------------------------------------------------------------------------------
+# request shape
 
 def test_revert_posts_source_and_target_pairs_to_v1_revert():
     captured = {}
@@ -724,7 +714,7 @@ def test_no_pairs_makes_no_call_at_all():
     assert _dnt_client(handler).revert([], batch_size=10) == []
 
 
-# --- failure -------------------------------------------------------------------------------------
+# failure
 
 def test_failed_batch_yields_none():
     """None leaves the denominator, no items scores nothing: the two must stay distinguishable."""
@@ -764,7 +754,7 @@ def test_short_response_realigns():
     assert results[1] is None and results[2] is None
 
 
-# --- health --------------------------------------------------------------------------------------
+# health
 
 def test_health_is_false_when_service_cannot_be_reached():
     def handler(request):
@@ -798,7 +788,7 @@ def test_health_is_true_when_both_probes_pass():
     assert _dnt_client(handler).health() is True
 
 
-# --- the response normalizers --------------------------------------------------------------------
+# the response normalizers
 
 @pytest.mark.parametrize("raw, expected", [
     (["AcoladPro"], ["AcoladPro"]),
@@ -862,7 +852,7 @@ def test_segments_are_found_in_any_envelope(body, count):
     assert len(dnt.response_segments(body)) == count
 
 
-# --- what the service's own smoke test pins ------------------------------------------------------
+# what the service's own smoke test pins
 # These follow the service's documented verification calls, so the shapes below are the real ones.
 
 def test_detect_envelope_is_understood():
@@ -973,13 +963,10 @@ def test_no_language_configured_sends_no_options_block():
     assert "options" not in captured["body"]
 
 
-# ================================================================================================
 # the run
-# ================================================================================================
 
 class _StubPostMt:
     """Healthy client that records whether anything was ever submitted."""
-
     def __init__(self):
         self.submitted = False
         self.authenticated = True
@@ -1008,8 +995,6 @@ def stub_postmt(monkeypatch):
 
 class _StubGlossary:
     """Reachable term-bases index that records the ids it was asked for."""
-
-
     def __init__(self, *args, term_count=1, **kwargs):
         self.asked_for = None
         self._term_count = term_count
@@ -1032,7 +1017,6 @@ class _StubGlossary:
 
 class _StubStanza:
     """Identity lemmatizer: keeps the tests off the network without changing what is matched."""
-
     def lemmatize_batch_safe(self, texts, language):
         return list(texts)
 
@@ -1042,8 +1026,6 @@ class _StubStanza:
 
 class _StubDnt:
     """A reachable DNT service naming one item per segment, with the health probes the CLI needs."""
-
-
     def __init__(self, items=("TimberLine",)):
         self.items = list(items)
         self.authenticated = True
@@ -1062,6 +1044,26 @@ class _StubDnt:
 def stub_stanza(monkeypatch):
     """Every CLI run building a glossary client builds a Stanza one, so stub it module-wide."""
     monkeypatch.setattr(run, "StanzaClient", lambda *a, **k: _StubStanza())
+
+
+def test_settings_file_defaults_to_dotenv(monkeypatch):
+    """No ENV_FILE leaves dotenv to find `.env` itself - the behaviour every run had before."""
+    monkeypatch.delenv("ENV_FILE", raising=False)
+    assert config._settings_file() is None
+
+
+def test_settings_file_named_by_env_file_is_used(monkeypatch, tmp_path):
+    settings = tmp_path / ".env.tm"
+    settings.write_text("BENCH_COMPONENT=[\"tm\"]\n", encoding="utf-8")
+    monkeypatch.setenv("ENV_FILE", str(settings))
+    assert config._settings_file() == str(settings)
+
+
+def test_env_file_that_is_not_there_stops_the_run(monkeypatch, tmp_path):
+    """Falling back to `.env` would score the run against settings nobody asked for."""
+    monkeypatch.setenv("ENV_FILE", str(tmp_path / "absent"))
+    with pytest.raises(RuntimeError, match="which is not a file"):
+        config._settings_file()
 
 
 @pytest.fixture(autouse=True)
@@ -1232,7 +1234,7 @@ def test_folder_scores_every_dataset_in_and_pools(
     assert "en-gb->fr-fr" in report
 
 
-# --- BENCH_COMPONENT ------------------------------------------------------------------------------
+# BENCH_COMPONENT
 
 
 def test_no_component_configured_says_what_choices_are(monkeypatch, tmp_path, capsys):

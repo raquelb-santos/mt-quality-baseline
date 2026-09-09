@@ -14,13 +14,18 @@ from typing import Any, Sequence
 
 COMPONENTS = ("glossary", "dnt")
 
-DATA_TYPES = (".json", ".csv", ".mxliff", ".xliff", ".xlf")
+# What each component's folder is scanned for
+DATA_TYPES: dict[str, tuple[str, ...]] = {
+    "glossary": (".json", ".csv", ".mxliff", ".xliff", ".xlf"),
+    "dnt": (".json", ".csv", ".mxliff", ".xliff", ".xlf"),
+}
 
 PARAMS_SUFFIX = ".params.json"
 
 
-def find_datasets(configured: str, *, variable: str) -> list[Path]:
-    """The datasets one component's setting names: a file, or a folder's direct children, sorted."""
+def find_datasets(configured: str, *, variable: str, component: str) -> list[Path]:
+    """A file, or a folder's direct children, sorted — only the types that component reads."""
+    types = DATA_TYPES[component]
     if not configured.strip():
         raise ValueError(
             f"No dataset to score. Set {variable} in .env to a dataset file, or to a folder "
@@ -31,11 +36,11 @@ def find_datasets(configured: str, *, variable: str) -> list[Path]:
     if candidate.is_dir():
         found = sorted(
             child for child in candidate.iterdir()
-            if child.is_file() and child.suffix.lower() in DATA_TYPES
+            if child.is_file() and child.suffix.lower() in types
             and not child.name.endswith(PARAMS_SUFFIX)
         )
         if not found:
-            raise ValueError(f"No dataset files in {candidate} (looked for {', '.join(DATA_TYPES)}).")
+            raise ValueError(f"No dataset files in {candidate} (looked for {', '.join(types)}).")
         return found
     if candidate.is_file():
         return [candidate]
@@ -59,7 +64,7 @@ def _strip_namespace(tag: str) -> str:
 
 
 def parse_mxliff(xml_string: str) -> list[dict[str, Any]]:
-    """Namespace-agnostic; `<target>` is the human reference, the `<alt-trans>` beside it the MT."""
+    """Namespace-agnostic; `<target>` is REF, the `<alt-trans>` beside it MT."""
     root = ET.fromstring(xml_string)
     segments: list[dict[str, Any]] = []
 
@@ -132,7 +137,6 @@ def validate(dataset: Dataset) -> None:
         errors.append("no segments")
 
     for index, segment in enumerate(dataset.segments):
-        # The reference is the metric's denominator.
         for field_name in ("source_content", "target_content", "reference_content"):
             value = segment.get(field_name)
             if not (isinstance(value, str) and value.strip()):
@@ -161,7 +165,7 @@ def load(path: str | Path, *, component: str) -> Dataset:
     elif suffix in {".mxliff", ".xliff", ".xlf"}:
         body = {"segments": parse_mxliff(raw)}
     else:
-        raise ValueError(f"Unsupported dataset format: {suffix} (expected one of {', '.join(DATA_TYPES)})")
+        raise ValueError(f"Unsupported dataset format: {suffix} (expected one of {', '.join(DATA_TYPES[component])})")
 
     dataset = Dataset(
         name=params.get("name") or body.get("name") or path.stem,

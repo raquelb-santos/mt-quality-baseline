@@ -1,4 +1,4 @@
-"""The report: the primitives a component formats its numbers with, and the file a run writes."""
+"""Report primitives every component formats its numbers with, and the file a run writes."""
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,7 +39,7 @@ def table(
     heading: str = "###",
     width: int = 8,
 ) -> str:
-    """One table, in either destination: a Markdown grid, or columns aligned for a terminal."""
+    """One table, as a Markdown grid or as columns aligned for a terminal."""
     if not rows:
         return ""
 
@@ -111,7 +111,6 @@ def stratum_of(result: Any) -> tuple[str, str]:
 
 
 def by_stratum(results: Sequence[Any]) -> dict[tuple[str, str], list[Any]]:
-    """Group results into strata, preserving the order each stratum was first seen."""
     grouped: dict[tuple[str, str], list[Any]] = {}
     for result in results:
         grouped.setdefault(stratum_of(result), []).append(result)
@@ -152,7 +151,6 @@ def write_report(
     *,
     dry_run: bool,
 ) -> Path:
-    """Write the run's report and return where it went, for the caller to name on the console."""
     now = datetime.now(timezone.utc)
     path = report_path(list(results_by_component), dry_run=dry_run, now=now)
     path.parent.mkdir(parents=True, exist_ok=True)

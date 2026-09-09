@@ -1,47 +1,63 @@
 """Runtime configuration, read from `.env`."""
 
-import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
 
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+
+def _settings_file() -> str | None:
+    """`ENV_FILE` points a run at a settings file other than `.env` - one per component, say, so a
+    TM run needs no edit to the file a glossary run reads. None leaves dotenv to find `.env` itself.
+
+    A named file that is not there stops the run rather than falling back to `.env`: the fallback
+    would score the run against settings the operator did not ask for, and every typed setting
+    would then fail one at a time as though it were unset."""
+    named = (os.getenv("ENV_FILE") or "").strip()
+    if not named:
+        return None
+    if not os.path.isfile(named):
+        raise RuntimeError(f"ENV_FILE names {named}, which is not a file.")
+    return named
 
 
-def _env(name: str, default: Any = None) -> Any:
-    return field(default_factory=lambda: os.getenv(name, default))
+load_dotenv(_settings_file(), override=True)
 
 
 def parse_list(raw: str) -> list[str]:
-    value = raw.strip()
+    parts = raw.strip().strip("[]").split(",")
+    return [item for item in (part.strip().strip("\"'") for part in parts) if item]
 
-    if value.startswith("["):
-        try:
-            parsed = json.loads(value)
-        except ValueError:
-            parsed = None
-        if isinstance(parsed, list):
-            return [str(item).strip() for item in parsed if str(item).strip()]
-        value = value.strip("[]")
 
-    return [item for item in (part.strip().strip("\"'") for part in value.split(",")) if item]
+def _required(name: str) -> str:
+    """A typed setting has no fallback: unset stops the run rather than scoring against a guess."""
+    value = os.getenv(name) or ""
+    if not value.strip():
+        raise RuntimeError(f"{name} is not set in .env.")
+    return value.strip()
+
+
+def _env(name: str) -> Any:
+    return field(default_factory=lambda: os.getenv(name))
 
 
 def _env_list(name: str) -> Any:
-    return field(default_factory=lambda: parse_list(os.getenv(name, "")))
+    return field(default_factory=lambda: parse_list(os.getenv(name) or ""))
 
 
-def _env_bool(name: str, default: bool) -> Any:
-    return field(
-        default_factory=lambda: os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
-    )
+
+
+def _env_bool(name: str) -> Any:
+    return field(default_factory=lambda: _required(name).lower() in {"1", "true", "yes", "on"})
+
+
+PATH_VARIABLES = {"glossary": "GLOSSARY_PATH", "dnt": "DNT_PATH"}
 
 
 @dataclass(frozen=True)
 class PostMtConfig:
-    base_url: str = _env("POSTMT_BASE_URL", "http://localhost:3000")
+    base_url: str = _env("POSTMT_BASE_URL")
     poll_interval: float = 3.0
     timeout: float = 30 * 60.0
     api_key: str | None = _env("POSTMT_API_KEY")
@@ -49,28 +65,25 @@ class PostMtConfig:
 
 @dataclass(frozen=True)
 class StanzaConfig:
-    base_url: str = _env("STANZA_BASE_URL", "http://localhost:8000")
+    base_url: str = _env("STANZA_BASE_URL")
     timeout: float = 120.0
 
 
 @dataclass(frozen=True)
 class SearchEngineConfig:
-    node: str = _env("SEARCH_ENGINE_URL", "")
-    username: str | None = _env("SEARCH_ENGINE_USERNAME")
-    password: str | None = _env("SEARCH_ENGINE_PASSWORD")
+    node: str = _env("SEARCH_ENGINE_URL")
+    username: str = _env("SEARCH_ENGINE_USERNAME")
+    password: str = _env("SEARCH_ENGINE_PASSWORD")
     timeout: float = 120.0
     # AWS-managed domains reject basic auth; requests must be SigV4-signed.
-    aws_sigv4: bool = _env_bool("ES_AWS_SIGV4_ENABLED", False)
+    aws_sigv4: bool = _env_bool("ES_AWS_SIGV4_ENABLED")
     aws_region: str | None = _env("AWS_REGION")
     aws_profile: str | None = _env("AWS_PROFILE")
 
 
-PATH_VARIABLES = {"glossary": "GLOSSARY_PATH", "dnt": "DNT_PATH"}
-
-
 @dataclass(frozen=True)
 class DntConfig:
-    base_url: str = _env("DNT_BASE_URL", "")
+    base_url: str | None = _env("DNT_BASE_URL")
     api_key: str | None = _env("DNT_API_KEY")
     timeout: float = 120.0
     batch_size: int = 25
@@ -82,12 +95,12 @@ class BenchmarkConfig:
     lemma_matching: bool = True
     # The components this run measures, in reporting order.
     components: list[str] = _env_list("BENCH_COMPONENT")
-    # A file, or a folder to score every dataset inside it.
-    glossary_path: str = _env("GLOSSARY_PATH", "")
-    dnt_path: str = _env("DNT_PATH", "")
-
-    def data_path(self, component: str) -> str:
-        return {"glossary": self.glossary_path, "dnt": self.dnt_path}[component]
+    # Per component: a file, or a folder to score every dataset inside it.
+    paths: dict[str, str] = field(
+        default_factory=lambda: {
+            component: os.getenv(variable) or "" for component, variable in PATH_VARIABLES.items()
+        }
+    )
 
 
 @dataclass

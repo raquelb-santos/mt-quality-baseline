@@ -44,9 +44,10 @@ python sourcecode/run.py --dry-run
 
 `pip install -e .` also puts the same entry point on the path as `mt-quality-baseline`.
 
-What a run scores is configured in `.env`, as `GLOSSARY_PATH` and `DNT_PATH`. Each may name a single
-dataset file (`.json`, `.csv`, `.mxliff`, `.xliff`, `.xlf`) or a folder of them; a CSV or XLIFF
-needs a `<name>.params.json` beside it giving its own `parameters`, `glossary_ids` and `steps`.
+What a run scores is configured in `.env`, as `GLOSSARY_PATH` and `DNT_PATH`. Each may
+name a dataset file or a folder of them (`.json`,
+`.csv`, `.mxliff`, `.xliff`, `.xlf`). A file that cannot describe itself needs a `<name>.params.json`
+beside it giving its own `parameters`, `steps` and `glossary_ids`.
 Components are configured separately because pooling adds counts within a stratum.
 
 A run prints each component's scorecard as it is measured and writes one Markdown report under
@@ -68,7 +69,9 @@ A run prints each component's scorecard as it is measured and writes one Markdow
      ├─ 2. score every version against REF, with the dataset's component
      │      terminology ─ a. lemmatize ───────► Stanza        (as post-mt does)
      │                    b. resolve terms ───► term-bases    (same query post-mt sends)
-     │                         (glossary ids pinned in the dataset)
+     │                         (percolate each source against the pinned glossary
+     │                          ids, then follow the hit's concept id to the
+     │                          target term the segment is held to)
      │                    c. count each term in REF, then in MT and APE
      │
      │      DNT ───────── a. detect and revert ► DNT service  POST /v1/revert

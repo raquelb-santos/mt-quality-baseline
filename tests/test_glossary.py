@@ -19,22 +19,19 @@ from sourcecode.glossary_score import (
     INCONSISTENCY,
     MISS,
     OVER_APPLICATION,
+    Aggregate,
+    Tally,
+    TermBreakdown,
     ViolationReport,
-    find_violations,
-    pool_violations,
     aggregate,
     build_glossary_map,
+    find_violations,
     pool,
-    rate,
+    pool_violations,
     score_translation,
 )
-from sourcecode.glossary_score import Aggregate, TallyReport, TermBreakdown, pool
 from sourcecode.postmt import RunResult
 
-
-# ================================================================================================
-# the metric
-# ================================================================================================
 
 MAPPINGS = [
     {"source_content": "brake", "target_content": "frein"},
@@ -49,8 +46,6 @@ REFERENCE = "le frein du moteur"
 ENGINE = [{"source_content": "engine", "target_content": "moteur"}]
 THRICE = "Le moteur entraîne le support moteur et le capot moteur."
 
-
-# --- instances: strict, permissive, and what the mapping is built from -------------------------------
 
 def test_glossary_map_groups_targets_by_source():
     # Mirrors how post-mt phrases the prompt, so we score the contract the model was shown.
@@ -91,6 +86,11 @@ def test_missing_strict_term_is_recorded():
     assert violation.source_content == "engine"
     assert violation.expected_targets == ["moteur"]
     assert violation.strictness == "strict"
+    assert violation.missed_occurrences == 1
+
+    agg = aggregate([score])
+    assert agg.violations == 1
+    assert agg.adherence_rate == 0.5
 
 
 def test_expected_instances_count_per_term_not_per_segment():
@@ -136,8 +136,6 @@ def test_lemma_matching_is_used_when_lemmas_are_supplied():
     assert with_lemmas.adherent == 1
 
 
-# --- the reference is the denominator ------------------------------------------------------------------
-
 def test_term_reference_never_uses_is_not_scored():
     """Retrieval proposes, the reference disposes: no denominator, so it is dropped."""
     score = score_translation(
@@ -155,12 +153,11 @@ def test_partial_rendering_is_violation():
         ref_text=THRICE,
     )
     assert (score.expected, score.adherent) == (3, 1)
+    # Rendered somewhere but not everywhere: inconsistent use, not outright absence.
+    assert (score.terms.used_partly, score.terms.never_used) == (1, 0)
 
     violation = score.violations[0]
-    assert violation.missed_occurrences == 2
-    assert violation.expected_occurrences == 3
-    # Rendered somewhere but not everywhere: inconsistent use, not outright absence.
-    assert violation.missed_occurrences < violation.expected_occurrences
+    assert (violation.missed_occurrences, violation.expected_occurrences) == (2, 3)
 
 
 def test_fully_consistent_use_scores_clean():
@@ -170,6 +167,12 @@ def test_fully_consistent_use_scores_clean():
     )
     assert (score.expected, score.adherent) == (3, 3)
     assert score.violations == []
+    assert score.terms.used_everywhere == 1
+
+    # A fully adherent term raises no violation, so only this record carries its denominator.
+    assert len(score.term_scores) == 1
+    term = score.term_scores[0]
+    assert (term.expected, term.adherent, term.violations) == (3, 3, 0)
 
 
 def test_absent_term_misses_every_occurrence():
@@ -177,6 +180,8 @@ def test_absent_term_misses_every_occurrence():
         mappings=ENGINE, text="Rien ici.", language_code="fr-fr", ref_text=THRICE,
     )
     # Not partial: nothing was rendered, so every occurrence the human made is missed.
+    assert (score.expected, score.adherent) == (3, 0)
+    assert score.terms.never_used == 1
     assert score.violations[0].missed_occurrences == 3
     assert score.violations[0].expected_occurrences == 3
 
@@ -194,15 +199,6 @@ def test_inflected_reference_still_sets_denominator():
     assert score.adherent == 1
 
 
-def test_renderings_cannot_exceed_reference_denominator():
-    score = score_translation(
-        mappings=ENGINE, text="moteur moteur moteur moteur moteur", language_code="fr-fr",
-        ref_text="Le moteur.",
-    )
-    assert score.expected == 1
-    assert score.adherent == 1  # capped, never 5
-
-
 def test_permissive_variants_sum_toward_denominator():
     mappings = [
         {"source_content": "battery", "target_content": "batterie"},
@@ -216,34 +212,6 @@ def test_permissive_variants_sum_toward_denominator():
     assert (score.expected, score.adherent) == (2, 2)
 
 
-# --- the term breakdown, reported beside the one rate ------------------------------------------------
-
-def test_term_with_no_rendering_at_all_is_never_used():
-    score = score_translation(
-        mappings=ENGINE, text="Rien ici.", language_code="fr-fr", ref_text=THRICE,
-    )
-    assert (score.expected, score.adherent) == (3, 0)
-    assert score.terms.never_used == 1
-
-
-def test_fewer_renderings_is_used_partly():
-    score = score_translation(
-        mappings=ENGINE, text="Le moteur, le bloc et le groupe.", language_code="fr-fr",
-        ref_text=THRICE,
-    )
-    assert (score.expected, score.adherent) == (3, 1)
-    # Present, but not everywhere: the distinction a single-use metric cannot draw.
-    assert (score.terms.used_partly, score.terms.never_used) == (1, 0)
-
-
-def test_matching_reference_is_used_everywhere():
-    score = score_translation(
-        mappings=ENGINE, text="Le moteur, le support moteur et le capot moteur.",
-        language_code="fr-fr", ref_text=THRICE,
-    )
-    assert score.terms.used_everywhere == 1
-
-
 def test_over_use_is_recorded_but_never_moves_rate():
     score = score_translation(
         mappings=ENGINE, text="moteur moteur moteur moteur moteur", language_code="fr-fr",
@@ -253,6 +221,7 @@ def test_over_use_is_recorded_but_never_moves_rate():
     # The cap still holds: five renderings against the human's three score 3/3, never 5/3.
     assert (score.expected, score.adherent) == (3, 3)
     assert score.violations == []
+    assert score.term_scores[0].rendered == 5   # the raw count survives the cap
 
 
 def test_avoided_term_is_over_use():
@@ -295,38 +264,17 @@ def test_presence_is_recoverable_from_violation_detail():
         assert score.terms.never_used == never
 
 
-# --- a missed instance is a violation, whatever the version did -----------------------------------------
-
-def test_miss_in_rendered_segment_is_violation():
-    """The ordinary failure: the segment was translated, just not with the target term."""
-    score = score_translation(
-        mappings=MAPPINGS, text="le frein du bloc", language_code="fr-fr",
-        ref_text=REFERENCE,
-    )
-    assert score.violations[0].missed_occurrences == 1
-
-    agg = aggregate([score])
-    assert agg.violations == 1
-    assert agg.adherence_rate == 0.5
-
-
-def test_miss_with_no_translation_at_all_is_violation():
+@pytest.mark.parametrize("text", ["", "      "])
+def test_miss_with_no_translation_at_all_is_violation(text):
     """An empty version is not excused: every instance the reference rendered is still owed."""
     score = score_translation(
-        mappings=MAPPINGS, text="", language_code="fr-fr", ref_text=REFERENCE,
+        mappings=MAPPINGS, text=text, language_code="fr-fr", ref_text=REFERENCE,
     )
     assert (score.expected, score.adherent) == (2, 0)
 
     agg = aggregate([score])
     assert agg.adherence_rate == 0.0
     assert agg.violations == 2
-
-
-def test_whitespace_only_is_violation():
-    score = score_translation(
-        mappings=MAPPINGS, text="      ", language_code="fr-fr", ref_text=REFERENCE,
-    )
-    assert aggregate([score]).violations == 2
 
 
 def test_violations_account_for_whole_shortfall():
@@ -351,8 +299,6 @@ def test_violations_account_for_whole_shortfall():
     # And it pools per slice as well as overall.
     assert agg.strict.violations + agg.permissive.violations == 3
 
-
-# --- aggregating across segments -------------------------------------------------------------------------
 
 def test_aggregate_computes_both_rates():
     clean = score_translation(                                                                # 2/2
@@ -426,47 +372,6 @@ def test_aggregate_keeps_unexpected_over_use():
     assert totals.terms.over_used == 1
 
 
-# --- the same evidence rolled up: term, segment, dataset ---------------------------------------------------
-# Each level recomputes its rate from its own pooled counts rather than averaging the level below.
-
-def test_term_rate_pools_counts_across_segments():
-    """Two segments, same term: 1/3 in one and 3/3 in the other pools to 4/6, not (33%+100%)/2."""
-    poor = score_translation(
-        mappings=ENGINE, text="Le moteur, le bloc et le groupe.", language_code="fr-fr",
-        ref_text=THRICE,
-    )
-    good = score_translation(
-        mappings=ENGINE, text="Le moteur, le support moteur et le capot moteur.",
-        language_code="fr-fr", ref_text=THRICE,
-    )
-    expected = sum(t.expected for s in (poor, good) for t in s.term_scores)
-    adherent = sum(t.adherent for s in (poor, good) for t in s.term_scores)
-    assert (adherent, expected) == (4, 6)
-    assert rate(adherent, expected) == pytest.approx(4 / 6)   # not the 66.67% an average gives
-
-
-def test_term_scores_are_recorded_for_adherent_terms_too():
-    """A fully adherent term raises no violation, so only this record carries its denominator."""
-    score = score_translation(
-        mappings=ENGINE, text="Le moteur, le support moteur et le capot moteur.",
-        language_code="fr-fr", ref_text=THRICE,
-    )
-    assert score.violations == []
-    assert len(score.term_scores) == 1
-    term = score.term_scores[0]
-    assert (term.expected, term.adherent, term.violations) == (3, 3, 0)
-
-
-def test_term_score_keeps_raw_count():
-    score = score_translation(
-        mappings=ENGINE, text="moteur moteur moteur moteur moteur", language_code="fr-fr",
-        ref_text=THRICE,
-    )
-    term = score.term_scores[0]
-    assert term.rendered == 5      # unbounded
-    assert term.adherent == 3      # bounded by REF's, which is what the rate uses
-
-
 def test_term_scores_sum_to_segment_totals():
     """The per-term grain must reconcile with the segment rate built on top of it."""
     mappings = [
@@ -497,11 +402,6 @@ def test_pooling_adds_buckets():
     assert (pooled.terms.never_used, pooled.terms.used_everywhere) == (1, 9)
 
 
-
-# ================================================================================================
-# corpus-level violations
-# ================================================================================================
-
 def pairs(*mapping):
     return [{"source_content": s, "target_content": t} for s, t in mapping]
 
@@ -522,8 +422,6 @@ def kinds(report):
     return sorted((item.kind, item.source_content, item.detail) for item in report.items)
 
 
-# --- misses -------------------------------------------------------------------------------------
-
 def test_term_reference_used_and_output_dropped_is_miss():
     report = run(["La plaquette est usee."], ["Le frein est use."], [BRAKE_PAIRS])
     assert kinds(report) == [(MISS, "brake pad", "")]
@@ -541,7 +439,6 @@ def test_empty_output_misses_every_term_reference_used():
 
 
 def test_lemma_match_is_rendering_not_miss():
-    """The lemma fallback applies here as it does to adherence, or an inflected term reads as a miss."""
     report = run(
         ["Les freins sont uses."], ["Le frein est use."], [BRAKE_PAIRS],
         text_lemmas={"Les freins sont uses.": "le frein etre use", "Le frein est use.": "le frein etre use"},
@@ -549,8 +446,6 @@ def test_lemma_match_is_rendering_not_miss():
     )
     assert report.items == []
 
-
-# --- inconsistency ------------------------------------------------------------------------------
 
 def test_two_renderings_of_one_term_is_inconsistency():
     corpus = ENGINE_PAIRS + pairs(("engine", "bloc moteur"))
@@ -601,8 +496,6 @@ def test_case_and_spacing_variants_are_one():
     assert [i for i in report.items if i.kind == INCONSISTENCY] == []
 
 
-# --- over-application ---------------------------------------------------------------------------
-
 def test_target_without_its_source_is_over_application():
     """Nothing retrieved here and the human chose otherwise, so the wording is unlicensed."""
     report = run(["Le frein est ici."], ["Le dispositif est ici."], [[]], corpus=BRAKE_PAIRS)
@@ -627,8 +520,6 @@ def test_blank_target_still_licenses_rendering():
     report = run(["Le frein est ici."], ["Le dispositif est ici."], [retrieved], corpus=BRAKE_PAIRS)
     assert [i for i in report.items if i.kind == OVER_APPLICATION] == []
 
-
-# --- totals and the rate ------------------------------------------------------------------------
 
 def test_three_kinds_sum_to_total():
     corpus = BRAKE_PAIRS + ENGINE_PAIRS + pairs(("engine", "bloc moteur"))
@@ -666,8 +557,6 @@ def test_inputs_must_be_same_length():
         run(["a", "b"], ["a"], [[]])
 
 
-# --- pooling ------------------------------------------------------------------------------------
-
 def test_pooling_recomputes_rate_from_summed_counts():
     one = run(["La plaquette."], ["Le frein."], [BRAKE_PAIRS])
     clean = run(["Le frein.", "Le frein."], ["Le frein."] * 2, [BRAKE_PAIRS] * 2)
@@ -682,9 +571,6 @@ def test_pooling_leaves_items_empty():
     one = run(["La plaquette."], ["Le frein."], [BRAKE_PAIRS])
     assert pool_violations([one]).items == []
 
-# ================================================================================================
-# rendering
-# ================================================================================================
 
 REPORT_GLOSSARY = {
     "The brake pad is worn.": [{"source_content": "brake pad", "target_content": "frein"}],
@@ -702,34 +588,16 @@ REPORT_SEGMENTS = [
 
 
 def _run(name, segments):
-    dataset = Dataset(
-        name=name,
-        component="glossary",
-        parameters=normalize_language(
-            {
-                "source_language": "English (United Kingdom)",
-                "target_language": "French (France)",
-                "domain": "Automotive",
-            }
-        ),
-        glossary_ids=["tb1"],
-        segments=[dict(s) for s in segments],
+    benchmark = _benchmark(
+        FakePostMt(glossary=REPORT_GLOSSARY), glossary=REPORT_GLOSSARY, lemma_matching=True
     )
-    benchmark = Benchmark(
-        postmt=FakePostMt(glossary=REPORT_GLOSSARY),
-        stanza=FakeStanza(),
-        glossary=FakeGlossary(REPORT_GLOSSARY),
-        config=FakeConfig(FakeBenchmarkConfig(lemma_matching=True)),
-    )
-    return benchmark.run(dataset)
+    return benchmark.run(_dataset(name, segments))
 
 
 @pytest.fixture
 def result():
     return _run("accents", REPORT_SEGMENTS)
 
-
-# --- the summary and the three tables under it ---------------------------------------------------------
 
 def test_scorecard_names_stratum(result):
     """What was measured and where; the dataset name and steps sit on the tables below."""
@@ -740,8 +608,7 @@ def test_scorecard_names_stratum(result):
 
 
 def test_glossary_blind_run_says_so(result):
-    """Blindness the probe let through, segment by segment: without this the scorecard reads as a
-    pipeline given the terms and ignoring them."""
+    """Blindness the preflight cannot see: without it the scorecard reads as a clean run."""
     # The healthy run says nothing of the kind, so the warning cannot be background noise.
     assert "post-mt was shown no glossary" not in glossary_scorecard(result).as_markdown()
 
@@ -755,13 +622,6 @@ def test_summary_shows_na_not_zero(result):
     result.mt.adherence_rate = None
     result.ape.adherence_rate = None
     assert "n/a" in glossary_scorecard(result).as_markdown()
-
-
-def test_summary_reports_two_columns(result):
-    rendered = glossary_scorecard(result).as_markdown()
-
-    for column in ("MT ", "APE "):
-        assert column in rendered
 
 
 def test_reference_metrics_stay_out_of_reports(result):
@@ -797,25 +657,25 @@ def test_term_rows_are_worst_first(result):
 
 def test_per_term_table_shows_counts_and_violations(result):
     table = render_term_adherence(result)
-    header = next(line for line in table.splitlines() if "Source term" in line)
+    header = next(line for line in table.splitlines() if "Glossary entry" in line)
     assert [column.strip() for column in header.strip("|").split("|")] == [
-        "Source term", "Targets", "MT", "APE", "REF", "Violations", "Adherence", "Bucket",
-        "Kind",
+        "Glossary entry", "MT", "APE", "REF", "Violations", "Adherence", "Bucket", "Kind",
     ]
     # No legend under it: the columns are named in the header and nowhere else.
     assert "renderings in the human reference" not in table
-    assert table.rstrip().splitlines()[-1].startswith("| cable")
+    row = next(r for r in term_rows(result) if r["source_term"] == "cable")
+    assert table.rstrip().splitlines()[-1].startswith(f"| cable → {row['expected_targets']}")
 
 
 def test_console_matches_file(result):
     """The terminal narrows the table; it must not restate it. Both come from `term_rows`."""
     console = render_term_adherence_console(result)
 
-    assert "term" in console.splitlines()[2] and "REF" in console.splitlines()[2]
+    assert "entry" in console.splitlines()[2] and "REF" in console.splitlines()[2]
     for row in term_rows(result):
-        line = next(l for l in console.splitlines() if l.strip().startswith(row["source_term"]))
+        line = next(l for l in console.splitlines() if l.strip().startswith(row["entry"]))
         assert line.split() == [
-            *row["source_term"].split(),
+            *row["entry"].split(),
             str(row["mt_rendered"]),
             str(row["ape_rendered"]),
             str(row["ref_rendered"]),
@@ -824,25 +684,11 @@ def test_console_matches_file(result):
         ]
 
 
-def test_console_table_is_worst_first_like_file(result):
-    console = render_term_adherence_console(result)
-    printed = [l.strip().rsplit("  ", 1)[0] for l in console.splitlines()[3:] if l.strip()]
-
-    assert [p.split()[0] for p in printed] == [r["source_term"].split()[0] for r in term_rows(result)]
-
-
 def test_run_that_matched_no_terms_says_so_on_console(result):
     """Zeroes with no table underneath read as a clean run rather than one that measured nothing."""
     result.segments = []
 
     assert "No glossary terms matched." in render_term_adherence_console(result)
-
-
-def test_term_rows_expose_raw_count(result):
-    """The version count is reported unbounded, so over-rendering survives the cap that folds it."""
-    for row in term_rows(result):
-        assert row["ape_rendered"] == 0                    # neither fixture target was used
-        assert row["ape_adherent"] == min(row["ape_rendered"], row["ref_rendered"])
 
 
 @pytest.mark.parametrize("source, target, reference, bucket", [
@@ -909,22 +755,18 @@ def test_three_levels_reconcile(result):
     assert sum(row["mt_adherent"] for row in rows) == result.mt.adherent
 
 
-# --- strata: one figure per language pair × domain -------------------------------------------------------
-# These drive the pooling directly, because what matters is how counts combine.
-
 def _aggregate(expected, adherent, *, segments=1, fully_adherent=1, terms=None):
     """An Aggregate carrying only the counts pooling cares about; pass a TermBreakdown to vary."""
     breakdown = terms or TermBreakdown(
         used_everywhere=adherent, never_used=expected - adherent
     )
-    missed = expected - adherent
     return Aggregate(
         expected=expected,
         adherent=adherent,
-        violations=missed,
+        violations=expected - adherent,
         adherence_rate=None if expected == 0 else adherent / expected,
-        strict=TallyReport(expected, adherent, missed, None),
-        permissive=TallyReport(0, 0, 0, None),
+        strict=Tally(expected, adherent),
+        permissive=Tally(),
         terms=breakdown,
         segments_with_glossary=segments,
         segments_fully_adherent=fully_adherent,
@@ -941,7 +783,6 @@ class _Result:
         self.mt = mt
         self.ape = ape if ape is not None else mt
         self.totals = {"segments": segments}
-        self.started_at = "2026-01-01T00:00:00+00:00"
         self.mt_violations = violations or ViolationReport(segments=segments)
         self.ape_violations = violations or ViolationReport(segments=segments)
 
@@ -957,7 +798,6 @@ def test_pooling_sums_counts_rather_than_averaging_rates():
 
 
 def test_pooling_is_split_invariant():
-    """Splitting a dataset and pooling must reproduce the unsplit number."""
     whole = _aggregate(8, 5)
     split = pool([_aggregate(6, 4), _aggregate(2, 1)])
 
@@ -975,7 +815,6 @@ def test_pooling_keeps_violations_and_segment_counts():
 
 
 def test_empty_stratum_reports_no_rate_rather_than_zero():
-    """`None`, never 0: no evidence is not total failure."""
     pooled = pool([_aggregate(0, 0, segments=0, fully_adherent=0)])
 
     assert pooled.expected == 0
@@ -1037,12 +876,8 @@ def test_single_dataset_still_renders_stratum():
     assert "ALL ·" not in rendered
 
 
-# ================================================================================================
-# orchestration
-# ================================================================================================
-
 class FakeStanza:
-    """Identity lemmatizer: keeps the tests off the network without changing what is matched."""
+    """Identity lemmatizer, so nothing here touches the network."""
 
     def lemmatize_batch_safe(self, texts, language):
         return list(texts)
@@ -1062,7 +897,7 @@ class FakeGlossary:
 
 
 class FakePostMt:
-    """Returns the MT unchanged except where `fixes` names a source text; `submitted` records it."""
+    """Returns the MT unchanged except where `fixes` names a source text."""
 
     def __init__(self, fixes=None, glossary=None):
         self.fixes = fixes or {}
@@ -1150,12 +985,12 @@ def _dataset(name, segments):
     )
 
 
-def _benchmark(postmt=None, *, batch_size=2):
+def _benchmark(postmt=None, *, batch_size=2, glossary=GLOSSARY, lemma_matching=False):
     return Benchmark(
         postmt=postmt if postmt is not None else FakePostMt(fixes=FIXES, glossary=GLOSSARY),
         stanza=FakeStanza(),
-        glossary=FakeGlossary(GLOSSARY),
-        config=FakeConfig(FakeBenchmarkConfig(batch_size=batch_size)),
+        glossary=FakeGlossary(glossary),
+        config=FakeConfig(FakeBenchmarkConfig(batch_size, lemma_matching)),
     )
 
 
@@ -1168,8 +1003,6 @@ def dataset():
 def benchmark():
     return _benchmark()
 
-
-# --- end to end --------------------------------------------------------------------------------------
 
 def test_end_to_end_scores_mt_baseline_against_post_edited(benchmark, dataset):
     result = benchmark.run(dataset)
@@ -1197,41 +1030,19 @@ def test_segment_without_glossary_does_not_dilute_rate(benchmark, dataset):
     assert clean.has_glossary_resolved is False
 
 
-def test_blind_run_is_refused_before_pipeline(dataset):
-    """The probe costs one segment; continuing costs the whole dataset and measures nothing."""
-    postmt = FakePostMt(fixes=FIXES, glossary={})
-
-    with pytest.raises(RuntimeError, match="cat_project_id"):
-        _benchmark(postmt).run(dataset)
-
-    # Only the probe was ever submitted, so the dataset itself was never billed.
-    assert postmt.batches_seen == [["s1"]]
-
-
-def test_dry_run_never_probes_postmt(dataset):
+def test_dry_run_never_submits_to_postmt(dataset):
     postmt = FakePostMt(fixes=FIXES, glossary={})
     _benchmark(postmt).run(dataset, skip_pipeline=True)
 
     assert postmt.batches_seen == []
 
 
-def test_no_resolved_terms_skips_probe(dataset):
-    """Nothing resolved means nothing to be blind to, and the probe would answer False regardless."""
-    postmt = FakePostMt(fixes=FIXES, glossary=GLOSSARY)
-    dataset.segments = [dict(SEGMENTS[2])]
-
-    _benchmark(postmt).run(dataset)
-
-    assert postmt.batches_seen == [["s3"]]
-
-
 def test_batching_preserves_order_and_index_alignment(dataset):
     postmt = FakePostMt(fixes=FIXES, glossary=GLOSSARY)
     result = _benchmark(postmt).run(dataset)
 
-    # batch_size 2 over 3 segments => two batches, behind the one-segment retrieval probe;
-    # misalignment would misattribute terms.
-    assert postmt.batches_seen == [["s1"], ["s1", "s2"], ["s3"]]
+    # batch_size 2 over 3 segments => two batches; misalignment would misattribute terms.
+    assert postmt.batches_seen == [["s1", "s2"], ["s3"]]
     assert [s.source_segment_id for s in result.segments] == ["s1", "s2", "s3"]
 
     first = result.segments[0]
@@ -1291,8 +1102,6 @@ def test_short_pipeline_response_realigns(dataset):
     assert result.totals["segments"] == 3
 
 
-# --- the human reference is the denominator ----------------------------------------------------------
-
 @pytest.fixture
 def reference_dataset():
     return _dataset("against-the-reference", REFERENCE_SEGMENTS)
@@ -1344,8 +1153,6 @@ def test_avoided_term_is_not_held_against_ape():
     assert result.ape.violations == 0
 
 
-# --- skip_pipeline: dry run and full run share one code path -------------------------------------------
-
 def test_skip_pipeline_never_contacts_postmt(dataset):
     class ExplodingPostMt:
         def run(self, **kwargs):
@@ -1365,7 +1172,7 @@ def test_skip_pipeline_scores_same_way_as_full_run(dataset):
     assert dry.mt.expected == full.mt.expected
     assert dry.mt.adherent == full.mt.adherent
     assert dry.mt.adherence_rate == full.mt.adherence_rate
-    # Post-edited mirrors the baseline when nothing was post-edited.
+    # APE mirrors MT when nothing was post-edited.
     assert dry.ape.adherent == dry.mt.adherent
     assert dry.totals["segments_changed_by_ape"] == 0
 
@@ -1378,21 +1185,10 @@ def test_skip_pipeline_still_measures_against_reference(dataset):
     assert [s.ref_text for s in dry.segments] == [s["reference_content"] for s in SEGMENTS]
 
 
-# --- a misconfigured or failed run must not read as a clean measurement ---------------------------------
-
 def test_warns_when_postmt_saw_no_glossary(dataset, caplog):
     """A misconfigured run reads as "APE does not help terminology" unless it is called out."""
-    class BlindAfterProbePostMt(FakePostMt):
-        """Retrieval fires for the probe and then stops - the case the probe cannot catch."""
-
-        def run(self, *, parameters, segments, steps=("AQE", "APE"), on_progress=None):
-            result = super().run(parameters=parameters, segments=segments, steps=steps)
-            if len(self.batches_seen) > 1:
-                for segment in result.segments:
-                    segment["has_glossary"] = False
-            return result
-
-    _benchmark(BlindAfterProbePostMt(fixes=FIXES, glossary=GLOSSARY)).run(dataset)
+    # Parameters good enough to pass preflight and still retrieve nothing: only the run says so.
+    _benchmark(FakePostMt(fixes=FIXES, glossary={})).run(dataset)
 
     assert "post-mt reported no glossary" in caplog.text
     assert "ecosystem_id" in caplog.text

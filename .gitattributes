@@ -1,0 +1,2 @@
+# Line endings are LF in the repository, whatever the working copy is edited on.
+* text=auto eol=lf

@@ -2,18 +2,16 @@
 
 from typing import Any, Sequence
 
-from . import glossary_score
 from .report import Scorecard, by_stratum, cell, pct, rate, signed_pct
 from .glossary_benchmark import BenchmarkResult
+from .glossary_score import pool, pool_violations
 
 
 def glossary_scorecard(result: BenchmarkResult) -> Scorecard:
-    """One terminology dataset's headline results, in the form both destinations render from."""
     mt, ape = result.mt, result.ape
     totals, delta = result.totals, result.delta
     mt_v, ape_v = result.mt_violations, result.ape_violations
 
-    # What was measured and the stratum it was measured in - the rest is on the tables below.
     subheading = f"{result.parameters['source_language']} → {result.parameters['target_language']}"
     if result.parameters.get("domain"):
         subheading += f"  ·  {result.parameters['domain']}"
@@ -76,7 +74,6 @@ def glossary_scorecard(result: BenchmarkResult) -> Scorecard:
 
 
 def _bucket(rendered: int, expected: int) -> str:
-    """The scorecard's four buckets, decided per row on the pooled counts."""
     if rendered == 0:
         # No denominator either: REF never used the term, so there is nothing to bucket.
         return "never" if expected else ""
@@ -121,12 +118,14 @@ def term_rows(result: BenchmarkResult) -> list[dict[str, Any]]:
         rows.append({
             "source_term": source,
             "expected_targets": entry["expected_targets"],
+            # The entry as the glossary states it, so a row is readable without the two columns.
+            "entry": f"{source} → {entry['expected_targets']}",
             "strictness": entry["strictness"],
             "segments": entry["segments"],
             "ref_rendered": expected,
             "mt_rendered": entry["mt_rendered"],
-            "mt_adherent": entry["mt_adherent"] if expected else "",
             # A zero denominator is a term REF never used, so the row reads as a review item.
+            "mt_adherent": entry["mt_adherent"] if expected else "",
             "ape_adherent": entry["ape_adherent"] if expected else "",
             "ape_rendered": entry["ape_rendered"],
             # Against the uncapped count, so the term the cap folded away is still reviewable.
@@ -149,20 +148,18 @@ def render_term_adherence(result: BenchmarkResult) -> str:
     lines = [
         "### Per-term adherence (adherence is APE against REF, worst first)",
         "",
-        "| Source term | Targets | MT | APE | REF | Violations | Adherence | Bucket | Kind |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
-    ]
-    for row in rows:
-        lines.append(
-            f"| {cell(row['source_term'])} | {cell(row['expected_targets'])}"
+        "| Glossary entry | MT | APE | REF | Violations | Adherence | Bucket | Kind |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        *(
+            f"| {cell(row['entry'])}"
             f" | {row['mt_rendered']} | {row['ape_rendered']}"
             f" | {row['ref_rendered']} | {row['ape_violations']}"
             f" | {pct(row['ape_adherence_rate'])} | {row['ape_bucket']}"
             f" | {row['strictness']} |"
-        )
-    lines.append("")
-
-    return "\n".join(lines)
+            for row in rows
+        ),
+    ]
+    return "\n".join([*lines, ""])
 
 
 def render_term_adherence_console(result: BenchmarkResult) -> str:
@@ -174,23 +171,21 @@ def render_term_adherence_console(result: BenchmarkResult) -> str:
             [f"Per-term adherence — {result.dataset}", "", "  No glossary terms matched.", ""]
         )
 
-    width = max(max(len(row["source_term"]) for row in rows), len("term"))
+    width = max(max(len(row["entry"]) for row in rows), len("entry"))
     lines = [
         f"Per-term adherence — {result.dataset} (adherence is APE against REF, worst first)",
         "",
-        f"  {'term'.ljust(width)}  {'MT':>4} {'APE':>4} {'REF':>4}"
+        f"  {'entry'.ljust(width)}  {'MT':>4} {'APE':>4} {'REF':>4}"
         f" {'violations':>10}  adherence",
-    ]
-    for row in rows:
-        lines.append(
-            f"  {row['source_term'].ljust(width)}"
+        *(
+            f"  {row['entry'].ljust(width)}"
             f"  {row['mt_rendered']:>4} {row['ape_rendered']:>4}"
             f" {row['ref_rendered']:>4} {str(row['ape_violations']):>10}"
             f"  {pct(row['ape_adherence_rate'])}"
-        )
-    lines.append("")
-
-    return "\n".join(lines)
+            for row in rows
+        ),
+    ]
+    return "\n".join([*lines, ""])
 
 
 def render_comparison(results: Sequence[BenchmarkResult]) -> str:
@@ -206,19 +201,23 @@ def render_comparison(results: Sequence[BenchmarkResult]) -> str:
             f" → APE {pct(result.ape.adherence_rate)}"
             f"  ({signed_pct(result.delta.adherence_rate)})"
         )
-    lines.append("")
-    return "\n".join(lines)
+    return "\n".join([*lines, ""])
+
+
+def _pooled(group: Sequence[BenchmarkResult]) -> tuple[Any, Any, Any, Any]:
+    return (
+        pool([r.mt for r in group]),
+        pool([r.ape for r in group]),
+        pool_violations([r.mt_violations for r in group]),
+        pool_violations([r.ape_violations for r in group]),
+    )
 
 
 def stratum_rows(results: Sequence[BenchmarkResult]) -> list[dict[str, Any]]:
     """One row per stratum, with the pooled counts its rates were computed from."""
     rows = []
     for (pair, domain), group in by_stratum(results).items():
-        mt = glossary_score.pool([r.mt for r in group])
-        ape = glossary_score.pool([r.ape for r in group])
-        mt_v = glossary_score.pool_violations([r.mt_violations for r in group])
-        ape_v = glossary_score.pool_violations([r.ape_violations for r in group])
-
+        mt, ape, mt_v, ape_v = _pooled(group)
         rows.append({
             "language_pair": pair,
             "domain": domain,
@@ -251,10 +250,7 @@ def _stratum_lines(results: Sequence[BenchmarkResult]) -> list[str]:
         )
 
     if len(lines) > 1:
-        mt = glossary_score.pool([r.mt for r in results])
-        ape = glossary_score.pool([r.ape for r in results])
-        mt_v = glossary_score.pool_violations([r.mt_violations for r in results])
-        ape_v = glossary_score.pool_violations([r.ape_violations for r in results])
+        mt, ape, mt_v, ape_v = _pooled(results)
         lines.append(
             f"ALL · {mt.expected} inst"
             f"  ·  MT {pct(mt.adherence_rate)} → APE {pct(ape.adherence_rate)}"
@@ -268,14 +264,9 @@ def _stratum_lines(results: Sequence[BenchmarkResult]) -> list[str]:
 def render_strata(results: Sequence[BenchmarkResult]) -> str:
     """Pooled adherence per language pair and domain."""
     lines = _stratum_lines(results)
-    if not lines:
-        return ""
-    return "\n".join(["## By stratum", "", *(f"- {line}" for line in lines), ""])
+    return "" if not lines else "\n".join(["## By stratum", "", *(f"- {l}" for l in lines), ""])
 
 
 def render_strata_console(results: Sequence[BenchmarkResult]) -> str:
-    """The same lines, indented for a terminal."""
     lines = _stratum_lines(results)
-    if not lines:
-        return ""
-    return "\n".join(["Adherence by stratum", "", *(f"  {line}" for line in lines), ""])
+    return "" if not lines else "\n".join(["Adherence by stratum", "", *(f"  {l}" for l in lines), ""])

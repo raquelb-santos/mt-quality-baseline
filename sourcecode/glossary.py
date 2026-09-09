@@ -1,19 +1,18 @@
 """Glossary resolution against the term-bases index, sending the same queries post-mt sends."""
 
-import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Sequence
 
-import httpx
+from .search_engine import SearchClient
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class GlossaryMatches:
-    """``per_text_mappings[i]`` corresponds to ``texts[i]``."""
     mappings: list[dict[str, str]]
+    # Aligned with the texts queried: per_text_mappings[i] belongs to texts[i].
     per_text_mappings: list[list[dict[str, str]]]
 
 
@@ -30,48 +29,6 @@ def _term_index(provider: str | None) -> str:
     return "xtm-term-bases" if str(provider or "").lower() == "xtm" else "term-bases"
 
 
-class SigV4Auth(httpx.Auth):
-    """Sign requests for an AWS-managed OpenSearch/Elasticsearch domain."""
-
-    requires_request_body = True
-
-    def __init__(self, region: str, profile: str | None = None, service: str = "es") -> None:
-        try:
-            from botocore.session import Session
-        except ImportError as error:  # pragma: no cover - depends on the install extra
-            raise RuntimeError(
-                "AWS request signing needs botocore: pip install 'mt-quality-baseline[aws]'"
-            ) from error
-
-        credentials = Session(profile=profile).get_credentials()
-        if credentials is None:
-            raise RuntimeError(
-                f"No AWS credentials for profile {profile!r}. Run `aws sso login --profile {profile}`."
-            )
-        self._credentials = credentials
-        self.region = region
-        self.service = service
-
-    def auth_flow(self, request: httpx.Request):
-        from botocore.auth import SigV4Auth as _SigV4Auth
-        from botocore.awsrequest import AWSRequest
-
-        # Sign a copy carrying only the signed headers, then copy botocore's result back on.
-        signable = AWSRequest(
-            method=request.method,
-            url=str(request.url),
-            data=request.content,
-            headers={"Host": request.url.netloc.decode("ascii")},
-        )
-        if "content-type" in request.headers:
-            signable.headers["Content-Type"] = request.headers["content-type"]
-
-        _SigV4Auth(self._credentials.get_frozen_credentials(), self.service, self.region).add_auth(signable)
-        for header, value in signable.headers.items():
-            request.headers[header] = value
-        yield request
-
-
 class GlossaryClient:
 
     def __init__(
@@ -83,44 +40,20 @@ class GlossaryClient:
         aws_region: str | None = None,
         aws_profile: str | None = None,
     ) -> None:
-        if aws_region:
-            auth: Any = SigV4Auth(aws_region, aws_profile)
-        elif username and password:
-            auth = (username, password)
-        else:
-            auth = None
-        self._client = httpx.Client(base_url=node.rstrip("/"), timeout=timeout, auth=auth)
-        self.node = node
+        self.search = SearchClient(node, username, password, timeout, aws_region, aws_profile)
 
     def close(self) -> None:
-        self._client.close()
+        self.search.close()
 
     def ping(self) -> bool:
-        try:
-            self._client.get("/").raise_for_status()
-            return True
-        except httpx.HTTPError as error:
-            logger.error("[GLOSSARY] cannot reach search engine at %s: %s", self.node, error)
-            return False
-
-    def _msearch(self, index: str, bodies: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-        lines = [json.dumps(part) for body in bodies for part in ({"index": index}, body)]
-        response = self._client.post(
-            "/_msearch",
-            content=("\n".join(lines) + "\n").encode("utf-8"),
-            headers={"Content-Type": "application/x-ndjson"},
-        )
-        response.raise_for_status()
-        return response.json().get("responses", [])
+        return self.search.ping()
 
     def count_terms(self, glossary_ids: Sequence[str], provider: str | None = None) -> int:
         """Documents the index holds for these ids — 0 means the ids are not in this cluster."""
-        response = self._client.post(
-            f"/{_term_index(provider)}/_count",
-            json={"query": {"terms": {"glossary_id": as_id_list(glossary_ids)}}},
+        return self.search.count(
+            _term_index(provider),
+            {"query": {"terms": {"glossary_id": as_id_list(glossary_ids)}}},
         )
-        response.raise_for_status()
-        return int(response.json().get("count", 0))
 
     def fetch_matches(
         self,
@@ -141,7 +74,10 @@ class GlossaryClient:
                 raise ValueError(f"No {label} provided")
 
         index = _term_index(provider)
-        bodies = [
+        per_text_source_terms = [[] for _ in texts]
+        concept_ids: set[str] = set()
+
+        responses = self.search.msearch(index, [
             {
                 "query": {
                     "bool": {
@@ -156,12 +92,9 @@ class GlossaryClient:
                 "sort": ["_score"],
             }
             for text in texts
-        ]
+        ])
 
-        per_text_source_terms: list[list[dict[str, str]]] = [[] for _ in texts]
-        all_concept_ids: set[str] = set()
-
-        for i, response in enumerate(self._msearch(index, bodies)):
+        for i, response in enumerate(responses):
             if response.get("error"):
                 logger.warning("[GLOSSARY] percolate error on text %d: %s", i, response["error"])
                 continue
@@ -170,33 +103,28 @@ class GlossaryClient:
                 per_text_source_terms[i].append(
                     {"term_text": source.get("term_text"), "concept_id": source.get("concept_id")}
                 )
-                all_concept_ids.add(source.get("concept_id"))
+                concept_ids.add(source.get("concept_id"))
 
-        if not all_concept_ids:
-            return GlossaryMatches(mappings=[], per_text_mappings=[[] for _ in texts])
-
-        response = self._client.post(
-            f"/{index}/_search",
-            json={
+        targets_by_concept: dict[str, list[str]] = {}
+        if concept_ids:
+            response = self.search.search(index, {
                 "query": {
                     "bool": {
                         "filter": [
-                            {"terms": {"concept_id": sorted(all_concept_ids)}},
+                            {"terms": {"concept_id": sorted(concept_ids)}},
                             {"terms": {"language": language_variants(target_language)}},
                         ]
                     }
                 },
                 "size": 1000,
-            },
-        )
-        response.raise_for_status()
+            })
+            for hit in response.get("hits", {}).get("hits", []):
+                source = hit.get("_source", {})
+                targets_by_concept.setdefault(source.get("concept_id"), []).append(
+                    source.get("term_text")
+                )
 
-        targets_by_concept: dict[str, list[str]] = {}
-        for hit in response.json().get("hits", {}).get("hits", []):
-            source = hit.get("_source", {})
-            targets_by_concept.setdefault(source.get("concept_id"), []).append(source.get("term_text"))
-
-        per_text_mappings: list[list[dict[str, str]]] = []
+        per_text_mappings = []
         for source_terms in per_text_source_terms:
             mappings: list[dict[str, str]] = []
             seen: set[str] = set()

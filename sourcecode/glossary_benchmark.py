@@ -2,10 +2,8 @@
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Sequence
-
 from pathlib import Path
+from typing import Any, Sequence
 
 from .text_processing import Dataset, load
 from .pipeline import run_pipeline, stub_pipeline
@@ -20,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 
 def load_dataset(path: Path, *, glossary: Any, node: str, dry_run: bool) -> Dataset:
-    """One terminology dataset, with the two guards that stop a meaningless run before it costs."""
     data = load(path, component="glossary")
 
     # An id not in this cluster does not fail: it matches nothing and scores a clean-looking 0.
@@ -46,8 +43,6 @@ def load_dataset(path: Path, *, glossary: Any, node: str, dry_run: bool) -> Data
 
 @dataclass
 class SegmentResult:
-    """One segment's versions, named the same way everywhere: SRC, MT, APE, REF."""
-
     source_segment_id: str
     src_text: str
     mt_text: str
@@ -72,8 +67,6 @@ class Delta:
 @dataclass
 class BenchmarkResult:
     dataset: str
-    started_at: str
-    finished_at: str
     parameters: dict[str, Any]
     glossary_ids: list[str]
     config: dict[str, Any]
@@ -85,7 +78,6 @@ class BenchmarkResult:
     mt_violations: ViolationReport = field(default_factory=ViolationReport)
     ape_violations: ViolationReport = field(default_factory=ViolationReport)
     ref_violations: ViolationReport = field(default_factory=ViolationReport)
-    # Miss / inconsistency / over-application, and the share of segments carrying at least one.
     usage: Usage = field(default_factory=Usage)
     failed_segments: int = 0
     failure_reason: str | None = None
@@ -148,11 +140,10 @@ class Benchmark:
 
         unique_texts = list(dict.fromkeys(t for t in texts if t))
         unique_terms = list(dict.fromkeys(t for t in terms if t))
-        combined = unique_texts + unique_terms
-        if not combined:
+        if not unique_texts and not unique_terms:
             return None, None
 
-        lemmas = self.stanza.lemmatize_batch_safe(combined, target_language)
+        lemmas = self.stanza.lemmatize_batch_safe(unique_texts + unique_terms, target_language)
         if lemmas is None:
             logger.warning(
                 "[SCORE] proceeding with surface-form matching only - inflected forms will count as violations"
@@ -165,7 +156,6 @@ class Benchmark:
         )
 
     def run(self, dataset: Dataset, *, skip_pipeline: bool = False) -> BenchmarkResult:
-        started_at = datetime.now(timezone.utc).isoformat()
         target_language = dataset.parameters.get("clean_target_language_code")
 
         per_segment_mappings = self.resolve_glossary(
@@ -187,7 +177,7 @@ class Benchmark:
             self.postmt, dataset, batch_size=self.config.benchmark.batch_size
         )
         processed = outcome.segments
-        failures = [] if skip_pipeline else outcome.failures
+        failures = outcome.failures
 
         mt_texts = [s.get("target_content") or "" for s in processed]
         ape_texts = [extract_post_edited(s) for s in processed]
@@ -204,9 +194,7 @@ class Benchmark:
         for i, segment in enumerate(processed):
             original = dataset.segments[i]
             mappings = per_segment_mappings[i]
-            mt_text = mt_texts[i]
-            ape_text = ape_texts[i]
-            ref_text = ref_texts[i]
+            mt_text, ape_text, ref_text = mt_texts[i], ape_texts[i], ref_texts[i]
 
             common = dict(
                 mappings=mappings,
@@ -230,9 +218,7 @@ class Benchmark:
                 glossary_terms=mappings,
                 mt=score_translation(text=mt_text, text_lemmas=text_lemmas.get(mt_text), **common),
                 ape=score_translation(text=ape_text, text_lemmas=text_lemmas.get(ape_text), **common),
-                ref=score_translation(
-                    text=ref_text, text_lemmas=text_lemmas.get(ref_text), **common
-                ),
+                ref=score_translation(text=ref_text, text_lemmas=text_lemmas.get(ref_text), **common),
             ))
 
         # Resolved here but never shown to post-mt, so the APE column measures something else.
@@ -258,7 +244,7 @@ class Benchmark:
 
         mt_aggregate = aggregate([r.mt for r in results])
         ape_aggregate = aggregate([r.ape for r in results])
-        ref_aggregate = aggregate([r.ref for r in results])
+        mt_rate, ape_rate = mt_aggregate.adherence_rate, ape_aggregate.adherence_rate
 
         # Corpus-level, so it runs once over every segment rather than inside the loop above.
         violation_kwargs = dict(
@@ -277,12 +263,8 @@ class Benchmark:
             terms_fixed += len(mt_violated - ape_violated)
             terms_regressed += len(ape_violated - mt_violated)
 
-        mt_rate, ape_rate = mt_aggregate.adherence_rate, ape_aggregate.adherence_rate
-
         return BenchmarkResult(
             dataset=f"{dataset.name} (dry-run)" if skip_pipeline else dataset.name,
-            started_at=started_at,
-            finished_at=datetime.now(timezone.utc).isoformat(),
             parameters={
                 "source_language": dataset.parameters.get("clean_source_language_code"),
                 "target_language": target_language,
@@ -303,7 +285,7 @@ class Benchmark:
             },
             mt=mt_aggregate,
             ape=ape_aggregate,
-            ref=ref_aggregate,
+            ref=aggregate([r.ref for r in results]),
             mt_violations=find_violations(texts=mt_texts, **violation_kwargs),
             ape_violations=find_violations(texts=ape_texts, **violation_kwargs),
             ref_violations=find_violations(texts=ref_texts, **violation_kwargs),
