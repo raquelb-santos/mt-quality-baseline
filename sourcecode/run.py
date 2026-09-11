@@ -10,43 +10,41 @@ from typing import Any
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sourcecode import dnt_benchmark, dnt_report, glossary_benchmark, glossary_report, report
-from sourcecode import text_processing
+from sourcecode import dnt_benchmark, dnt_report, glossary_benchmark, glossary_report, pipeline, report, tags_benchmark, tags_report, text_processing
 from sourcecode.config import PATH_VARIABLES, Config
 from sourcecode.dnt import DntClient
 from sourcecode.glossary import GlossaryClient
 from sourcecode.postmt import PostMtClient, StanzaClient
 
 
-# Each component's heading and the parts filed under it.
-COMPONENT_SECTIONS = {
-    "glossary": (
-        "Terminology adherence",
-        lambda results: [
-            *(part for result in results
-              for part in (glossary_report.glossary_scorecard(result).as_markdown(),
-                           glossary_report.render_term_adherence(result))),
-            glossary_report.render_comparison(results),
-            glossary_report.render_strata(results),
-        ],
-    ),
-    "dnt": (
-        "DNT preservation",
-        lambda results: [
-            *(part for result in results
-              for part in (dnt_report.dnt_scorecard(result).as_markdown(),
-                           dnt_report.render_dnt_detection(result),
-                           dnt_report.render_dnt_items(result))),
-            dnt_report.render_dnt_comparison(results),
-            dnt_report.render_dnt_strata(results),
-        ],
-    ),
+COMPONENTS = {
+    "glossary": ("Terminology adherence", glossary_report,
+                 (glossary_report.render_terms,),
+                 (glossary_report.render_terms_console,)),
+    "dnt": ("DNT preservation", dnt_report,
+            (dnt_report.render_detection, dnt_report.render_items,
+             dnt_report.render_defects),
+            (dnt_report.render_detection_console, dnt_report.render_items_console)),
+    "tags": ("Tag and placeholder integrity", tags_report,
+             (tags_report.render_families, tags_report.render_tags, tags_report.render_defects),
+             (tags_report.render_families_console, tags_report.render_tags_console)),
 }
 
-# The pooled table the console gets once a component's datasets are all scored.
-STRATA_CONSOLE = {
-    "glossary": glossary_report.render_strata_console,
-    "dnt": dnt_report.render_dnt_strata_console,
+
+def _section(module: Any, own: tuple[Any, ...]) -> Any:
+    """The scorecard and each component's own parts per dataset, then the corpus-wide tables."""
+    return lambda results: [
+        *(part for result in results
+          for part in (module.scorecard(result).as_markdown(),
+                       *(render(result) for render in own))),
+        module.render_comparison(results),
+        module.render_strata(results),
+    ]
+
+
+COMPONENT_SECTIONS = {
+    component: (heading, _section(module, own))
+    for component, (heading, module, own, _) in COMPONENTS.items()
 }
 
 
@@ -85,33 +83,25 @@ def main(argv: list[str] | None = None) -> int:
 
     components = config.benchmark.components
     if not components:
-        print(f"Set BENCH_COMPONENT to one or more of: {', '.join(text_processing.COMPONENTS)}.",
+        print(f"Set BENCH_COMPONENT to one or more of: {', '.join(COMPONENTS)}.",
               file=sys.stderr)
         return 2
-    unknown = [c for c in components if c not in text_processing.COMPONENTS]
+    unknown = [c for c in components if c not in COMPONENTS]
     if unknown:
         print(f"BENCH_COMPONENT names {', '.join(unknown)}; expected one or more of: "
-              f"{', '.join(text_processing.COMPONENTS)}.", file=sys.stderr)
+              f"{', '.join(COMPONENTS)}.", file=sys.stderr)
         return 2
-
-    if "glossary" in components:
-        if config.search_engine.aws_sigv4 and not config.search_engine.aws_region:
-            print("ES_AWS_SIGV4_ENABLED is set but AWS_REGION is not.", file=sys.stderr)
-            return 2
-
-    search_credentials = {
-        "username": config.search_engine.username,
-        "password": config.search_engine.password,
-        "timeout": config.search_engine.timeout,
-        "aws_region": config.search_engine.aws_region if config.search_engine.aws_sigv4 else None,
-        "aws_profile": config.search_engine.aws_profile,
-    }
 
     stanza = glossary = dnt = postmt = None
 
     try:
         if "glossary" in components:
-            if not config.search_engine.node:
+            search = config.search_engine
+            if search.aws_sigv4 and not search.aws_region:
+                print("ES_AWS_SIGV4_ENABLED is set but AWS_REGION is not.", file=sys.stderr)
+                return 2
+
+            if not search.node:
                 print("Set SEARCH_ENGINE_URL to the term-bases index post-mt queries.",
                       file=sys.stderr)
                 return 2
@@ -121,9 +111,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
 
             stanza = StanzaClient(config.stanza.base_url, config.stanza.timeout)
-            glossary = GlossaryClient(config.search_engine.node, **search_credentials)
+            glossary = GlossaryClient(
+                search.node, search.username, search.password, search.timeout,
+                search.aws_region if search.aws_sigv4 else None, search.aws_profile,
+            )
             if not glossary.ping():
-                print(f"Search engine unreachable at {config.search_engine.node}.", file=sys.stderr)
+                print(f"Search engine unreachable at {search.node}.", file=sys.stderr)
                 return 1
 
         if "dnt" in components:
@@ -159,46 +152,47 @@ def main(argv: list[str] | None = None) -> int:
         for component in components:
             configured = config.benchmark.paths[component]
             datasets = text_processing.find_datasets(
-                configured, variable=PATH_VARIABLES[component], component=component,
+                configured, variable=PATH_VARIABLES[component],
             )
             logging.info("[BENCH] %s: %s", PATH_VARIABLES[component], configured)
             if len(datasets) > 1:
                 logging.info("[BENCH] %d %s datasets to score", len(datasets), component)
 
+            _, module, _, console = COMPONENTS[component]
             results = []
             for path in datasets:
                 logging.info("[BENCH] loading %s", path)
                 if component == "glossary":
                     data = glossary_benchmark.load_dataset(
-                        path, glossary=glossary,
-                        node=config.search_engine.node, dry_run=args.dry_run,
+                        path, glossary=glossary, node=config.search_engine.node,
+                        dry_run=args.dry_run,
                     )
-                    scored = glossary_benchmark.Benchmark(
-                        postmt=postmt, stanza=stanza, glossary=glossary, config=config
-                    ).run(data, skip_pipeline=args.dry_run)
-                    blocks = [
-                        glossary_report.glossary_scorecard(scored).as_console(),
-                        glossary_report.render_term_adherence_console(scored),
-                    ]
+                    scored = glossary_benchmark.run_benchmark(
+                        data, postmt=postmt, stanza=stanza, glossary=glossary, config=config,
+                        skip_pipeline=args.dry_run,
+                    )
                 elif component == "dnt":
-                    data = dnt_benchmark.load_dataset(path, dry_run=args.dry_run)
-                    scored = dnt_benchmark.DntBenchmark(postmt=postmt, dnt=dnt, config=config).run(
-                        data, skip_pipeline=args.dry_run
+                    data = pipeline.load_dataset(path, component="dnt", dry_run=args.dry_run)
+                    scored = dnt_benchmark.run_benchmark(
+                        data, postmt=postmt, dnt=dnt, config=config, skip_pipeline=args.dry_run
                     )
-                    blocks = [
-                        dnt_report.dnt_scorecard(scored).as_console(),
-                        dnt_report.render_dnt_detection_console(scored),
-                        dnt_report.render_dnt_items_console(scored),
-                    ]
+                elif component == "tags":
+                    data = pipeline.load_dataset(path, component="tags", dry_run=args.dry_run)
+                    scored = tags_benchmark.run_benchmark(
+                        data, postmt=postmt, config=config, skip_pipeline=args.dry_run
+                    )
+                else:
+                    raise ValueError(f"{component} is in COMPONENTS but has no branch here.")
 
-                for block in blocks:
+                for block in (module.scorecard(scored).as_console(),
+                              *(render(scored) for render in console)):
                     if block:
                         print(block)
                 results.append(scored)
 
             results_by_component[component] = results
             if results:
-                print(STRATA_CONSOLE[component](results))
+                print(module.render_strata_console(results))
 
         report_file = report.write_report(
             results_by_component,

@@ -13,7 +13,7 @@ sends them through post-mt, and scores the translation against the human referen
 | **REV** | the reverted output the DNT service returned (DNT only)     |
 | **REF** | the human translation delivered for the segment             |
 
-Two components are implemented:
+Three components are implemented:
 
 **Terminology adherence** — how often each version uses the glossary terms the human used. **MT**
 and **APE** are both scored against **REF**.
@@ -21,6 +21,10 @@ and **APE** are both scored against **REF**.
 **DNT preservation** — how often each version keeps the items that must not be translated. **APE**
 is sent to the DNT service's **revert endpoint**, which returns both the items it weighed in a
 segment and **REV**. **MT**, **APE** and **REV** are each scored against **REF**.
+
+**Tag and placeholder integrity** — how much of a segment's markup each version carries through
+unbroken. The tags are read off the segments themselves, and **MT**, **APE** and **REF** are each
+scored against **SRC**.
 
 It reports each version's score and the **delta** from post-editing, **repairs and regressions**, a
 worst-first **per-item worklist** tracing numbers back to segments, and **pooling by stratum**
@@ -44,8 +48,8 @@ python sourcecode/run.py --dry-run
 
 `pip install -e .` also puts the same entry point on the path as `mt-quality-baseline`.
 
-What a run scores is configured in `.env`, as `GLOSSARY_PATH` and `DNT_PATH`. Each may
-name a dataset file or a folder of them (`.json`,
+What a run scores is configured in `.env`, as `GLOSSARY_PATH`, `DNT_PATH` and `TAGS_PATH`.
+Each may name a dataset file or a folder of them (`.json`,
 `.csv`, `.mxliff`, `.xliff`, `.xlf`). A file that cannot describe itself needs a `<name>.params.json`
 beside it giving its own `parameters`, `steps` and `glossary_ids`.
 Components are configured separately because pooling adds counts within a stratum.
@@ -79,6 +83,9 @@ A run prints each component's scorecard as it is measured and writes one Markdow
      │                          a third version to score)
      │                    b. count each item in SRC and REF,
      │                       then in MT, APE and REV
+     │
+     │      tags ──────── a. count each tag in SRC, then in MT, APE and REF,
+     │                       and check pairing and ordering in each
      │
      └─ 3. aggregate, pool by stratum, write the report
 ```
@@ -215,6 +222,90 @@ Everything below is reported for **MT**, for **APE** and for **REV**:
   reversion moved it by, with the items the next version broke and the ones it fixed counted
   separately.
 
+***
+
+## Tag and placeholder integrity
+
+Tags come from **the segments themselves**. **SRC is the answer key**, **REF** is scored
+beside **MT** and **APE** to show how many of them a human really keeps.
+
+A fully correct segment therefore carries the same tags and placeholders, in the same numbers, in
+SRC, in MT and in REF. 
+
+Seven notations are read:
+
+| Family         | Written as                          |
+| -------------- | ----------------------------------- |
+| `paired_open`  | `{1>` `{b>` `{b^>`                  |
+| `paired_close` | `<1}` `<b}` `<b^}`                  |
+| `standalone`   | `{1}` `{2}` `{name}`                |
+| `double_brace` | `{{var}}`                           |
+| `xml`          | `<ph x="1"/>` `<span ...>` `</span>` |
+| `printf`       | `%s` `%1$s` `%.2f`                  |
+| `entity`       | `&brand;` `&#160;`                  |
+
+
+### Metrics
+
+For every tag in a segment, the **SRC count** is how often it appears in the **source**, and the
+**version count** is how often it appears in the **version being scored**, capped at the SRC count
+so that a tag emitted four times where SRC had one cannot cover three dropped elsewhere. Summed over
+every tag in every segment:
+
+```
+expected_instances = sum of the SRC counts
+present_instances  = sum of the version counts
+
+integrity_rate     = present_instances / expected_instances
+
+dropped_instances  = expected_instances - present_instances
+```
+
+Comparison is **case-sensitive and exact** and no tag is
+read as a renamed version of another. A version that turns `{1>` into `{2>` is therefore charged
+twice, once for the `{1>` it dropped and once for the `{2>` it invented. 
+
+The same tags counted **once each instead of per instance**, split four ways by how the version
+count compares with SRC's:
+
+| Bucket             | When                | Meaning                                        |
+| ------------------ | ------------------- | ---------------------------------------------- |
+| **never carried**  | none in the version | SRC carried it, the version has none of it     |
+| **carried partly** | fewer than SRC      | kept in one place and lost in another          |
+| **matched SRC**    | as many as SRC      | present exactly as often as it was owed        |
+| **duplicated**     | more than SRC       | an id repeated, which re-imports as two spans  |
+
+### What is reported
+
+Everything below is reported for **MT**, for **APE** and for **REF**:
+
+* **Integrity rate** — the share of expected instances the version carries, **per tag**, **per tag
+  family**, **per dataset** and **per stratum**.
+
+* **Error kinds**, counted separately over the whole corpus rather than netted against each other:
+
+  * **dropped** — the source carried the tag and the version has fewer of it.
+
+  * **duplicated** — the version has more of it than the source did.
+
+  * **hallucinated** — a tag the source never carried at all, which is the receiving half of a
+    renumbering.
+
+  * **unpaired** — an opener with no closer, or a closer standing before its opener. Ids that
+    already arrive broken in SRC are left out, so no version is charged for markup it was handed
+    broken.
+
+  * **mis-ordered** — the surviving tags stand in a different order than the source put them in,
+    with nothing lost.
+
+* **Segments clean** — the share of tag-bearing segments with no error of any kind. A segment
+  whose source carries no tag is left out of the denominator, since nothing to preserve is not
+  evidence that preservation works. An invented tag is still counted there.
+
+* **Repairs and regressions** — a **repair** is a tag MT got wrong and APE corrected, a
+  **regression** one MT got right and APE broke.
+
+
 ## Configuration
 
 Create a `.env` in the repo root with the following variables:
@@ -226,8 +317,8 @@ Create a `.env` in the repo root with the following variables:
 | `STANZA_BASE_URL`                                     | Stanza lemmatizer, `https://stanza.acolad.build` — no credential                                                                                                                        |
 | `SEARCH_ENGINE_URL`                                   | term-bases index                                                                                                                                                                        |
 | `SEARCH_ENGINE_USERNAME` / `SEARCH_ENGINE_PASSWORD`   | HTTP basic auth, if the cluster uses it                                                                                                                                                 |
-| `GLOSSARY_PATH` / `DNT_PATH`                          | the single source of what each component scores: a dataset file, or a folder of that component's datasets                                                                               |
-| `BENCH_COMPONENT`                                     | which components a run measures, `glossary` and/or `dnt`                                                                                                                                |
+| `GLOSSARY_PATH` / `DNT_PATH` / `TAGS_PATH`            | the single source of what each component scores — a dataset file, or a folder of that component's datasets                                                                              |
+| `BENCH_COMPONENT`                                     | which components a run measures, one or more of `glossary`, `dnt` and `tags`                                                                                                            |
 | `DNT_BASE_URL` / `DNT_API_KEY`                        | the DNT service and its key, sent as `X-Api-Key` — note the casing, post-mt's own key is not accepted                                                                                   |
 | `ES_AWS_SIGV4_ENABLED` / `AWS_REGION` / `AWS_PROFILE` | sign requests with AWS SigV4 instead — required by AWS-managed domains, which reject basic auth. Needs `pip install -e ".[aws]"` and a live login (`aws sso login --profile <profile>`) |
 
@@ -235,8 +326,10 @@ The *APE* column only means anything if post-mt was shown the same terms, and it
 asking the CAT tool which term bases are attached to `cat_project_id`. Every component therefore
 requires **`tempo_task_id`** and **`cat_project_id`**. Terminology also
 requires **`cat_tool_provider`** and **`ecosystem_id`**, without which retrieval is skipped and APE
-runs blind. Since a well-formed `cat_project_id` naming no real project passes every field check and
-still retrieves nothing, terminology submits **one AQE-only segment** and reads `has_glossary` off
-the reply, stopping the run for the price of one segment rather than billing the dataset for a
-measurement that means nothing. Both ids come from the CAT tool and cannot be invented, and the term
-base named in `glossary_ids` has to be attached to that project.
+runs blind. Before any segment is billed, terminology checks that the ids in `glossary_ids` exist in
+the term-bases index, and that these fields are present and name a CAT tool post-mt supports. Either
+failure stops the run. A well-formed `cat_project_id` naming no real project passes both checks and
+still retrieves nothing, and that case surfaces only once the dataset has been billed, as a
+scorecard warning raised from the `has_glossary` flag post-mt returns. Both ids come from the CAT
+tool and cannot be invented, and the term base named in `glossary_ids` has to be attached to that
+project.
