@@ -3,33 +3,19 @@
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
-from .text_processing import Dataset, load
-from .dnt_score import DntAggregate, DntScore, aggregate, score_dnt
+from .text_processing import Dataset
+from .dnt_score import Aggregate, Score, aggregate, score_dnt
 from .pipeline import run_pipeline, stub_pipeline
-from .postmt import Usage, extract_post_edited, preflight_submission, raise_for_preflight
+from .postmt import Usage, extract_post_edited, segment_id
+from .report import delta, report_parameters
 
 logger = logging.getLogger(__name__)
 
 
-def load_dataset(path: Path, *, dry_run: bool) -> Dataset:
-    """Only the submission preflight applies: glossary retrieval has no bearing on DNT items."""
-    data = load(path, component="dnt")
-
-    if not dry_run:
-        raise_for_preflight(
-            preflight_submission(data.parameters),
-            "Preflight failed: post-mt would reject every segment, so there would be no "
-            "APE column to score. Fix the parameters above.",
-        )
-
-    return data
-
-
 @dataclass
-class DntSegmentResult:
+class SegmentResult:
     source_segment_id: str
     src_text: str
     mt_text: str
@@ -40,14 +26,14 @@ class DntSegmentResult:
     changed_by_rev: bool
     items: list[str]
     unread: bool
-    mt: DntScore
-    ape: DntScore
-    rev: DntScore
-    ref: DntScore
+    mt: Score
+    ape: Score
+    rev: Score
+    ref: Score
 
 
 @dataclass
-class DntDelta:
+class Delta:
     ape_preservation_rate: float | None
     rev_preservation_rate: float | None
     items_fixed_by_ape: int
@@ -57,21 +43,21 @@ class DntDelta:
 
 
 @dataclass
-class DntResult:
+class Result:
     dataset: str
     parameters: dict[str, Any]
     totals: dict[str, int]
-    mt: DntAggregate
-    ape: DntAggregate
-    rev: DntAggregate
-    ref: DntAggregate
-    delta: DntDelta
+    mt: Aggregate
+    ape: Aggregate
+    rev: Aggregate
+    ref: Aggregate
+    delta: Delta
     # Detection runs in an LLM call, so two runs with one fingerprint shared a denominator.
     fingerprint: str = ""
     usage: Usage = field(default_factory=Usage)
     failed_segments: int = 0
     failure_reason: str | None = None
-    segments: list[DntSegmentResult] = field(default_factory=list)
+    segments: list[SegmentResult] = field(default_factory=list)
 
 
 def fingerprint_of(item_lists: list[list[str]]) -> str:
@@ -81,15 +67,11 @@ def fingerprint_of(item_lists: list[list[str]]) -> str:
     return hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()[:8]
 
 
-def _delta(before: float | None, after: float | None) -> float | None:
-    return None if before is None or after is None else after - before
-
-
-def _failing(score: DntScore) -> set[str]:
+def _failing(score: Score) -> set[str]:
     return {item.text for item in score.item_scores if item.leaked or item.over_kept}
 
 
-def _repairs(results: list[DntSegmentResult], before: str, after: str) -> dict[str, int]:
+def _repairs(results: list[SegmentResult], before: str, after: str) -> tuple[int, int]:
     """Fixed and broken counted separately: swapping one failure for the other is not a repair."""
     fixed = broken = 0
     for result in results:
@@ -97,141 +79,116 @@ def _repairs(results: list[DntSegmentResult], before: str, after: str) -> dict[s
         now = _failing(getattr(result, after))
         fixed += len(was - now)
         broken += len(now - was)
-    return {f"items_fixed_by_{after}": fixed, f"items_broken_by_{after}": broken}
+    return fixed, broken
 
 
-class DntBenchmark:
-    def __init__(self, *, postmt: Any, dnt: Any, config: Any) -> None:
-        self.postmt = postmt
-        self.dnt = dnt
-        self.config = config
+def run_benchmark(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any, skip_pipeline: bool = False) -> Result:
+    source_language = dataset.parameters.get("clean_source_language_code")
+    target_language = dataset.parameters.get("clean_target_language_code")
 
-    def run(self, dataset: Dataset, *, skip_pipeline: bool = False) -> DntResult:
-        source_language = dataset.parameters.get("clean_source_language_code")
-        target_language = dataset.parameters.get("clean_target_language_code")
+    outcome = stub_pipeline(dataset) if skip_pipeline else run_pipeline(
+        postmt, dataset, batch_size=config.benchmark.batch_size
+    )
+    processed = outcome.segments
 
-        outcome = stub_pipeline(dataset) if skip_pipeline else run_pipeline(
-            self.postmt, dataset, batch_size=self.config.benchmark.batch_size
+    src_texts = [s.get("source_content") or "" for s in dataset.segments]
+    ref_texts = [s.get("reference_content") or "" for s in dataset.segments]
+    mt_texts = [s.get("target_content") or "" for s in dataset.segments]
+    ape_texts = [extract_post_edited(s) for s in processed]
+
+    # Reversion runs on the last version there is; --dry-run makes that MT.
+    reversions = dnt.revert(
+        [
+            {"id": str(index), "source": source, "target": target}
+            for index, (source, target) in enumerate(zip(src_texts, ape_texts))
+        ],
+        batch_size=config.dnt.batch_size,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+    unread = sum(1 for reversion in reversions if reversion is None)
+    if unread:
+        logger.error(
+            "[DNT] %d/%d segments came back from no revert batch. They are excluded from the "
+            "denominator rather than scored as having nothing to preserve - a rate over the "
+            "rest is still meaningful, one that counted them as perfect would not be.",
+            unread, len(reversions),
         )
-        processed = outcome.segments
 
-        src_texts = [s.get("source_content") or "" for s in dataset.segments]
-        ref_texts = [s.get("reference_content") or "" for s in dataset.segments]
-        mt_texts = [s.get("target_content") or "" for s in processed]
-        ape_texts = [extract_post_edited(s) for s in processed]
-
-        # Reversion runs on the last version there is; --dry-run makes that MT.
-        reversions = self.dnt.revert(
-            [
-                {"id": str(index), "source": source, "target": target}
-                for index, (source, target) in enumerate(zip(src_texts, ape_texts))
-            ],
-            batch_size=self.config.dnt.batch_size,
-            source_language=source_language,
-            target_language=target_language,
+    per_segment_items = [[] if r is None else list(r.items) for r in reversions]
+    carrying = sum(1 for items in per_segment_items if items)
+    logger.info("[DNT] %d/%d segments carry at least one DNT item", carrying, len(dataset.segments))
+    if carrying == 0 and unread < len(reversions):
+        logger.warning(
+            "[DNT] no DNT items at all - check DNT_BASE_URL and the language pair before "
+            "trusting a 0-instance result"
         )
 
-        unread = sum(1 for reversion in reversions if reversion is None)
-        if unread:
-            logger.error(
-                "[DNT] %d/%d segments came back from no revert batch. They are excluded from the "
-                "denominator rather than scored as having nothing to preserve - a rate over the "
-                "rest is still meaningful, one that counted them as perfect would not be.",
-                unread, len(reversions),
-            )
+    results: list[SegmentResult] = []
+    for index, segment in enumerate(processed):
+        reversion = reversions[index]
+        items = per_segment_items[index]
+        src_text, ref_text = src_texts[index], ref_texts[index]
+        mt_text, ape_text = mt_texts[index], ape_texts[index]
+        rev_text = ape_text if reversion is None else reversion.rev_text
 
-        per_segment_items = [[] if r is None else list(r.items) for r in reversions]
-        carrying = sum(1 for items in per_segment_items if items)
-        logger.info(
-            "[DNT] %d/%d segments carry at least one DNT item", carrying, len(dataset.segments)
+        common = dict(
+            items=items,
+            src_text=src_text,
+            ref_text=ref_text,
+            source_language_code=source_language,
+            target_language_code=target_language,
         )
-        if carrying == 0 and unread < len(reversions):
-            logger.warning(
-                "[DNT] no DNT items at all - check DNT_BASE_URL and the language pair before "
-                "trusting a 0-instance result"
-            )
 
-        results: list[DntSegmentResult] = []
-        for index, segment in enumerate(processed):
-            reversion = reversions[index]
-            items = per_segment_items[index]
-            src_text, ref_text = src_texts[index], ref_texts[index]
-            mt_text, ape_text = mt_texts[index], ape_texts[index]
-            rev_text = ape_text if reversion is None else reversion.rev_text
+        results.append(SegmentResult(
+            source_segment_id=segment_id(segment, dataset.segments[index], index),
+            src_text=src_text,
+            mt_text=mt_text,
+            ape_text=ape_text,
+            rev_text=rev_text,
+            ref_text=ref_text,
+            changed_by_ape=mt_text != ape_text,
+            changed_by_rev=ape_text != rev_text,
+            items=items,
+            unread=reversion is None,
+            mt=score_dnt(text=mt_text, **common),
+            ape=score_dnt(text=ape_text, **common),
+            rev=score_dnt(text=rev_text, **common),
+            ref=score_dnt(text=ref_text, **common),
+        ))
 
-            common = dict(
-                items=items,
-                src_text=src_text,
-                ref_text=ref_text,
-                source_language_code=source_language,
-                target_language_code=target_language,
-            )
+    failures = outcome.failures
 
-            results.append(DntSegmentResult(
-                source_segment_id=str(
-                    segment.get("source_segment_id")
-                    or dataset.segments[index].get("source_segment_id")
-                    or index
-                ),
-                src_text=src_text,
-                mt_text=mt_text,
-                ape_text=ape_text,
-                rev_text=rev_text,
-                ref_text=ref_text,
-                changed_by_ape=mt_text != ape_text,
-                changed_by_rev=ape_text != rev_text,
-                items=items,
-                unread=reversion is None,
-                mt=score_dnt(text=mt_text, **common),
-                ape=score_dnt(text=ape_text, **common),
-                rev=score_dnt(text=rev_text, **common),
-                ref=score_dnt(text=ref_text, **common),
-            ))
+    scored = [r for r in results if not r.unread]
+    mt = aggregate([r.mt for r in scored], segments_unread=unread)
+    ape = aggregate([r.ape for r in scored], segments_unread=unread)
+    rev = aggregate([r.rev for r in scored], segments_unread=unread)
+    ref = aggregate([r.ref for r in scored], segments_unread=unread)
 
-        failures = outcome.failures
-        if failures:
-            logger.error(
-                "[DNT] %d/%d segments carry a post-mt error, so their APE text is just MT "
-                "echoed back. The APE column and every delta derived from it "
-                "are NOT a measurement of APE. First error: %s",
-                len(failures), len(results), failures[0],
-            )
-
-        scored = [r for r in results if not r.unread]
-        mt = aggregate([r.mt for r in scored], segments_unread=unread)
-        ape = aggregate([r.ape for r in scored], segments_unread=unread)
-        rev = aggregate([r.rev for r in scored], segments_unread=unread)
-        ref = aggregate([r.ref for r in scored], segments_unread=unread)
-
-        return DntResult(
-            dataset=f"{dataset.name} (dry-run)" if skip_pipeline else dataset.name,
-            parameters={
-                "source_language": source_language,
-                "target_language": target_language,
-                "domain": dataset.parameters.get("domain"),
-                "cat_tool_provider": dataset.parameters.get("cat_tool_provider"),
-                "cat_project_id": dataset.parameters.get("cat_project_id"),
-            },
-            fingerprint=fingerprint_of(per_segment_items),
-            usage=outcome.usage,
-            failed_segments=len(failures),
-            failure_reason=failures[0] if failures else None,
-            totals={
-                "segments": len(dataset.segments),
-                "segments_read": len(scored),
-                "segments_with_items": carrying,
-                "segments_changed_by_ape": sum(1 for r in results if r.changed_by_ape),
-                "segments_changed_by_rev": sum(1 for r in results if r.changed_by_rev),
-            },
-            mt=mt,
-            ape=ape,
-            rev=rev,
-            ref=ref,
-            delta=DntDelta(
-                ape_preservation_rate=_delta(mt.preservation_rate, ape.preservation_rate),
-                rev_preservation_rate=_delta(ape.preservation_rate, rev.preservation_rate),
-                **_repairs(scored, "mt", "ape"),
-                **_repairs(scored, "ape", "rev"),
-            ),
-            segments=results,
-        )
+    return Result(
+        dataset=f"{dataset.name} (dry-run)" if skip_pipeline else dataset.name,
+        parameters=report_parameters(dataset),
+        fingerprint=fingerprint_of(per_segment_items),
+        usage=outcome.usage,
+        failed_segments=len(failures),
+        failure_reason=failures[0] if failures else None,
+        totals={
+            "segments": len(dataset.segments),
+            "segments_read": len(scored),
+            "segments_with_items": carrying,
+            "segments_changed_by_ape": sum(1 for r in results if r.changed_by_ape),
+            "segments_changed_by_rev": sum(1 for r in results if r.changed_by_rev),
+        },
+        mt=mt,
+        ape=ape,
+        rev=rev,
+        ref=ref,
+        delta=Delta(
+            delta(mt.preservation_rate, ape.preservation_rate),
+            delta(ape.preservation_rate, rev.preservation_rate),
+            *_repairs(scored, "mt", "ape"),
+            *_repairs(scored, "ape", "rev"),
+        ),
+        segments=results,
+    )

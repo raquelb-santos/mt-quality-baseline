@@ -3,46 +3,30 @@
 from collections import defaultdict
 from typing import Any, Sequence
 
-from .dnt_benchmark import DntResult
+from .dnt_benchmark import Result
 from .dnt_score import pool
-from .report import Scorecard, by_stratum, cell, pct, rate, signed_pct, table
+from .report import Scorecard, arrow, by_stratum, cell, failure_warning, pct, rate, scope_note, signed_pct, spend_fact, subheading_of, table
 from .text_processing import count_surface
 
-# The versions a run scores, in delivery order.
-PIPELINE = (("mt", "MT"), ("ape", "APE"), ("rev", "REV"))
+VERSIONS = ("mt", "ape", "rev")
 
-# The per-item worklist counts instead of rating: what each version kept, REF too, and REV's ratio.
 ITEM_COLUMNS = ("MT", "APE", "REV", "REF", "Preservation")
 
 
-def _arrow(values: Sequence[Any]) -> str:
-    return " → ".join(str(value) for value in values)
-
-
 def _moved(values: Sequence[Any]) -> str:
-    return " → ".join(f"{label} {value}" for (_, label), value in zip(PIPELINE, values))
+    return " → ".join(f"{v.upper()} {value}" for v, value in zip(VERSIONS, values))
 
 
-def dnt_scorecard(result: DntResult) -> Scorecard:
-    """One DNT dataset's headline results, in the form both destinations render from."""
-    mt, ape, rev = result.mt, result.ape, result.rev
-    versions = (mt, ape, rev)
+def scorecard(result: Result) -> Scorecard:
+    mt = result.mt
+    versions = (mt, result.ape, result.rev)
     totals, delta = result.totals, result.delta
 
-    subheading = f"{result.parameters['source_language']} → {result.parameters['target_language']}"
-    if result.parameters.get("domain"):
-        subheading += f"  ·  {result.parameters['domain']}"
-
-    warnings = []
-    if result.failed_segments:
-        warnings.append(
-            f"{result.failed_segments}/{totals['segments']} segments failed inside post-mt"
-            f"\n{result.failure_reason}"
-        )
+    warnings = failure_warning(result)
     if mt.segments_unread:
         warnings.append(
             f"{mt.segments_unread}/{totals['segments']} segments came back from no revert batch"
-            " and are excluded from every count below, rather than counted as having nothing to"
+            " and are excluded from every rate below, rather than counted as having nothing to"
             " preserve."
         )
 
@@ -52,6 +36,7 @@ def dnt_scorecard(result: DntResult) -> Scorecard:
         ("Leaked", [a.leaked for a in versions]),
         ("Over-kept", [a.over_kept for a in versions]),
         ("Segments clean", [pct(a.segment_preservation_rate) for a in versions]),
+        ("Kept from SRC", [pct(a.src_retention_rate) for a in versions]),
     ]
     width = max(len(label) for label, _ in metrics)
 
@@ -60,44 +45,44 @@ def dnt_scorecard(result: DntResult) -> Scorecard:
         f" · with items {totals['segments_with_items']}"
         f" · changed by APE {totals['segments_changed_by_ape']}"
         f" · by REV {totals['segments_changed_by_rev']}",
-        f"Items {mt.distinct_items} scored · {mt.expected} REF instances"
+        f"Items {mt.items.distinct_items} scored · {mt.expected} REF instances"
         f" · excluded: not in REF {mt.not_in_ref}"
         f" · not in SRC {mt.not_in_src} · fingerprint {result.fingerprint}",
+        f"SRC instances {mt.in_src} · REF kept {pct(result.ref.src_retention_rate)} of them,"
+        f" so the rest are items the human chose to translate",
         *(f"{label.ljust(width)}  {_moved(values)}" for label, values in metrics),
+        *scope_note(mt.segments_scored, totals["segments_with_items"],
+                    "the rest name no item that both SRC and REF carry"),
+        *spend_fact(result.usage),
     ]
-
-    if result.usage.cost or result.usage.tokens:
-        facts.append(
-            f"LLM spend ${result.usage.cost:.4f} · {result.usage.tokens:,} tokens "
-            f"({result.usage.prompt_tokens:,} prompt / {result.usage.completion_tokens:,} completion)"
-        )
 
     detail = [
         f"Preservation delta APE {signed_pct(delta.ape_preservation_rate)}"
         f" · REV {signed_pct(delta.rev_preservation_rate)}",
-        f"Leak kinds · translated {_arrow([a.leaks.translated for a in versions])}"
-        f" · case drift {_arrow([a.leaks.case_drift for a in versions])}",
+        f"Leak kinds · translated {arrow([a.leaks.translated for a in versions])}"
+        f" · case drift {arrow([a.leaks.case_drift for a in versions])}",
         f"Item outcomes"
-        f" · matched {_arrow([a.items.matched_ref for a in versions])}"
-        f" · partly {_arrow([a.items.kept_partly for a in versions])}"
-        f" · never {_arrow([a.items.never_kept for a in versions])}"
-        f" · over-kept {_arrow([a.items.over_kept for a in versions])}",
+        f" · matched {arrow([a.items.matched_ref for a in versions])}"
+        f" · partly {arrow([a.items.kept_partly for a in versions])}"
+        f" · never {arrow([a.items.never_kept for a in versions])}"
+        f" · over-kept {arrow([a.items.over_kept for a in versions])}",
         f"APE repaired {delta.items_fixed_by_ape} · broke {delta.items_broken_by_ape}"
         f" · REV repaired {delta.items_fixed_by_rev}"
         f" · broke {delta.items_broken_by_rev}",
     ]
 
     return Scorecard(
-        heading="dnt", subheading=subheading, facts=facts, warnings=warnings, detail=detail
+        heading="dnt", subheading=subheading_of(result), facts=facts,
+        warnings=warnings, detail=detail,
     )
 
 
-def item_rows(result: DntResult) -> list[dict[str, Any]]:
-    """One row per distinct DNT item, with rates recomputed from the pooled counts, not averaged."""
+def item_rows(result: Result) -> list[dict[str, Any]]:
+    """One row per distinct DNT item."""
     pooled: dict[str, defaultdict[str, int]] = {}
 
     for segment in result.segments:
-        columns = {c: {i.text: i for i in getattr(segment, c).item_scores} for c, _ in PIPELINE}
+        columns = {c: {i.text: i for i in getattr(segment, c).item_scores} for c in VERSIONS}
         # One column's keys are all of them: an item is either scored in every column or in none.
         for text, mt_score in columns["mt"].items():
             entry = pooled.setdefault(text, defaultdict(int))
@@ -108,7 +93,7 @@ def item_rows(result: DntResult) -> list[dict[str, Any]]:
             for column, scores in columns.items():
                 scored = scores[text]
                 entry[f"{column}_preserved"] += scored.preserved
-                entry[f"{column}_kept"] += scored.kept
+                entry[f"{column}_found"] += scored.found
                 entry[f"{column}_over_kept"] += scored.over_kept
 
     rows = [
@@ -118,9 +103,9 @@ def item_rows(result: DntResult) -> list[dict[str, Any]]:
             "ref_kept": entry["expected"],
             "mt_over_kept": entry["mt_over_kept"],
             "rev_over_kept": entry["rev_over_kept"],
-            **{f"{c}_kept": entry[f"{c}_kept"] for c, _ in PIPELINE},
+            **{f"{c}_found": entry[f"{c}_found"] for c in VERSIONS},
             **{f"{c}_preservation_rate": rate(entry[f"{c}_preserved"], entry["expected"])
-               for c, _ in PIPELINE},
+               for c in VERSIONS},
         }
         for text, entry in pooled.items()
     ]
@@ -130,13 +115,13 @@ def item_rows(result: DntResult) -> list[dict[str, Any]]:
     return rows
 
 
-def item_cells(result: DntResult) -> list[tuple[str, list[str]]]:
+def item_cells(result: Result) -> list[tuple[str, list[str]]]:
     """Each item against what every version kept, REF included, and REV's ratio."""
     return [
         (
             row["item"],
             [
-                *(str(row[f"{column}_kept"]) for column, _ in PIPELINE),
+                *(str(row[f"{column}_found"]) for column in VERSIONS),
                 str(row["ref_kept"]),
                 pct(row["rev_preservation_rate"]),
             ],
@@ -145,7 +130,7 @@ def item_cells(result: DntResult) -> list[tuple[str, list[str]]]:
     ]
 
 
-def render_dnt_items(result: DntResult) -> str:
+def render_items(result: Result) -> str:
     rows = item_cells(result)
     if not rows:
         return "No DNT items were reported.\n"
@@ -153,7 +138,7 @@ def render_dnt_items(result: DntResult) -> str:
                  "DNT item", ITEM_COLUMNS, rows)
 
 
-def render_dnt_items_console(result: DntResult) -> str:
+def render_items_console(result: Result) -> str:
     rows = item_cells(result)
     if not rows:
         return "\n".join(
@@ -167,7 +152,7 @@ def render_dnt_items_console(result: DntResult) -> str:
     )
 
 
-def detection_rows(result: DntResult) -> list[dict[str, Any]]:
+def detection_rows(result: Result) -> list[dict[str, Any]]:
     """One row per item per segment: the grain the scope gates work at. Empty segments get a row."""
     source_language = result.parameters.get("source_language")
     target_language = result.parameters.get("target_language")
@@ -181,7 +166,7 @@ def detection_rows(result: DntResult) -> list[dict[str, Any]]:
                 "item": "(no response)" if segment.unread else "(none)",
                 "scored": False, "flag": "", "counted": False,
                 "in_src": "", "in_ref": "",
-                **{f"in_{column}": "" for column, _ in PIPELINE},
+                **{f"in_{column}": "" for column in VERSIONS},
                 "preserved": 0, "expected": 0,
             })
             continue
@@ -193,7 +178,7 @@ def detection_rows(result: DntResult) -> list[dict[str, Any]]:
                 column: count_surface(
                     getattr(segment, f"{column}_text"), item, target_language, casefold=False
                 )
-                for column, _ in PIPELINE
+                for column in VERSIONS
             }
 
             # The same gates `score_dnt` applies, so the row and the totals agree.
@@ -223,7 +208,7 @@ def _preservation(row: dict[str, Any]) -> str:
     return pct(rate(row["preserved"], row["expected"]))
 
 
-def render_dnt_detection(result: DntResult) -> str:
+def render_detection(result: Result) -> str:
     """What the service named per segment, including the items no column scores."""
     rows = detection_rows(result)
     if not rows:
@@ -246,7 +231,7 @@ def render_dnt_detection(result: DntResult) -> str:
     return "\n".join(lines)
 
 
-def render_dnt_detection_console(result: DntResult) -> str:
+def render_detection_console(result: Result) -> str:
     rows = detection_rows(result)
     if not rows:
         return ""
@@ -271,7 +256,52 @@ def render_dnt_detection_console(result: DntResult) -> str:
     return "\n".join(lines)
 
 
-def render_dnt_comparison(results: Sequence[DntResult]) -> str:
+def defect_rows(result: Result) -> list[dict[str, Any]]:
+    """One row per item a version failed, which is the worklist tracing numbers to segments."""
+    rows = []
+    for segment in result.segments:
+        scores = {version: {i.text: i for i in getattr(segment, version).item_scores}
+                  for version in VERSIONS}
+        for scored in segment.ref.item_scores:
+            faults = []
+            for version in VERSIONS:
+                against_ref = scores[version][scored.text]
+                if against_ref.leaked:
+                    faults.append(f"{version.upper()} {against_ref.leak_kind.replace('_', ' ')}")
+                elif against_ref.over_kept:
+                    faults.append(f"{version.upper()} over-kept")
+            if not faults:
+                continue
+
+            rows.append({
+                "segment_id": segment.source_segment_id,
+                "item": scored.text,
+                "ref_kept": scored.expected,
+                **{f"{version}_found": scores[version][scored.text].found for version in VERSIONS},
+                "faults": ", ".join(faults),
+            })
+    return rows
+
+
+def render_defects(result: Result) -> str:
+    """Every DNT item a version lost or over-kept, and what each version did to it."""
+    rows = [
+        (
+            str(row["segment_id"]),
+            [
+                cell(row["item"]),
+                str(row["ref_kept"]),
+                *(str(row[f"{column}_found"]) for column in VERSIONS),
+                cell(row["faults"]),
+            ],
+        )
+        for row in defect_rows(result)
+    ]
+    return table("DNT items that did not survive", "Segment",
+                 ("DNT item", "REF", "MT", "APE", "REV", "What went wrong"), rows)
+
+
+def render_comparison(results: Sequence[Result]) -> str:
     if len(results) < 2:
         return ""
 
@@ -290,11 +320,11 @@ def render_dnt_comparison(results: Sequence[DntResult]) -> str:
     return "\n".join(lines)
 
 
-def dnt_stratum_rows(results: Sequence[DntResult]) -> list[dict[str, Any]]:
+def stratum_rows(results: Sequence[Result]) -> list[dict[str, Any]]:
     """One row per stratum, with the pooled counts its rates were computed from."""
     rows = []
     for (pair, domain), group in by_stratum(results).items():
-        mt, ape, rev = (pool([getattr(r, column) for r in group]) for column, _ in PIPELINE)
+        mt, ape, rev = (pool([getattr(r, column) for r in group]) for column in VERSIONS)
 
         rows.append({
             "language_pair": pair,
@@ -309,18 +339,18 @@ def dnt_stratum_rows(results: Sequence[DntResult]) -> list[dict[str, Any]]:
     return rows
 
 
-def stratum_rate_rows(results: Sequence[DntResult]) -> list[tuple[str, list[str]]]:
+def stratum_rate_rows(results: Sequence[Result]) -> list[tuple[str, list[str]]]:
     """Each stratum against its pooled preservation, the instance count in the label."""
     rows = [
         (
             f"{row['language_pair']} · {row['domain']} · {row['expected_instances']} inst",
-            [pct(row[f"{column}_preservation_rate"]) for column, _ in PIPELINE],
+            [pct(row[f"{column}_preservation_rate"]) for column in VERSIONS],
         )
-        for row in dnt_stratum_rows(results)
+        for row in stratum_rows(results)
     ]
 
     if len(rows) > 1:
-        pooled = [pool([getattr(r, column) for r in results]) for column, _ in PIPELINE]
+        pooled = [pool([getattr(r, column) for r in results]) for column in VERSIONS]
         rows.append(
             (f"ALL · {pooled[0].expected} inst", [pct(a.preservation_rate) for a in pooled])
         )
@@ -328,16 +358,12 @@ def stratum_rate_rows(results: Sequence[DntResult]) -> list[tuple[str, list[str]
     return rows
 
 
-def render_dnt_strata(results: Sequence[DntResult]) -> str:
+def render_strata(results: Sequence[Result]) -> str:
     """Pooled preservation per language pair and domain."""
-    rows = stratum_rate_rows(results)
-    if not rows:
-        return ""
-
-    return table("Preservation by stratum", "Stratum",
-                 [label for _, label in PIPELINE], rows, heading="##")
+    return table("Preservation by stratum", "Stratum", [v.upper() for v in VERSIONS],
+                 stratum_rate_rows(results), heading="##")
 
 
-def render_dnt_strata_console(results: Sequence[DntResult]) -> str:
-    return table("Preservation by stratum", "stratum", [name for _, name in PIPELINE],
+def render_strata_console(results: Sequence[Result]) -> str:
+    return table("Preservation by stratum", "stratum", [v.upper() for v in VERSIONS],
                  stratum_rate_rows(results), console=True)

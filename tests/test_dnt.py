@@ -7,7 +7,7 @@ import pytest
 
 from sourcecode import dnt_report, report, run
 from sourcecode.dnt import Reversion
-from sourcecode.dnt_benchmark import DntBenchmark, fingerprint_of
+from sourcecode.dnt_benchmark import fingerprint_of, run_benchmark
 from sourcecode.dnt_score import (
     CASE_DRIFT,
     TRANSLATED,
@@ -120,14 +120,16 @@ def _dataset(name="dnt-set", domain="Test", segments=SEGMENTS):
 
 
 def _result(name="dnt-set", domain="Test"):
-    return DntBenchmark(postmt=None, dnt=FakeDnt(items=ITEMS), config=CONFIG).run(
-        _dataset(name, domain), skip_pipeline=True
+    return run_benchmark(
+        _dataset(name, domain), postmt=None, dnt=FakeDnt(items=ITEMS), config=CONFIG,
+        skip_pipeline=True,
     )
 
 
 def _run(dnt, *, skip_pipeline=True, postmt=None):
-    return DntBenchmark(postmt=postmt, dnt=dnt, config=CONFIG).run(
-        _dataset(segments=SEGMENTS[:2]), skip_pipeline=skip_pipeline
+    return run_benchmark(
+        _dataset(segments=SEGMENTS[:2]), postmt=postmt, dnt=dnt, config=CONFIG,
+        skip_pipeline=skip_pipeline,
     )
 
 
@@ -302,7 +304,7 @@ def test_exclusions_are_counted_not_scored():
     assert result.not_in_ref == 1
     assert result.expected == 0
     assert result.errors == 0
-    assert result.segments_with_items == 0
+    assert result.segments_scored == 0
     assert result.preservation_rate is None
 
 
@@ -311,8 +313,8 @@ def test_fully_preserved_needs_both_directions():
 
     result = aggregate([over])
 
-    assert result.segments_with_items == 1
-    assert result.segments_fully_preserved == 0
+    assert result.segments_scored == 1
+    assert result.segments_clean == 0
 
 
 def test_pooling_sums_counts_rather_than_averaging_rates():
@@ -360,7 +362,7 @@ def test_pooling_carries_unread_count_forward():
 def test_scorecard_names_stratum():
     """The component and the stratum, and nothing the tables below already carry."""
     result = _result()
-    line = dnt_report.dnt_scorecard(result).as_console().splitlines()[0]
+    line = dnt_report.scorecard(result).as_console().splitlines()[0]
 
     assert line == "dnt  -  en-gb → fr-fr  ·  Test"
     assert result.dataset not in line and "steps" not in line
@@ -369,8 +371,8 @@ def test_scorecard_names_stratum():
 def test_console_headlines_file_details():
     """Every line in the file breaks down one the console already showed; neither contradicts."""
     result = _result()
-    console = dnt_report.dnt_scorecard(result).as_console()
-    rendered = dnt_report.dnt_scorecard(result).as_markdown()
+    console = dnt_report.scorecard(result).as_console()
+    rendered = dnt_report.scorecard(result).as_markdown()
 
     for headline in ("Preservation", "Leaked", "Over-kept", "Segments clean"):
         assert headline in console and headline in rendered
@@ -382,14 +384,108 @@ def test_console_headlines_file_details():
 
 def test_scorecard_explains_nothing():
     """The label names the number; what it means is in the README, written once."""
-    rendered = dnt_report.dnt_scorecard(_result()).as_markdown()
+    rendered = dnt_report.scorecard(_result()).as_markdown()
 
     assert "never netted" not in rendered
     assert "leaked + over-kept" not in rendered
 
 
+def test_defect_list_names_the_item_the_segment_and_the_fault():
+    """The detection table is an items x segments grid; only a filtered list is a worklist."""
+    rows = {row["item"]: row for row in dnt_report.defect_rows(_result())}
+
+    assert rows["AcoladPro"]["segment_id"] == "s1"
+    assert rows["AcoladPro"]["mt_found"] == 0 and rows["AcoladPro"]["ref_kept"] == 1
+    assert "MT translated" in rows["AcoladPro"]["faults"]
+    assert "REV" not in rows["AcoladPro"]["faults"]      # reversion repaired it
+    assert "MT over-kept" in rows["Cleaner"]["faults"]
+
+
+def test_defect_list_leaves_out_items_every_version_kept():
+    """A row per preserved item would bury the failures, which is what the grid already does."""
+    segments = [{"source_segment_id": "s1", "source_content": "AcoladPro is here.",
+                 "target_content": "AcoladPro est ici.", "reference_content": "AcoladPro est ici."}]
+    result = run_benchmark(
+        _dataset(segments=segments), postmt=None, dnt=FakeDnt(items=["AcoladPro"]),
+        config=CONFIG, skip_pipeline=True,
+    )
+
+    assert dnt_report.defect_rows(result) == []
+    assert dnt_report.render_defects(result) == ""
+
+
+def test_defect_list_separates_case_drift_from_translation():
+    """The two failures need different fixes, so the worklist must not call them both a leak."""
+    segments = [{"source_segment_id": "s1", "source_content": "AcoladPro is here.",
+                 "target_content": "acoladpro est ici.", "reference_content": "AcoladPro est ici."}]
+    result = run_benchmark(
+        _dataset(segments=segments), postmt=None, dnt=FakeDnt(items=["AcoladPro"]),
+        config=CONFIG, skip_pipeline=True,
+    )
+
+    assert "MT case drift" in dnt_report.defect_rows(result)[0]["faults"]
+
+
+def test_src_retention_counts_items_the_reference_translated():
+    """REF-against-REF is 100% by construction; SRC is the only denominator that can fall."""
+    segments = [
+        # Kept by everyone.
+        {"source_segment_id": "s1", "source_content": "AcoladPro is here.",
+         "target_content": "AcoladPro est ici.", "reference_content": "AcoladPro est ici."},
+        # The human translated it away; the MT kept it.
+        {"source_segment_id": "s2", "source_content": "AcoladPro is sold.",
+         "target_content": "AcoladPro est vendu.", "reference_content": "Le produit est vendu."},
+    ]
+    result = run_benchmark(
+        _dataset(segments=segments), postmt=None, dnt=FakeDnt(items=["AcoladPro"]),
+        config=CONFIG, skip_pipeline=True,
+    )
+
+    assert result.mt.in_src == 2
+    assert result.ref.src_retention_rate == 0.5   # the human kept one of the two
+    assert result.mt.src_retention_rate == 1.0    # the MT kept both
+    # REF against itself still says nothing, which is why the SRC ratio was added.
+    assert result.ref.preservation_rate == 1.0
+
+
+def test_scorecard_says_when_fewer_segments_were_scored_than_counted():
+    """`with items` and the rate's denominator are different numbers; the gap has to be visible."""
+    segments = [
+        # Both SRC and REF carry it, so REF sets an expectation here.
+        {"source_segment_id": "s1", "source_content": "AcoladPro is here.",
+         "target_content": "AcoladPro est ici.", "reference_content": "AcoladPro est ici."},
+        # REF translated it away, so this segment is named but never scored.
+        {"source_segment_id": "s2", "source_content": "AcoladPro is here.",
+         "target_content": "AcoladPro est ici.", "reference_content": "Le produit est ici."},
+    ]
+    result = run_benchmark(
+        _dataset(segments=segments), postmt=None, dnt=FakeDnt(items=["AcoladPro"]),
+        config=CONFIG, skip_pipeline=True,
+    )
+
+    assert result.totals["segments_with_items"] == 2
+    assert result.mt.segments_scored == 1
+    assert "Scored against REF 1 of 2 segments" in dnt_report.scorecard(result).as_console()
+
+
+def test_scorecard_stays_quiet_when_every_counted_segment_was_scored():
+    segments = [
+        {"source_segment_id": "s1", "source_content": "AcoladPro is here.",
+         "target_content": "AcoladPro est ici.", "reference_content": "AcoladPro est ici."},
+        {"source_segment_id": "s2", "source_content": "AcoladPro is sold.",
+         "target_content": "AcoladPro est vendu.", "reference_content": "AcoladPro est vendu."},
+    ]
+    result = run_benchmark(
+        _dataset(segments=segments), postmt=None, dnt=FakeDnt(items=["AcoladPro"]),
+        config=CONFIG, skip_pipeline=True,
+    )
+
+    assert result.totals["segments_with_items"] == result.mt.segments_scored
+    assert "Scored against REF" not in dnt_report.scorecard(result).as_console()
+
+
 def test_summary_reports_three_columns():
-    rendered = dnt_report.dnt_scorecard(_result()).as_markdown()
+    rendered = dnt_report.scorecard(_result()).as_markdown()
 
     for column in ("MT ", "APE ", "REV "):
         assert column in rendered
@@ -398,7 +494,7 @@ def test_summary_reports_three_columns():
 def test_reference_metrics_stay_out_of_reports():
     """REF preserves everything by construction, so scoring it says nothing worth a column."""
     result = _result()
-    scorecard = dnt_report.dnt_scorecard(result)
+    scorecard = dnt_report.scorecard(result)
 
     assert result.ref.preservation_rate == 1.0
     for destination in (scorecard.as_console(), scorecard.as_markdown()):
@@ -410,26 +506,26 @@ def test_summary_carries_detection_fingerprint():
     """Detection is not reproducible, so a reader must see whether the denominator moved."""
     result = _result()
 
-    assert result.fingerprint in dnt_report.dnt_scorecard(result).as_markdown()
+    assert result.fingerprint in dnt_report.scorecard(result).as_markdown()
 
 
 def test_counts_travel_beside_rates():
-    rendered = dnt_report.dnt_scorecard(_result()).as_markdown()
+    rendered = dnt_report.scorecard(_result()).as_markdown()
 
     assert "REF instances" in rendered
     assert "not in REF" in rendered
 
 
 def test_non_ascii_items_survive_rendering():
-    rendered = (dnt_report.dnt_scorecard(_result()).as_markdown()
-                + dnt_report.render_dnt_items(_result()))
+    rendered = (dnt_report.scorecard(_result()).as_markdown()
+                + dnt_report.render_items(_result()))
 
     assert "Café Pro" in rendered
 
 
 def test_every_item_gets_untruncated_row():
     """Not a top-N: a table that stops somewhere tells a reader they have seen the whole worklist."""
-    rendered = dnt_report.render_dnt_items(_result())
+    rendered = dnt_report.render_items(_result())
 
     for item in ("AcoladPro", "Cleaner", "Café Pro"):
         assert item in rendered
@@ -439,9 +535,9 @@ def test_out_of_scope_item_is_flagged():
     """`Widget` moves no number but still cost an LLM call, so the run has to say so somewhere."""
     result = _result()
 
-    assert "Widget" not in dnt_report.render_dnt_items(result)
+    assert "Widget" not in dnt_report.render_items(result)
 
-    detection = dnt_report.render_dnt_detection(result)
+    detection = dnt_report.render_detection(result)
     assert "Widget" in detection
     assert "not in REF" in detection
 
@@ -472,7 +568,7 @@ def test_detection_ratios_sum_to_scorecard():
 
 def test_out_of_scope_item_shows_dash():
     """`0/0` would read as a failure; the reference simply asked nothing of it."""
-    console = dnt_report.render_dnt_detection_console(_result())
+    console = dnt_report.render_detection_console(_result())
     widget = next(
         line for line in console.splitlines()
         if line.split()[:2] == ["s4", "Widget"]
@@ -488,7 +584,7 @@ def test_over_keeping_surfaces_past_cap():
 
     assert rows["Cleaner"]["rev_over_kept"] == 1
     assert rows["Cleaner"]["rev_preservation_rate"] == 1.0
-    assert "Over-kept" in dnt_report.dnt_scorecard(result).as_markdown()
+    assert "Over-kept" in dnt_report.scorecard(result).as_markdown()
 
 
 def test_no_denominator_renders_as_na():
@@ -498,12 +594,12 @@ def test_no_denominator_renders_as_na():
     result.mt = aggregate([s.mt for s in result.segments])
 
     assert result.mt.preservation_rate is None
-    assert "n/a" in dnt_report.dnt_scorecard(result).as_markdown()
+    assert "n/a" in dnt_report.scorecard(result).as_markdown()
 
 
 def test_per_item_table_counts_every_version():
     """MT alone hides what reversion repaired, and a rate alone hides what was over-kept."""
-    rendered = dnt_report.render_dnt_items(_result())
+    rendered = dnt_report.render_items(_result())
     header = next(line for line in rendered.splitlines() if line.startswith("| DNT item"))
 
     assert [column.strip() for column in header.strip("|").split("|")] == [
@@ -527,12 +623,12 @@ def test_no_items_says_so():
     result = _result()
     result.segments = []
 
-    assert "No DNT items" in dnt_report.render_dnt_items(result)
+    assert "No DNT items" in dnt_report.render_items(result)
 
 
 def test_single_dataset_still_gets_stratum_row():
     """A run that measured one dataset must still say what its stratum preserved."""
-    rendered = dnt_report.render_dnt_strata([_result()])
+    rendered = dnt_report.render_strata([_result()])
 
     assert "Preservation by stratum" in rendered
     assert "en-gb->fr-fr" in rendered
@@ -543,14 +639,14 @@ def test_datasets_in_different_domains_are_different_strata():
     """Each gets its own row, and the row across them is pooled from the counts, not averaged."""
     results = [_result("a", "Automotive"), _result("b", "Legal")]
 
-    assert len(dnt_report.dnt_stratum_rows(results)) == 2
-    assert "ALL" in dnt_report.render_dnt_strata(results)
+    assert len(dnt_report.stratum_rows(results)) == 2
+    assert "ALL" in dnt_report.render_strata(results)
 
 
 def test_stratum_rows_are_printed_as_well_as_written():
     """The console and the file carry the same rows, off one builder."""
     results = [_result("a"), _result("b")]
-    console = dnt_report.render_dnt_strata_console(results)
+    console = dnt_report.render_strata_console(results)
 
     for label, rates in dnt_report.stratum_rate_rows(results):
         assert label in console
@@ -559,7 +655,7 @@ def test_stratum_rows_are_printed_as_well_as_written():
 
 
 def test_stratum_row_carries_both_directions():
-    rows = dnt_report.dnt_stratum_rows([_result("a"), _result("b")])
+    rows = dnt_report.stratum_rows([_result("a"), _result("b")])
 
     assert rows[0]["mt_leaked"] == 2          # one leak per dataset
     assert rows[0]["mt_over_kept"] == 2
@@ -583,7 +679,7 @@ def test_per_segment_counts_sum_to_scorecard():
 
 def test_stratum_row_is_pooled_scorecard():
     results = [_result("a"), _result("b")]
-    row = dnt_report.dnt_stratum_rows(results)[0]
+    row = dnt_report.stratum_rows(results)[0]
     pooled = pool([r.mt for r in results])
 
     assert row["expected_instances"] == pooled.expected
