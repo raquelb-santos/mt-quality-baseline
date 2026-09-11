@@ -1,5 +1,7 @@
+"""The terminology adherence metric: every version is scored against the human reference."""
+
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .text_processing import count_occurrences, normalize_text
 from .report import rate
@@ -7,6 +9,15 @@ from .report import rate
 MISS = "miss"                              # no sanctioned target form in the output
 INCONSISTENCY = "inconsistency"            # an approved target other than the one the reference used
 OVER_APPLICATION = "over-application"      # a target term used where its source term was not
+
+
+def bucket_of(found: int, expected: int) -> str:
+    """The one ladder both grains classify on - the per-segment counters and the pooled row."""
+    if found == 0:
+        return "never_used" if expected else ""
+    if found < expected:
+        return "used_partly"
+    return "matched_ref" if found == expected else "over_used"
 
 
 def build_glossary_map(mappings: Iterable[Mapping[str, str]] | None) -> dict[str, set[str]]:
@@ -31,7 +42,7 @@ class Tally:
     def adherence_rate(self) -> float | None:
         return rate(self.adherent, self.expected)
 
-    def add(self, other: Tally | TranslationScore) -> None:
+    def add(self, other: Any) -> None:
         self.expected += other.expected
         self.adherent += other.adherent
 
@@ -42,17 +53,17 @@ class TermBreakdown:
 
     never_used: int = 0
     used_partly: int = 0
-    used_everywhere: int = 0
+    matched_ref: int = 0
     over_used: int = 0
 
     @property
     def distinct_terms(self) -> int:
-        return self.never_used + self.used_partly + self.used_everywhere + self.over_used
+        return self.never_used + self.used_partly + self.matched_ref + self.over_used
 
     def add(self, other: TermBreakdown) -> None:
         self.never_used += other.never_used
         self.used_partly += other.used_partly
-        self.used_everywhere += other.used_everywhere
+        self.matched_ref += other.matched_ref
         self.over_used += other.over_used
 
 
@@ -86,7 +97,7 @@ class TermScore:
 
 
 @dataclass
-class TranslationScore:
+class Score:
     expected: int = 0
     adherent: int = 0
     strict: Tally = field(default_factory=Tally)
@@ -112,7 +123,7 @@ def _count_renderings(
     )
 
 
-def score_translation(
+def score_glossary(
     *,
     mappings: Iterable[Mapping[str, str]] | None,
     text: str,
@@ -121,9 +132,9 @@ def score_translation(
     text_lemmas: str | None = None,
     ref_lemmas: str | None = None,
     term_lemmas: Mapping[str, str] | None = None,
-) -> TranslationScore:
+) -> Score:
     """Score one translation of a segment against REF for that same segment."""
-    result = TranslationScore()
+    result = Score()
 
     for source, targets in build_glossary_map(mappings).items():
         expected_targets = sorted(targets)
@@ -147,14 +158,8 @@ def score_translation(
             tally.adherent += adherent_n
 
         # Bucketed on the counts: presence alone cannot tell "as often as the human" from "more".
-        if rendered == 0:
-            result.terms.never_used += 1
-        elif rendered < expected_n:
-            result.terms.used_partly += 1
-        elif rendered == expected_n:
-            result.terms.used_everywhere += 1
-        else:
-            result.terms.over_used += 1
+        bucket = bucket_of(rendered, expected_n)
+        setattr(result.terms, bucket, getattr(result.terms, bucket) + 1)
 
         result.term_scores.append(TermScore(
             source_content=source, expected_targets=expected_targets, strictness=strictness,
@@ -179,16 +184,16 @@ class Aggregate:
     strict: Tally
     permissive: Tally
     terms: TermBreakdown
-    segments_with_glossary: int
-    segments_fully_adherent: int
+    segments_scored: int
+    segments_clean: int
     segment_adherence_rate: float | None
 
 
 def _combine(
-    items: Sequence[TranslationScore] | Sequence[Aggregate],
-    scored: Sequence[TranslationScore] | Sequence[Aggregate],
-    segments_with_glossary: int,
-    segments_fully_adherent: int,
+    items: Sequence[Score] | Sequence[Aggregate],
+    scored: Sequence[Score] | Sequence[Aggregate],
+    segments_scored: int,
+    segments_clean: int,
 ) -> Aggregate:
     """Term counts pool over `items`, the rate-bearing tallies over `scored`."""
     total, strict, permissive = Tally(), Tally(), Tally()
@@ -208,31 +213,30 @@ def _combine(
         strict=strict,
         permissive=permissive,
         terms=terms,
-        segments_with_glossary=segments_with_glossary,
-        segments_fully_adherent=segments_fully_adherent,
-        segment_adherence_rate=rate(segments_fully_adherent, segments_with_glossary),
+        segments_scored=segments_scored,
+        segments_clean=segments_clean,
+        segment_adherence_rate=rate(segments_clean, segments_scored),
     )
 
 
-def aggregate(scores: Sequence[TranslationScore]) -> Aggregate:
-    matched = [s for s in scores if s is not None and s.term_scores]
-    scored = [s for s in matched if s.expected]
+def aggregate(scores: Sequence[Score]) -> Aggregate:
+    scored = [s for s in scores if s.expected]
     return _combine(
-        matched,
+        scores,
         scored,
-        segments_with_glossary=len(scored),
-        segments_fully_adherent=sum(1 for s in scored if s.adherent == s.expected),
+        segments_scored=len(scored),
+        segments_clean=sum(1 for s in scored if s.adherent == s.expected),
     )
 
 
 def pool(aggregates: Sequence[Aggregate]) -> Aggregate:
     """Rates recomputed from the pooled totals; averaging would weight 3 instances like 300."""
-    items = [a for a in aggregates if a is not None]
+    items = list(aggregates)
     return _combine(
         items,
         items,
-        segments_with_glossary=sum(a.segments_with_glossary for a in items),
-        segments_fully_adherent=sum(a.segments_fully_adherent for a in items),
+        segments_scored=sum(a.segments_scored for a in items),
+        segments_clean=sum(a.segments_clean for a in items),
     )
 
 
@@ -281,27 +285,27 @@ def _rendered_variants(
 
 def find_violations(
     *,
-    texts: Sequence[str],
+    versions: Sequence[Sequence[str]],
     ref_texts: Sequence[str],
     per_segment_mappings: Sequence[Iterable[Mapping[str, str]]],
     corpus_mappings: Iterable[Mapping[str, str]],
     language_code: str | None,
     text_lemmas: Mapping[str, str] | None = None,
     term_lemmas: Mapping[str, str] | None = None,
-) -> ViolationReport:
-    """Only where the reference rendered it: a declined proposal would score retrieval."""
-    if not (len(texts) == len(ref_texts) == len(per_segment_mappings)):
-        raise ValueError(
-            f"{len(texts)} texts, {len(ref_texts)} references and "
-            f"{len(per_segment_mappings)} segments of mappings must be the same length"
-        )
+) -> list[ViolationReport]:
+    """One report per version. What REF rendered is the same for all of them, so it is derived
+    once here rather than re-scanned for every version."""
+    for texts in versions:
+        if not (len(texts) == len(ref_texts) == len(per_segment_mappings)):
+            raise ValueError(
+                f"{len(texts)} texts, {len(ref_texts)} references and "
+                f"{len(per_segment_mappings)} segments of mappings must be the same length"
+            )
 
     corpus_map = build_glossary_map(corpus_mappings)
-    lookup = text_lemmas or {}
-    report = ViolationReport(segments=len(texts))
 
     def variants_in(text: str) -> dict[str, list[str]]:
-        lemmas = lookup.get(text)
+        lemmas = (text_lemmas or {}).get(text)
         normalized_text = normalize_text(text)
         normalized_lemmas = normalize_text(lemmas)
         return {
@@ -312,66 +316,122 @@ def find_violations(
             for source, targets in corpus_map.items()
         }
 
-    for index, text in enumerate(texts):
-        mappings = list(per_segment_mappings[index])
-        segment_map = build_glossary_map(mappings)
-        # From the raw mappings, so a term retrieved with a blank target still counts as retrieved.
-        retrieved = {m.get("source_content") for m in mappings if m.get("source_content")}
+    # Version-independent, so none of this is redone per version.
+    segment_maps = [build_glossary_map(mappings) for mappings in per_segment_mappings]
+    # From the raw mappings, so a term retrieved with a blank target still counts as retrieved.
+    retrieved_per_segment = [
+        {m.get("source_content") for m in mappings if m.get("source_content")}
+        for mappings in per_segment_mappings
+    ]
+    in_reference = [variants_in(ref_text) for ref_text in ref_texts]
+    ref_licensed = [
+        {normalize_text(variant) for variants in reference.values() for variant in variants}
+        for reference in in_reference
+    ]
 
-        found = variants_in(text)
-        in_reference = variants_in(ref_texts[index])
+    reports = []
+    for texts in versions:
+        report = ViolationReport(segments=len(texts))
 
-        # Any wording the reference used, plus any a term retrieved here sanctions.
-        licensed = {
-            normalize_text(variant)
-            for source, variants in found.items()
-            if source in segment_map
-            for variant in variants
-        } | {
-            normalize_text(variant)
-            for variants in in_reference.values()
-            for variant in variants
-        }
+        for index, text in enumerate(texts):
+            segment_map = segment_maps[index]
+            reference = in_reference[index]
+            found = variants_in(text)
 
-        for source in segment_map:
-            # The reference declined the term here, so there is nothing to hold this version to.
-            if not in_reference[source]:
-                continue
-            used = found[source]
-            if not used:
-                report.items.append(Violation(source, MISS, segment_index=index))
-                continue
-            # The reference settles the wording: a majority vote would let the version grade itself.
-            intended = {normalize_text(variant) for variant in in_reference[source]}
-            for variant in used:
-                if normalize_text(variant) not in intended:
-                    report.items.append(
-                        Violation(source, INCONSISTENCY, segment_index=index, detail=variant))
+            # Any wording the reference used, plus any a term retrieved here sanctions.
+            licensed = ref_licensed[index] | {
+                normalize_text(variant)
+                for source, variants in found.items()
+                if source in segment_map
+                for variant in variants
+            }
 
-        for source, used in found.items():
-            if source in retrieved:
-                continue
-            for variant in used:
-                if normalize_text(variant) not in licensed:
-                    report.items.append(
-                        Violation(source, OVER_APPLICATION, segment_index=index, detail=variant))
+            for source in segment_map:
+                # The reference declined the term here, so there is nothing to hold it to.
+                if not reference[source]:
+                    continue
+                used = found[source]
+                if not used:
+                    report.items.append(Violation(source, MISS, segment_index=index))
+                    continue
+                # The reference settles the wording, or the version would grade itself.
+                intended = {normalize_text(variant) for variant in reference[source]}
+                for variant in used:
+                    if normalize_text(variant) not in intended:
+                        report.items.append(
+                            Violation(source, INCONSISTENCY, segment_index=index, detail=variant))
 
-    report.items.sort(key=lambda item: (item.segment_index, str(item.source_content), item.kind))
-    report.miss = sum(1 for item in report.items if item.kind == MISS)
-    report.inconsistency = sum(1 for item in report.items if item.kind == INCONSISTENCY)
-    report.over_application = sum(1 for item in report.items if item.kind == OVER_APPLICATION)
-    report.total = len(report.items)
-    report.segments_with_violation = len({item.segment_index for item in report.items})
-    report.violation_rate = rate(report.segments_with_violation, report.segments)
-    return report
+            for source, used in found.items():
+                if source in retrieved_per_segment[index]:
+                    continue
+                for variant in used:
+                    if normalize_text(variant) not in licensed:
+                        report.items.append(
+                            Violation(source, OVER_APPLICATION, segment_index=index, detail=variant))
+
+        report.items.sort(key=lambda item: (item.segment_index, str(item.source_content), item.kind))
+        report.miss = sum(1 for item in report.items if item.kind == MISS)
+        report.inconsistency = sum(1 for item in report.items if item.kind == INCONSISTENCY)
+        report.over_application = sum(1 for item in report.items if item.kind == OVER_APPLICATION)
+        report.total = len(report.items)
+        report.segments_with_violation = len({item.segment_index for item in report.items})
+        report.violation_rate = rate(report.segments_with_violation, report.segments)
+        reports.append(report)
+
+    return reports
+
+
+@dataclass
+class ReferenceCheck:
+    """Whether the human translation rendered the glossary terms the source retrieved."""
+
+    terms_checked: int = 0
+    terms_rendered: int = 0
+    segments_to_review: int = 0
+    items: list[Violation] = field(default_factory=list)
+
+    @property
+    def to_review(self) -> int:
+        return self.terms_checked - self.terms_rendered
+
+
+def check_reference(
+    *,
+    ref_texts: Sequence[str],
+    per_segment_mappings: Sequence[Iterable[Mapping[str, str]]],
+    language_code: str | None,
+    text_lemmas: Mapping[str, str] | None = None,
+    term_lemmas: Mapping[str, str] | None = None,
+) -> ReferenceCheck:
+    """Indicative only: percolation also retrieves terms whose sense does not apply here."""
+    check = ReferenceCheck()
+
+    for index, text in enumerate(ref_texts):
+        lemmas = (text_lemmas or {}).get(text)
+        for source, targets in build_glossary_map(per_segment_mappings[index]).items():
+            expected_targets = sorted(targets)
+            check.terms_checked += 1
+            if _count_renderings(text, expected_targets, language_code, lemmas, term_lemmas):
+                check.terms_rendered += 1
+            else:
+                check.items.append(Violation(
+                    source, MISS, expected_targets=expected_targets, segment_index=index,
+                ))
+
+    check.items.sort(key=lambda item: (item.segment_index, str(item.source_content)))
+    check.segments_to_review = len({item.segment_index for item in check.items})
+    return check
 
 
 def pool_violations(reports: Sequence[ViolationReport]) -> ViolationReport:
     """`items` is left empty: a segment index only means something inside its own dataset."""
-    items = [r for r in reports if r is not None]
     pooled = ViolationReport()
-    for name in ("miss", "inconsistency", "over_application", "total",
-                 "segments", "segments_with_violation"):
-        setattr(pooled, name, sum(getattr(r, name) for r in items))
+    for report in reports:
+        pooled.miss += report.miss
+        pooled.inconsistency += report.inconsistency
+        pooled.over_application += report.over_application
+        pooled.total += report.total
+        pooled.segments += report.segments
+        pooled.segments_with_violation += report.segments_with_violation
     pooled.violation_rate = rate(pooled.segments_with_violation, pooled.segments)
     return pooled

@@ -6,12 +6,14 @@ import pytest
 from sourcecode.text_processing import Dataset, normalize_language
 from sourcecode.report import by_stratum, pct, stratum_of
 from sourcecode.glossary import GlossaryMatches
-from sourcecode.glossary_benchmark import Benchmark
+from functools import partial
+
+from sourcecode.glossary_benchmark import run_benchmark
 from sourcecode.glossary_report import (
-    glossary_scorecard,
+    scorecard,
     render_strata,
-    render_term_adherence,
-    render_term_adherence_console,
+    render_terms,
+    render_terms_console,
     stratum_rows,
     term_rows,
 )
@@ -28,7 +30,9 @@ from sourcecode.glossary_score import (
     find_violations,
     pool,
     pool_violations,
-    score_translation,
+    ReferenceCheck,
+    check_reference,
+    score_glossary,
 )
 from sourcecode.postmt import RunResult
 
@@ -64,7 +68,7 @@ def test_glossary_map_groups_targets_by_source():
 
 
 def test_any_permissive_variant_is_adherent():
-    score = score_translation(
+    score = score_glossary(
         mappings=MAPPINGS, text="le freinage du moteur", language_code="fr-fr",
         ref_text="le freinage du moteur",
     )
@@ -75,7 +79,7 @@ def test_any_permissive_variant_is_adherent():
 
 
 def test_missing_strict_term_is_recorded():
-    score = score_translation(
+    score = score_glossary(
         mappings=MAPPINGS, text="le frein du bloc", language_code="fr-fr",
         ref_text=REFERENCE,
     )
@@ -95,7 +99,7 @@ def test_missing_strict_term_is_recorded():
 
 def test_expected_instances_count_per_term_not_per_segment():
     # Two terms in one reference must contribute 2 instances, or the metric tracks segment length.
-    score = score_translation(
+    score = score_glossary(
         mappings=MAPPINGS, text="rien ici", language_code="fr-fr", ref_text=REFERENCE,
     )
     assert (score.expected, score.adherent) == (2, 0)
@@ -103,7 +107,7 @@ def test_expected_instances_count_per_term_not_per_segment():
 
 
 def test_segments_without_glossary_terms_contribute_nothing():
-    score = score_translation(
+    score = score_glossary(
         mappings=[], text="whatever", language_code="fr-fr", ref_text="peu importe",
     )
     assert score.expected == 0
@@ -112,20 +116,20 @@ def test_segments_without_glossary_terms_contribute_nothing():
     assert agg.expected == 0
     # None, never 0 — no evidence is not zero adherence, and a 0 would drag rollups down.
     assert agg.adherence_rate is None
-    assert agg.segments_with_glossary == 0
+    assert agg.segments_scored == 0
 
 
 def test_lemma_matching_is_used_when_lemmas_are_supplied():
     mappings = [{"source_content": "engine", "target_content": "moteur electrique"}]
 
-    without = score_translation(
+    without = score_glossary(
         mappings=mappings, text="les moteurs electriques sont bons", language_code="fr-fr",
         ref_text="le moteur electrique est bon",
     )
     assert without.expected == 1
     assert without.adherent == 0
 
-    with_lemmas = score_translation(
+    with_lemmas = score_glossary(
         mappings=mappings,
         text="les moteurs electriques sont bons",
         language_code="fr-fr",
@@ -138,7 +142,7 @@ def test_lemma_matching_is_used_when_lemmas_are_supplied():
 
 def test_term_reference_never_uses_is_not_scored():
     """Retrieval proposes, the reference disposes: no denominator, so it is dropped."""
-    score = score_translation(
+    score = score_glossary(
         mappings=ENGINE, text="Le bloc et le groupe.", language_code="fr-fr",
         ref_text="Le bloc entraîne le support.",
     )
@@ -148,7 +152,7 @@ def test_term_reference_never_uses_is_not_scored():
 
 
 def test_partial_rendering_is_violation():
-    score = score_translation(
+    score = score_glossary(
         mappings=ENGINE, text="Le moteur, le bloc et le groupe.", language_code="fr-fr",
         ref_text=THRICE,
     )
@@ -161,13 +165,13 @@ def test_partial_rendering_is_violation():
 
 
 def test_fully_consistent_use_scores_clean():
-    score = score_translation(
+    score = score_glossary(
         mappings=ENGINE, text="Le moteur, le support moteur et le capot moteur.",
         language_code="fr-fr", ref_text=THRICE,
     )
     assert (score.expected, score.adherent) == (3, 3)
     assert score.violations == []
-    assert score.terms.used_everywhere == 1
+    assert score.terms.matched_ref == 1
 
     # A fully adherent term raises no violation, so only this record carries its denominator.
     assert len(score.term_scores) == 1
@@ -176,7 +180,7 @@ def test_fully_consistent_use_scores_clean():
 
 
 def test_absent_term_misses_every_occurrence():
-    score = score_translation(
+    score = score_glossary(
         mappings=ENGINE, text="Rien ici.", language_code="fr-fr", ref_text=THRICE,
     )
     # Not partial: nothing was rendered, so every occurrence the human made is missed.
@@ -188,7 +192,7 @@ def test_absent_term_misses_every_occurrence():
 
 def test_inflected_reference_still_sets_denominator():
     """The reference uses the same lemma fallback, so an inflected term is not silently dropped."""
-    score = score_translation(
+    score = score_glossary(
         mappings=[{"source_content": "cable", "target_content": "câble"}],
         text="le câble", language_code="fr-fr",
         ref_text="Branchez les câbles.",        # "câble" never appears verbatim
@@ -204,7 +208,7 @@ def test_permissive_variants_sum_toward_denominator():
         {"source_content": "battery", "target_content": "batterie"},
         {"source_content": "battery", "target_content": "accumulateur"},
     ]
-    score = score_translation(
+    score = score_glossary(
         mappings=mappings, text="la batterie et l'accumulateur", language_code="fr-fr",
         ref_text="la batterie et la batterie",
     )
@@ -213,7 +217,7 @@ def test_permissive_variants_sum_toward_denominator():
 
 
 def test_over_use_is_recorded_but_never_moves_rate():
-    score = score_translation(
+    score = score_glossary(
         mappings=ENGINE, text="moteur moteur moteur moteur moteur", language_code="fr-fr",
         ref_text=THRICE,
     )
@@ -226,7 +230,7 @@ def test_over_use_is_recorded_but_never_moves_rate():
 
 def test_avoided_term_is_over_use():
     """The entry usually does not fit that context: recorded, never scored either way."""
-    score = score_translation(
+    score = score_glossary(
         mappings=ENGINE, text="Le moteur est là.", language_code="fr-fr",
         ref_text="Le bloc est là.",
     )
@@ -241,13 +245,13 @@ def test_four_buckets_are_exhaustive():
         {"source_content": "engine", "target_content": "moteur"},
         {"source_content": "brake", "target_content": "frein"},
     ]
-    score = score_translation(
+    score = score_glossary(
         mappings=mappings, text="Le moteur et le frein.", language_code="fr-fr",
         ref_text="Le moteur, le moteur et le frein.",
     )
     assert (score.expected, score.adherent) == (3, 2)      # engine ×2 + brake ×1
     assert score.terms.distinct_terms == 2                 # engine used partly, brake everywhere
-    assert (score.terms.used_partly, score.terms.used_everywhere) == (1, 1)
+    assert (score.terms.used_partly, score.terms.matched_ref) == (1, 1)
 
 
 def test_presence_is_recoverable_from_violation_detail():
@@ -256,7 +260,7 @@ def test_presence_is_recoverable_from_violation_detail():
                  "Le moteur, le bloc et le groupe.",
                  "Le moteur, le support moteur et le capot moteur.",
                  "moteur moteur moteur moteur moteur"):
-        score = score_translation(
+        score = score_glossary(
             mappings=ENGINE, text=text, language_code="fr-fr", ref_text=THRICE,
         )
         never = sum(1 for v in score.violations
@@ -267,7 +271,7 @@ def test_presence_is_recoverable_from_violation_detail():
 @pytest.mark.parametrize("text", ["", "      "])
 def test_miss_with_no_translation_at_all_is_violation(text):
     """An empty version is not excused: every instance the reference rendered is still owed."""
-    score = score_translation(
+    score = score_glossary(
         mappings=MAPPINGS, text=text, language_code="fr-fr", ref_text=REFERENCE,
     )
     assert (score.expected, score.adherent) == (2, 0)
@@ -278,14 +282,14 @@ def test_miss_with_no_translation_at_all_is_violation(text):
 
 
 def test_violations_account_for_whole_shortfall():
-    missing = score_translation(
+    missing = score_glossary(
         mappings=MAPPINGS, text="le frein du bloc", language_code="fr-fr",
         ref_text=REFERENCE,
     )
-    empty = score_translation(
+    empty = score_glossary(
         mappings=MAPPINGS, text="", language_code="fr-fr", ref_text=REFERENCE,
     )
-    clean = score_translation(
+    clean = score_glossary(
         mappings=MAPPINGS, text="le frein du moteur", language_code="fr-fr",
         ref_text=REFERENCE,
     )
@@ -301,11 +305,11 @@ def test_violations_account_for_whole_shortfall():
 
 
 def test_aggregate_computes_both_rates():
-    clean = score_translation(                                                                # 2/2
+    clean = score_glossary(                                                                # 2/2
         mappings=MAPPINGS, text="le frein du moteur", language_code="fr-fr",
         ref_text=REFERENCE,
     )
-    partial = score_translation(                                                              # 1/2
+    partial = score_glossary(                                                              # 1/2
         mappings=MAPPINGS, text="le frein du bloc", language_code="fr-fr",
         ref_text=REFERENCE,
     )
@@ -316,8 +320,8 @@ def test_aggregate_computes_both_rates():
     assert agg.adherence_rate == 0.75
 
     # Segment level: only one of the two segments is fully clean.
-    assert agg.segments_with_glossary == 2
-    assert agg.segments_fully_adherent == 1
+    assert agg.segments_scored == 2
+    assert agg.segments_clean == 1
     assert agg.segment_adherence_rate == 0.5
 
     # The strict slice is the one failing here.
@@ -326,27 +330,27 @@ def test_aggregate_computes_both_rates():
 
 
 def test_aggregate_ignores_empty_scores():
-    scored = score_translation(
+    scored = score_glossary(
         mappings=MAPPINGS, text="le frein du moteur", language_code="fr-fr",
         ref_text=REFERENCE,
     )
-    empty = score_translation(
+    empty = score_glossary(
         mappings=[], text="nothing", language_code="fr-fr", ref_text="rien",
     )
 
     agg = aggregate([scored, empty, empty])
 
     # Three segments in, but only one had terms to judge.
-    assert agg.segments_with_glossary == 1
+    assert agg.segments_scored == 1
     assert agg.segment_adherence_rate == 1.0
 
 
 def test_aggregate_adds_buckets_across_segments():
-    consistent = score_translation(
+    consistent = score_glossary(
         mappings=ENGINE, text="Le moteur, le support moteur et le capot moteur.",
         language_code="fr-fr", ref_text=THRICE,
     )
-    inconsistent = score_translation(
+    inconsistent = score_glossary(
         mappings=ENGINE, text="Le moteur, le bloc et le groupe.", language_code="fr-fr",
         ref_text=THRICE,
     )
@@ -355,12 +359,12 @@ def test_aggregate_adds_buckets_across_segments():
     assert (totals.expected, totals.adherent) == (6, 4)
     assert totals.adherence_rate == pytest.approx(4 / 6)
     assert totals.terms.distinct_terms == 2
-    assert (totals.terms.used_everywhere, totals.terms.used_partly) == (1, 1)
+    assert (totals.terms.matched_ref, totals.terms.used_partly) == (1, 1)
 
 
 def test_aggregate_keeps_unexpected_over_use():
     """No denominator, so it cannot enter the rate - but dropping it would hide the review item."""
-    avoided = score_translation(
+    avoided = score_glossary(
         mappings=ENGINE, text="Le moteur est là.", language_code="fr-fr",
         ref_text="Le bloc est là.",
     )
@@ -368,7 +372,7 @@ def test_aggregate_keeps_unexpected_over_use():
 
     assert totals.expected == 0
     assert totals.adherence_rate is None
-    assert totals.segments_with_glossary == 0
+    assert totals.segments_scored == 0
     assert totals.terms.over_used == 1
 
 
@@ -378,7 +382,7 @@ def test_term_scores_sum_to_segment_totals():
         {"source_content": "engine", "target_content": "moteur"},
         {"source_content": "brake", "target_content": "frein"},
     ]
-    score = score_translation(
+    score = score_glossary(
         mappings=mappings, text="Le moteur et le frein.", language_code="fr-fr",
         ref_text="Le moteur, le moteur et le frein.",
     )
@@ -389,17 +393,17 @@ def test_term_scores_sum_to_segment_totals():
 
 def test_pooling_adds_buckets():
     """Counts pool by addition, so the breakdown is split-invariant for free."""
-    small = aggregate([score_translation(
+    small = aggregate([score_glossary(
         mappings=ENGINE, text="Rien ici.", language_code="fr-fr", ref_text="Le moteur.",
     )])
-    large = aggregate([score_translation(
+    large = aggregate([score_glossary(
         mappings=ENGINE, text=f"Le moteur {i}.", language_code="fr-fr",
         ref_text="Le moteur.",
     ) for i in range(9)])
 
     pooled = pool([small, large])
     assert pooled.terms.distinct_terms == 10
-    assert (pooled.terms.never_used, pooled.terms.used_everywhere) == (1, 9)
+    assert (pooled.terms.never_used, pooled.terms.matched_ref) == (1, 9)
 
 
 def pairs(*mapping):
@@ -412,10 +416,10 @@ ENGINE_PAIRS = pairs(("engine", "moteur"))
 
 def run(texts, references, per_segment, corpus=None, **kwargs):
     return find_violations(
-        texts=texts, ref_texts=references, per_segment_mappings=per_segment,
+        versions=[texts], ref_texts=references, per_segment_mappings=per_segment,
         corpus_mappings=corpus if corpus is not None else [m for g in per_segment for m in g],
         language_code="fr-fr", **kwargs,
-    )
+    )[0]
 
 
 def kinds(report):
@@ -591,7 +595,7 @@ def _run(name, segments):
     benchmark = _benchmark(
         FakePostMt(glossary=REPORT_GLOSSARY), glossary=REPORT_GLOSSARY, lemma_matching=True
     )
-    return benchmark.run(_dataset(name, segments))
+    return benchmark(_dataset(name, segments))
 
 
 @pytest.fixture
@@ -601,7 +605,7 @@ def result():
 
 def test_scorecard_names_stratum(result):
     """What was measured and where; the dataset name and steps sit on the tables below."""
-    line = glossary_scorecard(result).as_console().splitlines()[0]
+    line = scorecard(result).as_console().splitlines()[0]
 
     assert line == "glossary  -  en-gb → fr-fr  ·  Automotive"
     assert result.dataset not in line and "steps" not in line
@@ -610,10 +614,10 @@ def test_scorecard_names_stratum(result):
 def test_glossary_blind_run_says_so(result):
     """Blindness the preflight cannot see: without it the scorecard reads as a clean run."""
     # The healthy run says nothing of the kind, so the warning cannot be background noise.
-    assert "post-mt was shown no glossary" not in glossary_scorecard(result).as_markdown()
+    assert "post-mt was shown no glossary" not in scorecard(result).as_markdown()
 
     result.totals["segments_glossary_never_shown"] = 2
-    for rendered in (glossary_scorecard(result).as_markdown(), glossary_scorecard(result).as_console()):
+    for rendered in (scorecard(result).as_markdown(), scorecard(result).as_console()):
         assert "post-mt was shown no glossary on 2/2" in rendered
         assert "cat_project_id" in rendered
 
@@ -621,15 +625,34 @@ def test_glossary_blind_run_says_so(result):
 def test_summary_shows_na_not_zero(result):
     result.mt.adherence_rate = None
     result.ape.adherence_rate = None
-    assert "n/a" in glossary_scorecard(result).as_markdown()
+    assert "n/a" in scorecard(result).as_markdown()
+
+
+def test_scorecard_says_when_fewer_segments_were_scored_than_counted():
+    """`with glossary terms` and the rate's denominator are different numbers; say when they part."""
+    segments = [
+        # REF renders the glossary target, so it sets an expectation here.
+        {"source_segment_id": "s1", "source_content": "The engine is electric.",
+         "target_content": "Le bloc est électrique.",
+         "reference_content": "Le moteur est électrique."},
+        # A term was resolved, but the human declined it, so nothing holds this segment to it.
+        {"source_segment_id": "s2", "source_content": "The engine is electric.",
+         "target_content": "Le bloc est électrique.",
+         "reference_content": "Le groupe propulseur est électrique."},
+    ]
+    result = _benchmark()(_dataset("g", segments))
+
+    assert result.totals["segments_with_glossary"] == 2
+    assert result.mt.segments_scored == 1
+    assert "Scored against REF 1 of 2 segments" in scorecard(result).as_console()
 
 
 def test_reference_metrics_stay_out_of_reports(result):
     """REF is fully adherent by construction, so scoring it says nothing worth a column."""
-    scorecard = glossary_scorecard(result)
+    card = scorecard(result)
 
     assert result.ref.adherence_rate == 1.0
-    for destination in (scorecard.as_console(), scorecard.as_markdown()):
+    for destination in (card.as_console(), card.as_markdown()):
         assert "REF 100.00%" not in destination
         assert "(REF" not in destination
 
@@ -656,10 +679,11 @@ def test_term_rows_are_worst_first(result):
 
 
 def test_per_term_table_shows_counts_and_violations(result):
-    table = render_term_adherence(result)
+    table = render_terms(result)
     header = next(line for line in table.splitlines() if "Glossary entry" in line)
     assert [column.strip() for column in header.strip("|").split("|")] == [
-        "Glossary entry", "MT", "APE", "REF", "Violations", "Adherence", "Bucket", "Kind",
+        "Glossary entry", "MT", "APE", "REF", "Violations MT", "Violations APE",
+        "Adherence", "Bucket", "Kind",
     ]
     # No legend under it: the columns are named in the header and nowhere else.
     assert "renderings in the human reference" not in table
@@ -667,9 +691,20 @@ def test_per_term_table_shows_counts_and_violations(result):
     assert table.rstrip().splitlines()[-1].startswith(f"| cable → {row['expected_targets']}")
 
 
+def test_per_term_table_shows_what_ape_repaired():
+    """Both violation counts, so a term APE fixed is visible beside one it left broken."""
+    scored = _benchmark(lemma_matching=True)(_dataset("wiring", SEGMENTS))
+    rows = {row["source_term"]: row for row in term_rows(scored)}
+
+    # APE fixes the engine segment and leaves the brake pad as the MT wrote it.
+    assert (rows["engine"]["mt_violations"], rows["engine"]["ape_violations"]) == (1, 0)
+    assert (rows["brake pad"]["mt_violations"], rows["brake pad"]["ape_violations"]) == (1, 1)
+    assert "| 1 | 0 |" in render_terms(scored)
+
+
 def test_console_matches_file(result):
     """The terminal narrows the table; it must not restate it. Both come from `term_rows`."""
-    console = render_term_adherence_console(result)
+    console = render_terms_console(result)
 
     assert "entry" in console.splitlines()[2] and "REF" in console.splitlines()[2]
     for row in term_rows(result):
@@ -688,7 +723,7 @@ def test_run_that_matched_no_terms_says_so_on_console(result):
     """Zeroes with no table underneath read as a clean run rather than one that measured nothing."""
     result.segments = []
 
-    assert "No glossary terms matched." in render_term_adherence_console(result)
+    assert "No glossary terms matched." in render_terms_console(result)
 
 
 @pytest.mark.parametrize("source, target, reference, bucket", [
@@ -709,7 +744,7 @@ def test_per_term_table_names_each_bucket(source, target, reference, bucket):
 
     row, = term_rows(result)
     assert row["ape_bucket"] == bucket
-    assert f"| {bucket} |" in render_term_adherence(result)
+    assert f"| {bucket} |" in render_terms(result)
 
 
 def test_over_use_is_flagged_for_review():
@@ -729,7 +764,7 @@ def test_over_use_is_flagged_for_review():
     assert row["ape_violations"] == 0
     assert row["ape_adherence_rate"] == 1.0
     assert row["ape_bucket"] == "over-used"
-    assert "flagged for review, never counted as violations" in glossary_scorecard(result).as_markdown()
+    assert "flagged for review, never counted as violations" in scorecard(result).as_markdown()
 
 
 def test_per_term_adherence_is_only_rate(result):
@@ -758,7 +793,7 @@ def test_three_levels_reconcile(result):
 def _aggregate(expected, adherent, *, segments=1, fully_adherent=1, terms=None):
     """An Aggregate carrying only the counts pooling cares about; pass a TermBreakdown to vary."""
     breakdown = terms or TermBreakdown(
-        used_everywhere=adherent, never_used=expected - adherent
+        matched_ref=adherent, never_used=expected - adherent
     )
     return Aggregate(
         expected=expected,
@@ -768,14 +803,14 @@ def _aggregate(expected, adherent, *, segments=1, fully_adherent=1, terms=None):
         strict=Tally(expected, adherent),
         permissive=Tally(),
         terms=breakdown,
-        segments_with_glossary=segments,
-        segments_fully_adherent=fully_adherent,
+        segments_scored=segments,
+        segments_clean=fully_adherent,
         segment_adherence_rate=None,
     )
 
 
 class _Result:
-    """The few BenchmarkResult fields the stratum code reads."""
+    """The few Result fields the stratum code reads."""
 
     def __init__(self, name, source, target, domain, mt, ape=None, segments=1, violations=None):
         self.dataset = name
@@ -810,8 +845,8 @@ def test_pooling_keeps_violations_and_segment_counts():
                    _aggregate(6, 6, segments=3, fully_adherent=3)])
 
     assert pooled.violations == 1
-    assert pooled.segments_with_glossary == 5
-    assert pooled.segments_fully_adherent == 4
+    assert pooled.segments_scored == 5
+    assert pooled.segments_clean == 4
 
 
 def test_empty_stratum_reports_no_rate_rather_than_zero():
@@ -986,7 +1021,8 @@ def _dataset(name, segments):
 
 
 def _benchmark(postmt=None, *, batch_size=2, glossary=GLOSSARY, lemma_matching=False):
-    return Benchmark(
+    return partial(
+        run_benchmark,
         postmt=postmt if postmt is not None else FakePostMt(fixes=FIXES, glossary=GLOSSARY),
         stanza=FakeStanza(),
         glossary=FakeGlossary(glossary),
@@ -1005,7 +1041,7 @@ def benchmark():
 
 
 def test_end_to_end_scores_mt_baseline_against_post_edited(benchmark, dataset):
-    result = benchmark.run(dataset)
+    result = benchmark(dataset)
 
     assert result.totals["segments"] == 3
     assert result.totals["segments_with_glossary"] == 2
@@ -1019,12 +1055,12 @@ def test_end_to_end_scores_mt_baseline_against_post_edited(benchmark, dataset):
     assert result.ape.adherent == 1
     assert result.ape.adherence_rate == 0.5
 
-    assert result.delta.adherence_rate == 0.5
+    assert result.delta.ape_adherence_rate == 0.5
     assert result.delta.terms_fixed_by_ape == 1
 
 
 def test_segment_without_glossary_does_not_dilute_rate(benchmark, dataset):
-    result = benchmark.run(dataset)
+    result = benchmark(dataset)
     clean = next(s for s in result.segments if s.source_segment_id == "s3")
     assert clean.mt.expected == 0
     assert clean.has_glossary_resolved is False
@@ -1032,14 +1068,14 @@ def test_segment_without_glossary_does_not_dilute_rate(benchmark, dataset):
 
 def test_dry_run_never_submits_to_postmt(dataset):
     postmt = FakePostMt(fixes=FIXES, glossary={})
-    _benchmark(postmt).run(dataset, skip_pipeline=True)
+    _benchmark(postmt)(dataset, skip_pipeline=True)
 
     assert postmt.batches_seen == []
 
 
 def test_batching_preserves_order_and_index_alignment(dataset):
     postmt = FakePostMt(fixes=FIXES, glossary=GLOSSARY)
-    result = _benchmark(postmt).run(dataset)
+    result = _benchmark(postmt)(dataset)
 
     # batch_size 2 over 3 segments => two batches; misalignment would misattribute terms.
     assert postmt.batches_seen == [["s1", "s2"], ["s3"]]
@@ -1072,19 +1108,19 @@ def test_repairs_and_regressions_are_counted_separately(dataset):
             "The brake pad is worn.": "La garniture est usée.",        # regressed away from "frein"
         },
     )
-    result = _benchmark(postmt).run(dataset)
+    result = _benchmark(postmt)(dataset)
 
     assert result.mt.adherent == 1
     assert result.ape.adherent == 1
-    assert result.delta.adherence_rate == 0          # net change: nothing
+    assert result.delta.ape_adherence_rate == 0          # net change: nothing
 
     # ...but one term was repaired and a different one was broken.
     assert result.delta.terms_fixed_by_ape == 1
-    assert result.delta.terms_regressed_by_ape == 1
+    assert result.delta.terms_broken_by_ape == 1
 
 
 def test_postmts_has_glossary_is_retained(benchmark, dataset):
-    result = benchmark.run(dataset)
+    result = benchmark(dataset)
     for segment in result.segments:
         assert segment.has_glossary_reported == segment.has_glossary_resolved
 
@@ -1095,7 +1131,7 @@ def test_short_pipeline_response_realigns(dataset):
             full = super().run(parameters=parameters, segments=segments, steps=steps)
             return RunResult(task_id=full.task_id, segments=full.segments[:1], error=None)
 
-    result = _benchmark(TruncatingPostMt(fixes=FIXES, glossary=GLOSSARY)).run(dataset)
+    result = _benchmark(TruncatingPostMt(fixes=FIXES, glossary=GLOSSARY))(dataset)
 
     # Dropped segments fall back to their inputs rather than shifting every later index.
     assert [s.source_segment_id for s in result.segments] == ["s1", "s2", "s3"]
@@ -1110,7 +1146,7 @@ def reference_dataset():
 def test_reference_is_never_sent_to_postmt(reference_dataset):
     """The corrected translation is the answer key — it must not reach the pipeline."""
     postmt = FakePostMt(fixes=FIXES, glossary=GLOSSARY)
-    _benchmark(postmt).run(reference_dataset)
+    _benchmark(postmt)(reference_dataset)
 
     assert postmt.submitted, "nothing was submitted"
     for submitted in postmt.submitted:
@@ -1123,7 +1159,7 @@ def test_reference_is_never_sent_to_postmt(reference_dataset):
 
 
 def test_reference_sets_what_each_version_owed(reference_dataset):
-    result = _benchmark().run(reference_dataset)
+    result = _benchmark()(reference_dataset)
 
     # The human used one target term per segment, so two instances are owed.
     assert result.mt.expected == 2
@@ -1133,7 +1169,7 @@ def test_reference_sets_what_each_version_owed(reference_dataset):
     assert result.mt.adherent == 0
     assert result.ape.adherent == 1
     assert result.ape.adherence_rate == 0.5
-    assert result.delta.adherence_rate == pytest.approx(0.5)
+    assert result.delta.ape_adherence_rate == pytest.approx(0.5)
 
 
 def test_avoided_term_is_not_held_against_ape():
@@ -1143,7 +1179,7 @@ def test_avoided_term_is_not_held_against_ape():
          "target_content": "Le bloc est électrique.",
          "reference_content": "Le groupe est électrique."},
     ])
-    result = _benchmark().run(dataset)
+    result = _benchmark()(dataset)
 
     assert result.mt.expected == 0
     # No denominator anywhere, so there is no rate to report rather than a 0% or a 100%.
@@ -1158,7 +1194,7 @@ def test_skip_pipeline_never_contacts_postmt(dataset):
         def run(self, **kwargs):
             raise AssertionError("post-mt must not be called when skip_pipeline=True")
 
-    result = _benchmark(ExplodingPostMt()).run(dataset, skip_pipeline=True)
+    result = _benchmark(ExplodingPostMt())(dataset, skip_pipeline=True)
 
     assert result.dataset.endswith("(dry-run)")
 
@@ -1166,8 +1202,8 @@ def test_skip_pipeline_never_contacts_postmt(dataset):
 def test_skip_pipeline_scores_same_way_as_full_run(dataset):
     """A dry run and a full run must not disagree about a number."""
     # APE returns the MT unchanged, which is what a dry run assumes.
-    full = _benchmark(FakePostMt(fixes={}, glossary=GLOSSARY)).run(dataset)
-    dry = _benchmark().run(dataset, skip_pipeline=True)
+    full = _benchmark(FakePostMt(fixes={}, glossary=GLOSSARY))(dataset)
+    dry = _benchmark()(dataset, skip_pipeline=True)
 
     assert dry.mt.expected == full.mt.expected
     assert dry.mt.adherent == full.mt.adherent
@@ -1179,7 +1215,7 @@ def test_skip_pipeline_scores_same_way_as_full_run(dataset):
 
 def test_skip_pipeline_still_measures_against_reference(dataset):
     """The denominator comes from the dataset, not from post-mt, so a dry run has the full one."""
-    dry = _benchmark().run(dataset, skip_pipeline=True)
+    dry = _benchmark()(dataset, skip_pipeline=True)
 
     assert dry.mt.expected == 2
     assert [s.ref_text for s in dry.segments] == [s["reference_content"] for s in SEGMENTS]
@@ -1188,14 +1224,14 @@ def test_skip_pipeline_still_measures_against_reference(dataset):
 def test_warns_when_postmt_saw_no_glossary(dataset, caplog):
     """A misconfigured run reads as "APE does not help terminology" unless it is called out."""
     # Parameters good enough to pass preflight and still retrieve nothing: only the run says so.
-    _benchmark(FakePostMt(fixes=FIXES, glossary={})).run(dataset)
+    _benchmark(FakePostMt(fixes=FIXES, glossary={}))(dataset)
 
     assert "post-mt reported no glossary" in caplog.text
     assert "ecosystem_id" in caplog.text
 
 
 def test_no_warning_when_two_agree(dataset, caplog):
-    _benchmark().run(dataset)
+    _benchmark()(dataset)
     assert "post-mt reported no glossary" not in caplog.text
 
 
@@ -1219,11 +1255,11 @@ class FailingPostMt(FakePostMt):
 
 def test_per_segment_failures_are_surfaced(dataset, caplog):
     """The empty APE text falls back to raw MT, so every metric says "APE changed nothing"."""
-    result = _benchmark(FailingPostMt()).run(dataset)
+    result = _benchmark(FailingPostMt())(dataset)
 
     # On the numbers alone this is indistinguishable from a clean run...
     assert result.totals["segments_changed_by_ape"] == 0
-    assert result.delta.adherence_rate == 0.0
+    assert result.delta.ape_adherence_rate == 0.0
 
     # ...so only the failure count tells them apart.
     assert result.failed_segments == 3
@@ -1232,10 +1268,52 @@ def test_per_segment_failures_are_surfaced(dataset, caplog):
 
 
 def test_healthy_run_records_no_failures(benchmark, dataset):
-    assert benchmark.run(dataset).failed_segments == 0
-    assert benchmark.run(dataset).failure_reason is None
+    assert benchmark(dataset).failed_segments == 0
+    assert benchmark(dataset).failure_reason is None
 
 
 def test_dry_run_never_reports_post_mt_failures(benchmark, dataset):
     """A dry run does not call post-mt at all, so it cannot inherit a stale failure count."""
-    assert benchmark.run(dataset, skip_pipeline=True).failed_segments == 0
+    assert benchmark(dataset, skip_pipeline=True).failed_segments == 0
+
+
+GLOSSARY_PAIR = [
+    {"source_content": "brake pad", "target_content": "plaquette de frein"},
+    {"source_content": "cable", "target_content": "câble"},
+]
+
+
+def test_reference_check_flags_a_term_the_human_never_rendered():
+    """Checked against the termbase, so a human who ignored a term is surfaced."""
+    ref_texts = [
+        "La plaquette de frein et le câble sont neufs.",  # followed the glossary
+        "Le patin de frein est usé.",                     # an unapproved synonym
+    ]
+    check = check_reference(
+        ref_texts=ref_texts,
+        per_segment_mappings=[GLOSSARY_PAIR, GLOSSARY_PAIR],
+        language_code="fr-fr",
+    )
+
+    assert (check.terms_checked, check.terms_rendered, check.to_review) == (4, 2, 2)
+    assert check.segments_to_review == 1
+    assert {item.source_content for item in check.items} == {"brake pad", "cable"}
+    assert all(item.kind == MISS and item.segment_index == 1 for item in check.items)
+
+
+def test_reference_check_passes_when_the_human_followed_the_glossary():
+    check = check_reference(
+        ref_texts=["La plaquette de frein et le câble sont neufs."],
+        per_segment_mappings=[GLOSSARY_PAIR],
+        language_code="fr-fr",
+    )
+
+    assert (check.terms_checked, check.terms_rendered, check.to_review) == (2, 2, 0)
+    assert (check.items, check.segments_to_review) == ([], 0)
+
+
+def test_reference_check_reaches_both_destinations(result):
+    card = scorecard(result)
+
+    for destination in (card.as_console(), card.as_markdown()):
+        assert "Reference check · REF rendered" in destination
