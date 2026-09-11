@@ -254,8 +254,9 @@ def test_missing_languages_are_rejected(tmp_path):
         load(path, component="glossary")
 
 
-def test_parse_csv_accepts_short_and_long_column_names():
-    rows = parse_csv("source,target\nhello,bonjour\n")
+def test_parse_csv_numbers_rows_that_carry_no_id():
+    rows = parse_csv("source_content,target_content\nhello,bonjour\n")
+    assert rows[0]["source_segment_id"] == "0"
     assert rows[0]["source_content"] == "hello"
     assert rows[0]["target_content"] == "bonjour"
 
@@ -270,7 +271,8 @@ def test_parse_csv_handles_quoted_fields_with_commas():
 
 
 def test_load_csv_takes_parameters_from_sidecar(tmp_path):
-    path = _write(tmp_path, "d.csv", "source,target,reference\nhello,bonjour,salut\n")
+    path = _write(tmp_path, "d.csv",
+                  "source_content,target_content,reference_content\nhello,bonjour,salut\n")
     _write(tmp_path, "d.params.json", json.dumps({"parameters": PARAMETERS, "glossary_ids": ["tb1"]}))
     dataset = load(path, component="glossary")
     assert len(dataset.segments) == 1
@@ -677,7 +679,7 @@ def test_segments_are_identified_by_index():
         captured["ids"] = [s["id"] for s in json.loads(request.content)["segments"]]
         return httpx.Response(200, json={"segments": [{"terms": []}] * 3})
 
-    pairs = [{"id": str(i), "source": "s", "target": "t"} for i in range(3)]
+    pairs = [{"id": str(i), "source_content": "s", "target": "t"} for i in range(3)]
     _dnt_client(handler).revert(pairs, batch_size=10)
 
     assert captured["ids"] == ["0", "1", "2"]
@@ -691,7 +693,7 @@ def test_batching_splits_call_and_keeps_every_segment():
         calls.append(len(body["segments"]))
         return httpx.Response(200, json={"segments": [{"terms": []}] * len(body["segments"])})
 
-    pairs = [{"id": str(i), "source": "s", "target": "t"} for i in range(7)]
+    pairs = [{"id": str(i), "source_content": "s", "target": "t"} for i in range(7)]
     results = _dnt_client(handler).revert(pairs, batch_size=3)
 
     assert calls == [3, 3, 1]
@@ -726,7 +728,7 @@ def test_only_failed_batch_is_lost():
             return httpx.Response(500)
         return httpx.Response(200, json={"segments": [{"terms": ["A"], "corrected_text": "x"}]})
 
-    pairs = [{"id": str(i), "source": "s", "target": "t"} for i in range(2)]
+    pairs = [{"id": str(i), "source_content": "s", "target": "t"} for i in range(2)]
     results = _dnt_client(handler).revert(pairs, batch_size=1)
 
     assert results[0] is None
@@ -737,7 +739,7 @@ def test_short_response_realigns():
     def handler(request):
         return httpx.Response(200, json={"segments": [{"terms": ["A"], "corrected_text": "x"}]})
 
-    pairs = [{"id": str(i), "source": "s", "target": "t"} for i in range(3)]
+    pairs = [{"id": str(i), "source_content": "s", "target": "t"} for i in range(3)]
     results = _dnt_client(handler).revert(pairs, batch_size=10)
 
     assert len(results) == 3
@@ -905,7 +907,7 @@ def test_documented_revert_response():
         return httpx.Response(200, json={
             "results": [{
                 "id": "0",
-                "source": "AcoladPro is here.",
+                "source_content": "AcoladPro is here.",
                 "target": "Le Pro Acolad est ici.",
                 "result": "AcoladPro est ici.",
                 "terms": ["AcoladPro"],

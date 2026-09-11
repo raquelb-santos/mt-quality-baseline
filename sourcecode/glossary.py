@@ -135,7 +135,7 @@ class GlossaryClient:
                         mappings.append({"source_content": source["term_text"], "target_content": target_text})
             per_text_mappings.append(mappings)
 
-        # Keyed on the pair: two source terms sharing a target are two mappings, not one.
+        # Keyed on the pair, so a target two source terms reach in different texts is kept once each.
         flat: dict[tuple[str, str], dict[str, str]] = {}
         for mappings in per_text_mappings:
             for mapping in mappings:

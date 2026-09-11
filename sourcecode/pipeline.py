@@ -2,10 +2,11 @@
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from .text_processing import Dataset
-from .postmt import Usage, segment_error
+from .text_processing import Dataset, load
+from .postmt import Usage, preflight_submission, raise_for_preflight, segment_error
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,20 @@ class PipelineOutcome:
     failures: list[str] = field(default_factory=list)
 
 
+def load_dataset(path: Path, *, component: str, dry_run: bool) -> Dataset:
+    """Only the submission preflight applies: these components read what a segment carries."""
+    data = load(path, component=component)
+
+    if not dry_run:
+        raise_for_preflight(
+            preflight_submission(data.parameters),
+            "Preflight failed: post-mt would reject every segment, so there would be no "
+            "APE column to score. Fix the parameters above.",
+        )
+
+    return data
+
+
 def run_pipeline(postmt: Any, dataset: Dataset, *, batch_size: int) -> PipelineOutcome:
     segments = dataset.segments
     batches = [segments[i : i + batch_size] for i in range(0, len(segments), batch_size)]
@@ -27,14 +42,13 @@ def run_pipeline(postmt: Any, dataset: Dataset, *, batch_size: int) -> PipelineO
     usage = Usage()
 
     for number, batch in enumerate(batches, start=1):
-
         def on_progress(body: dict[str, Any], _n: int = number) -> None:
             percent = (body.get("progress") or {}).get("percent", 0)
             logger.info("[PIPELINE] batch %d/%d - %s%%", _n, len(batches), percent)
 
         result = postmt.run(
             parameters=dataset.parameters,
-            # REF is the answer key: stripped so it can never reach post-mt.
+            # REF is the answer key, dropped so it can never reach post-mt.
             segments=[
                 {k: v for k, v in segment.items() if k != "reference_content"}
                 for segment in batch
@@ -52,7 +66,7 @@ def run_pipeline(postmt: Any, dataset: Dataset, *, batch_size: int) -> PipelineO
                 number, len(result.segments), len(batch),
             )
 
-        usage = usage + result.usage
+        usage += result.usage
 
         for i, original in enumerate(batch):
             returned = result.segments[i] if i < len(result.segments) else None
@@ -61,7 +75,7 @@ def run_pipeline(postmt: Any, dataset: Dataset, *, batch_size: int) -> PipelineO
     failures = [error for s in processed if (error := segment_error(s))]
     if failures:
         logger.error(
-            "[PIPELINE] %d/%d segments failed inside post-mt - first: %s",
+            "[PIPELINE] %d/%d segments failed inside post-mt: %s",
             len(failures), len(processed), failures[0],
         )
 
@@ -72,7 +86,7 @@ def stub_pipeline(dataset: Dataset) -> PipelineOutcome:
     """The dry-run stand-in: the APE column mirrors MT, so every delta is zero."""
     return PipelineOutcome(
         segments=[
-            {**segment, "ape_results": {"text": segment.get("target_content", "")}}
+            {**segment, "ape_results": {"text": segment["target_content"]}}
             for segment in dataset.segments
         ]
     )

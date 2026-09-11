@@ -8,12 +8,8 @@ from dotenv import load_dotenv
 
 
 def _settings_file() -> str | None:
-    """`ENV_FILE` points a run at a settings file other than `.env` - one per component, say, so a
-    TM run needs no edit to the file a glossary run reads. None leaves dotenv to find `.env` itself.
-
-    A named file that is not there stops the run rather than falling back to `.env`: the fallback
-    would score the run against settings the operator did not ask for, and every typed setting
-    would then fail one at a time as though it were unset."""
+    """`ENV_FILE` points a run at a settings file other than `.env`; a named file that is not
+    there stops the run rather than silently falling back."""
     named = (os.getenv("ENV_FILE") or "").strip()
     if not named:
         return None
@@ -25,17 +21,9 @@ def _settings_file() -> str | None:
 load_dotenv(_settings_file(), override=True)
 
 
-def parse_list(raw: str) -> list[str]:
+def _parse_list(raw: str) -> list[str]:
     parts = raw.strip().strip("[]").split(",")
     return [item for item in (part.strip().strip("\"'") for part in parts) if item]
-
-
-def _required(name: str) -> str:
-    """A typed setting has no fallback: unset stops the run rather than scoring against a guess."""
-    value = os.getenv(name) or ""
-    if not value.strip():
-        raise RuntimeError(f"{name} is not set in .env.")
-    return value.strip()
 
 
 def _env(name: str) -> Any:
@@ -43,16 +31,14 @@ def _env(name: str) -> Any:
 
 
 def _env_list(name: str) -> Any:
-    return field(default_factory=lambda: parse_list(os.getenv(name) or ""))
-
-
+    return field(default_factory=lambda: _parse_list(os.getenv(name) or ""))
 
 
 def _env_bool(name: str) -> Any:
-    return field(default_factory=lambda: _required(name).lower() in {"1", "true", "yes", "on"})
+    return field(default_factory=lambda: (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"})
 
 
-PATH_VARIABLES = {"glossary": "GLOSSARY_PATH", "dnt": "DNT_PATH"}
+PATH_VARIABLES = {"glossary": "GLOSSARY_PATH", "dnt": "DNT_PATH", "tags": "TAGS_PATH"}
 
 
 @dataclass(frozen=True)

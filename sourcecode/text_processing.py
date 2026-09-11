@@ -12,20 +12,12 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-COMPONENTS = ("glossary", "dnt")
-
-# What each component's folder is scanned for
-DATA_TYPES: dict[str, tuple[str, ...]] = {
-    "glossary": (".json", ".csv", ".mxliff", ".xliff", ".xlf"),
-    "dnt": (".json", ".csv", ".mxliff", ".xliff", ".xlf"),
-}
-
 PARAMS_SUFFIX = ".params.json"
 
 
-def find_datasets(configured: str, *, variable: str, component: str) -> list[Path]:
-    """A file, or a folder's direct children, sorted — only the types that component reads."""
-    types = DATA_TYPES[component]
+def find_datasets(configured: str, *, variable: str) -> list[Path]:
+    """A file, or a folder's direct children, sorted."""
+    types = (".json", ".csv", ".mxliff", ".xliff", ".xlf")
     if not configured.strip():
         raise ValueError(
             f"No dataset to score. Set {variable} in .env to a dataset file, or to a folder "
@@ -60,7 +52,7 @@ class Dataset:
 
 
 def _strip_namespace(tag: str) -> str:
-    return tag.split("}", 1)[-1] if "}" in tag else tag
+    return tag.split("}", 1)[-1]
 
 
 def parse_mxliff(xml_string: str) -> list[dict[str, Any]]:
@@ -104,15 +96,12 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
     for index, row in enumerate(csv.DictReader(io.StringIO(text))):
         row = {(key or "").strip(): (value or "") for key, value in row.items()}
         segment = {
-            "source_segment_id": row.get("source_segment_id") or row.get("segment_id") or str(index),
-            "source_content": row.get("source_content") or row.get("source") or "",
-            "target_content": row.get("target_content") or row.get("mt") or row.get("target") or "",
+            "source_segment_id": row.get("source_segment_id") or str(index),
+            "source_content": row.get("source_content") or "",
+            "target_content": row.get("target_content") or "",
         }
 
-        reference = (
-            row.get("reference_content") or row.get("reference") or row.get("corrected_content")
-            or row.get("corrected") or row.get("post_edited") or row.get("human") or ""
-        )
+        reference = row.get("reference_content") or ""
         if reference.strip():
             segment["reference_content"] = reference
 
@@ -165,7 +154,7 @@ def load(path: str | Path, *, component: str) -> Dataset:
     elif suffix in {".mxliff", ".xliff", ".xlf"}:
         body = {"segments": parse_mxliff(raw)}
     else:
-        raise ValueError(f"Unsupported dataset format: {suffix} (expected one of {', '.join(DATA_TYPES[component])})")
+        raise ValueError(f"Unsupported dataset format: {suffix}")
 
     dataset = Dataset(
         name=params.get("name") or body.get("name") or path.stem,
@@ -246,31 +235,28 @@ LANGUAGE_MAPPING: dict[str, str] = {
 LANGUAGE_REVERSE_MAPPING: dict[str, str] = {name.lower(): code for code, name in LANGUAGE_MAPPING.items()}
 
 
-def normalize(lang: str) -> tuple[str, str]:
-    """Any input (code or display name) to (code, name); unknowns pass through."""
-    value = str(lang).lower()
-    if value in LANGUAGE_MAPPING:
-        return value, LANGUAGE_MAPPING[value]
-    return LANGUAGE_REVERSE_MAPPING.get(value, value), lang
-
-
 def normalize_language(parameters: dict[str, Any]) -> dict[str, Any]:
     """Return parameters with clean_*_language_code/_name injected."""
     output = dict(parameters)
     for side in ("source", "target"):
-        if parameters.get(f"{side}_language"):
-            code, name = normalize(parameters[f"{side}_language"])
-            output[f"clean_{side}_language_code"] = code
-            output[f"clean_{side}_language_name"] = name.lower()
+        given = parameters.get(f"{side}_language")
+        if not given:
+            continue
+        value = str(given).lower()
+        code, name = (
+            (value, LANGUAGE_MAPPING[value]) if value in LANGUAGE_MAPPING
+            else (LANGUAGE_REVERSE_MAPPING.get(value, value), given)
+        )
+        output[f"clean_{side}_language_code"] = code
+        output[f"clean_{side}_language_name"] = name.lower()
     return output
 
 
 # Word-boundary matching is meaningless for languages written without inter-word spacing.
-UNSPACED_LANGUAGES = frozenset({"ja", "zh", "ko", "th", "lo", "km", "my"})
-
-
 def is_unspaced_language(language_code: str | None) -> bool:
-    return str(language_code or "").split("-")[0].lower() in UNSPACED_LANGUAGES
+    return str(language_code or "").split("-")[0].lower() in {
+        "ja", "zh", "ko", "th", "lo", "km", "my"
+    }
 
 
 def normalize_text(text: object, *, casefold: bool = True) -> str:

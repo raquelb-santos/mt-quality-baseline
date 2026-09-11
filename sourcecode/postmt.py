@@ -16,6 +16,11 @@ def extract_post_edited(segment: dict[str, Any]) -> str:
     return ape_results.get("text") or segment.get("aped_text") or segment.get("target_content") or ""
 
 
+def segment_id(returned: dict[str, Any], original: dict[str, Any], index: int) -> str:
+    """post-mt echoes the id back, but a realigned segment may arrive without one."""
+    return str(returned.get("source_segment_id") or original.get("source_segment_id") or index)
+
+
 def reported_has_glossary(segment: dict[str, Any]) -> bool | None:
     """post-mt nests this inside ``aqe_results``; reading the top level always yields None."""
     nested = (segment.get("aqe_results") or {}).get("has_glossary")
@@ -108,13 +113,7 @@ class RunResult:
 
 
 class PostMtClient:
-    def __init__(
-        self,
-        base_url: str,
-        poll_interval: float = 3.0,
-        timeout: float = 1800.0,
-        api_key: str | None = None,
-    ) -> None:
+    def __init__(self, base_url: str, poll_interval: float, timeout: float, api_key: str | None) -> None:
         self._client = httpx.Client(
             base_url=base_url.rstrip("/"),
             timeout=120.0,
@@ -136,7 +135,6 @@ class PostMtClient:
             logger.error("[POST-MT] unreachable at %s: %s", self.base_url, error)
             return False
 
-        # Redirects are deliberately not followed: HTTP downgrades a redirected POST to GET.
         if response.is_redirect:
             logger.error(
                 "[POST-MT] %s redirected to %s - set POSTMT_BASE_URL to that URL "
@@ -229,10 +227,9 @@ class PostMtClient:
         *,
         parameters: dict[str, Any],
         segments: Sequence[dict[str, Any]],
-        steps: Sequence[str] = ("AQE", "APE"),
+        steps: Sequence[str],
         on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> RunResult:
-        """``steps`` defaults to AQE+APE: AQE is what triggers glossary retrieval upstream of APE."""
         task_id = self.submit(parameters=parameters, steps=steps, segments=segments)
         logger.info("[POST-MT] submitted task %s (%d segments, steps=%s)", task_id, len(segments), "+".join(steps))
 
@@ -254,7 +251,7 @@ class PostMtClient:
 
 
 class StanzaClient:
-    def __init__(self, base_url: str, timeout: float = 120.0) -> None:
+    def __init__(self, base_url: str, timeout: float) -> None:
         self._client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
 
     def close(self) -> None:

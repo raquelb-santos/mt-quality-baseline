@@ -61,7 +61,6 @@ class DntClient:
 
     def __init__(self, base_url: str, api_key: str | None = None, timeout: float = 120.0) -> None:
         headers = {"X-Api-Key": api_key} if api_key else {}
-
         self._client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout, headers=headers)
         self.base_url = base_url
         self.authenticated = bool(api_key)
@@ -77,7 +76,6 @@ class DntClient:
             logger.error("[DNT] unreachable at %s: %s (on the VPN?)", self.base_url, error)
             return False
 
-        # Redirects are deliberately not followed: HTTP downgrades a redirected POST to GET.
         if response.is_redirect:
             logger.error(
                 "[DNT] %s redirected to %s - set DNT_BASE_URL to that URL "
@@ -89,8 +87,7 @@ class DntClient:
         if response.is_error:
             logger.error(
                 "[DNT] %s returned HTTP %d for /health. Every path 404ing usually means the URL "
-                "reaches a gateway rather than the service - check DNT_BASE_URL, and that you are "
-                "on the VPN.",
+                "reaches a gateway rather than the service.",
                 self.base_url, response.status_code,
             )
             return False
@@ -128,8 +125,7 @@ class DntClient:
             status = body.get(name)
             if isinstance(status, str) and status.strip().lower() not in {"connected", "ok", "up", "healthy"}:
                 logger.error(
-                    "[DNT] %s reports %s = %r. Reversion runs an LLM call through that gateway, so "
-                    "every batch would fail.",
+                    "[DNT] %s reports %s = %r. Reverting depends on it, so every batch fails.",
                     self.base_url, name, status,
                 )
                 return False
@@ -178,9 +174,7 @@ class DntClient:
         if repairs_only:
             logger.error(
                 "[DNT] %d/%d segments reported only the items the service repaired, not every item "
-                "it weighed. Preserved items are then missing from the denominator, so the "
-                "preservation rate would measure the service's fix rate instead. Check the "
-                "response against /openapi.json before trusting these numbers.",
+                "it weighed, so preserved items are missing from the denominator.",
                 repairs_only, len(results),
             )
 
@@ -191,7 +185,7 @@ class DntClient:
         batch: Sequence[Mapping[str, str]],
         source_language: str | None,
         target_language: str | None,
-    ) -> list[Mapping[str, Any] | None]:
+    ) -> list[Mapping[str, Any]]:
         payload: dict[str, Any] = {
             "segments": [
                 {"id": pair["id"], "source": pair.get("source", ""), "target": pair.get("target", "")}
@@ -199,8 +193,7 @@ class DntClient:
             ]
         }
 
-        # The service detects better for knowing the pair, sent as the base code its examples use:
-        # `en-gb` -> `en`.
+        # The service detects better for knowing the pair, as a base code (`en-gb` -> `en`).
         options = {
             key: str(value).split("-")[0].lower()
             for key, value in (
@@ -214,4 +207,4 @@ class DntClient:
 
         response = self._client.post("/v1/revert", json=payload)
         response.raise_for_status()
-        return list(response_segments(response.json()))
+        return response_segments(response.json())

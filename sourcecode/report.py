@@ -8,12 +8,14 @@ from typing import Any, Callable, Mapping, Sequence
 # Per component: the heading it is filed under, and what renders its parts.
 Sections = Mapping[str, tuple[str, Callable[[Sequence[Any]], list[str]]]]
 
-REPORTS_DIR = Path("reports")
-
 
 def rate(numerator: int, denominator: int) -> float | None:
     """None, never 0, with no denominator: a misconfigured run is not total failure."""
     return None if denominator == 0 else numerator / denominator
+
+
+def delta(before: float | None, after: float | None) -> float | None:
+    return None if before is None or after is None else after - before
 
 
 def pct(value: float | None) -> str:
@@ -22,6 +24,10 @@ def pct(value: float | None) -> str:
 
 def signed_pct(value: float | None) -> str:
     return "n/a" if value is None else f"{value * 100:+.2f}%"
+
+
+def arrow(values: Sequence[Any]) -> str:
+    return " → ".join(str(value) for value in values)
 
 
 def cell(value: Any) -> str:
@@ -103,6 +109,50 @@ class Scorecard:
         return "\n".join(line.rstrip() for line in lines)
 
 
+def report_parameters(dataset: Any) -> dict[str, Any]:
+    """Canonical codes, so every component files one dataset under one stratum."""
+    parameters = dataset.parameters
+    return {
+        "source_language": parameters.get("clean_source_language_code"),
+        "target_language": parameters.get("clean_target_language_code"),
+        "domain": parameters.get("domain"),
+        "cat_tool_provider": parameters.get("cat_tool_provider"),
+        "cat_project_id": parameters.get("cat_project_id"),
+    }
+
+
+def subheading_of(result: Any) -> str:
+    """The language pair a dataset was scored on, and its domain where it names one."""
+    pair = f"{result.parameters['source_language']} → {result.parameters['target_language']}"
+    return f"{pair}  ·  {result.parameters['domain']}" if result.parameters.get("domain") else pair
+
+
+def failure_warning(result: Any) -> list[str]:
+    """The one warning every component raises: post-mt failed inside some segments."""
+    if not result.failed_segments:
+        return []
+    return [
+        f"{result.failed_segments}/{result.totals['segments']} segments failed inside post-mt"
+        f"\n{result.failure_reason}"
+    ]
+
+
+def scope_note(scored: int, named: int, reason: str) -> list[str]:
+    """Every rate is against REF, so it is over the segments REF set an expectation in, not all."""
+    if scored == named:
+        return []
+    return [f"Scored against REF {scored} of {named} segments - {reason}"]
+
+
+def spend_fact(usage: Any) -> list[str]:
+    if not (usage.cost or usage.tokens):
+        return []
+    return [
+        f"LLM spend ${usage.cost:.4f} · {usage.tokens:,} tokens "
+        f"({usage.prompt_tokens:,} prompt / {usage.completion_tokens:,} completion)"
+    ]
+
+
 def stratum_of(result: Any) -> tuple[str, str]:
     """A stratum is one language pair in one domain — the cell a result is reported in."""
     parameters = result.parameters
@@ -142,7 +192,7 @@ def render_report(
 def report_path(components: Sequence[str], *, dry_run: bool, now: datetime) -> Path:
     stem = "+".join(components) or "baseline"
     suffix = "_dry-run" if dry_run else ""
-    return REPORTS_DIR / f"{stem}{suffix}_{now.strftime('%Y%m%d-%H%M%S')}.md"
+    return Path("reports") / f"{stem}{suffix}_{now.strftime('%Y%m%d-%H%M%S')}.md"
 
 
 def write_report(

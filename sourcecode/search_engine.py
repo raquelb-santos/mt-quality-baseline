@@ -1,8 +1,8 @@
-"""The OpenSearch/Elasticsearch client the glossary and the TM index both query through."""
+"""The OpenSearch/Elasticsearch client the glossary queries through."""
 
 import json
 import logging
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable
 
 import httpx
 
@@ -105,10 +105,3 @@ class SearchClient:
         response.raise_for_status()
         return response.json().get("responses", [])
 
-    def mget(self, index: str, ids: Sequence[str]) -> list[dict[str, Any]]:
-        """Documents by `_id`, in request order; a miss comes back with `found` false."""
-        if not ids:
-            return []
-        response = self._client.post(f"/{index}/_mget", json={"ids": list(ids)})
-        response.raise_for_status()
-        return response.json().get("docs", [])
