@@ -6,7 +6,7 @@ from typing import Any
 
 from .pipeline import run_pipeline, stub_pipeline
 from .postmt import Usage, extract_post_edited, segment_id
-from .report import delta, report_parameters
+from .report import delta, report_parameters, stratum_of
 from .tags import extract_tags
 from .tags_score import Aggregate, Score, aggregate, score_tags
 from .text_processing import Dataset
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SegmentResult:
     source_segment_id: str
+    stratum: tuple[str, str]
     src_text: str
     mt_text: str
     ape_text: str
@@ -73,9 +74,11 @@ def run_benchmark(
     )
     processed = outcome.segments
 
-    src_texts = [s.get("source_content") or "" for s in dataset.segments]
-    ref_texts = [s.get("reference_content") or "" for s in dataset.segments]
-    mt_texts = [s.get("target_content") or "" for s in dataset.segments]
+    originals = dataset.segments
+    strata = [stratum_of(p) for p in dataset.parameters_per_segment()]
+    src_texts = [s.get("source_content") or "" for s in originals]
+    ref_texts = [s.get("reference_content") or "" for s in originals]
+    mt_texts = [s.get("target_content") or "" for s in originals]
     ape_texts = [extract_post_edited(s) for s in processed]
 
     per_segment_tags = [[tag.text for tag in extract_tags(text)] for text in src_texts]
@@ -92,7 +95,8 @@ def run_benchmark(
         src_text = src_texts[index]
 
         results.append(SegmentResult(
-            source_segment_id=segment_id(segment, dataset.segments[index], index),
+            source_segment_id=segment_id(segment, originals[index], index),
+            stratum=strata[index],
             src_text=src_text,
             mt_text=mt_texts[index],
             ape_text=ape_texts[index],

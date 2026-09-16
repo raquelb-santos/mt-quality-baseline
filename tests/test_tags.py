@@ -10,7 +10,7 @@ from sourcecode.postmt import RunResult
 from sourcecode.tags import ENTITY, PAIRED_CLOSE, PAIRED_OPEN, PRINTF, STANDALONE, XML, extract_tags, unpaired
 from sourcecode.tags_benchmark import run_benchmark
 from sourcecode.tags_score import aggregate, pool, score_tags
-from sourcecode.text_processing import Dataset, normalize_language
+from sourcecode.text_processing import Dataset, Task, normalize_language
 
 
 CONFIG = SimpleNamespace(benchmark=SimpleNamespace(batch_size=50))
@@ -65,14 +65,14 @@ SEGMENTS = [
 
 
 def _dataset(name="tags-set", domain="Test", segments=SEGMENTS):
+    parameters = normalize_language(
+        {"source_language": "en-gb", "target_language": "fr-fr", "domain": domain}
+    )
     return Dataset(
         name=name,
         component="tags",
-        parameters=normalize_language(
-            {"source_language": "en-gb", "target_language": "fr-fr", "domain": domain}
-        ),
-        glossary_ids=[],
-        segments=list(segments),
+        parameters=parameters,
+        tasks=[Task(parameters, list(segments))],
     )
 
 
@@ -446,9 +446,11 @@ def test_single_dataset_still_gets_a_stratum_row():
     assert "en-gb->fr-fr" in rendered
 
 
-def test_datasets_in_different_domains_are_different_strata():
+def test_one_pair_splits_into_the_domains_under_it():
     rows = tags_report.stratum_rows([_result(domain="Legal"), _result(domain="Medical")])
-    assert {row["domain"] for row in rows} == {"Legal", "Medical"}
+
+    assert [row["label"] for row in rows] == ["en-gb->fr-fr", "↳ Legal", "↳ Medical"]
+    assert rows[0]["expected_instances"] == sum(row["expected_instances"] for row in rows[1:])
 
 
 def test_stratum_row_is_the_pooled_scorecard():

@@ -3,11 +3,10 @@
 from collections import defaultdict
 from typing import Any, Sequence
 
-from .report import (Scorecard, arrow, by_stratum, cell, failure_warning, pct, rate,
-                     signed_pct, spend_fact, subheading_of, table)
+from .report import Scorecard, arrow, by_language_pair, cell, failure_warning, pct, rate, signed_pct, subheading_of, table
 from .tags import KINDS
 from .tags_benchmark import Result
-from .tags_score import Score, pool
+from .tags_score import aggregate, Score, pool
 
 # The versions a run scores, in delivery order.
 VERSIONS = ("mt", "ape", "ref")
@@ -52,7 +51,6 @@ def scorecard(result: Result) -> Scorecard:
         f"Tags {mt.tags.distinct_tags} scored · {mt.expected} SRC instances"
         f" · families {', '.join(sorted({r['family'] for r in family_rows(result)})) or 'none'}",
         *(f"{label.ljust(width)}  {_moved(values)}" for label, values in metrics),
-        *spend_fact(result.usage),
     ]
 
     detail = [
@@ -68,7 +66,7 @@ def scorecard(result: Result) -> Scorecard:
     ]
 
     return Scorecard(
-        heading="tags", subheading=subheading_of(result), facts=facts,
+        heading="tags", dataset=result.dataset, subheading=subheading_of(result), facts=facts,
         warnings=warnings, detail=detail,
     )
 
@@ -242,7 +240,7 @@ def render_defects(result: Result) -> str:
         return ""
 
     lines = [
-        "### Segments with a tag defect",
+        "#### Segments with a tag defect",
         "",
         "| Segment | SRC tags | MT | APE | REF |",
         "| --- | --- | --- | --- | --- |",
@@ -261,7 +259,7 @@ def render_comparison(results: Sequence[Result]) -> str:
     if len(results) < 2:
         return ""
 
-    lines = ["## Across datasets", ""]
+    lines = ["### Across datasets", ""]
     for result in results:
         pair = f"{result.parameters['source_language']}>{result.parameters['target_language']}"
         lines.append(
@@ -274,46 +272,53 @@ def render_comparison(results: Sequence[Result]) -> str:
     return "\n".join(lines)
 
 
-def stratum_rows(results: Sequence[Result]) -> list[dict[str, Any]]:
-    """One row per stratum, with the pooled counts its rates were computed from."""
-    rows = []
-    for (pair, domain), group in by_stratum(results).items():
-        mt, ape, ref = (pool([getattr(r, column) for r in group]) for column in VERSIONS)
+def _measured(segments: Sequence[Any]) -> dict[str, Any]:
+    """One group's counts, aggregated from the segments themselves rather than from datasets."""
+    mt, ape, ref = (aggregate([getattr(s, column) for s in segments]) for column in VERSIONS)
+    return {
+        "segments": len(segments),
+        "expected_instances": mt.expected,
+        "mt_integrity_rate": mt.integrity_rate,
+        "ape_integrity_rate": ape.integrity_rate,
+        "ref_integrity_rate": ref.integrity_rate,
+    }
 
-        rows.append({
-            "language_pair": pair,
-            "domain": domain,
-            "expected_instances": mt.expected,
-            "mt_integrity_rate": mt.integrity_rate,
-            "ape_integrity_rate": ape.integrity_rate,
-            "ref_integrity_rate": ref.integrity_rate,
-        })
+
+def stratum_rows(results: Sequence[Result]) -> list[dict[str, Any]]:
+    """One row per language pair, then one for each domain the pair was measured in."""
+    rows = []
+    for pair, domains in by_language_pair(results).items():
+        rows.append({"language_pair": pair, "domain": None, "label": pair,
+                     **_measured([s for group in domains.values() for s in group])})
+        for domain, group in domains.items():
+            rows.append({"language_pair": pair, "domain": domain, "label": f"↳ {domain}",
+                         **_measured(group)})
     return rows
 
 
 def stratum_rate_rows(results: Sequence[Result]) -> list[tuple[str, list[str]]]:
-    """Each stratum against its pooled integrity, the instance count in the label."""
+    """Each group against its pooled integrity, the instance count in the label."""
+    all_rows = stratum_rows(results)
     rows = [
-        (
-            f"{row['language_pair']} · {row['domain']} · {row['expected_instances']} inst",
-            [pct(row[f"{column}_integrity_rate"]) for column in VERSIONS],
-        )
-        for row in stratum_rows(results)
+        (f"{row['label']} · {row['expected_instances']} inst",
+         [pct(row[f"{column}_integrity_rate"]) for column in VERSIONS])
+        for row in all_rows
     ]
 
-    if len(rows) > 1:
-        pooled = [pool([getattr(r, column) for r in results]) for column in VERSIONS]
-        rows.append((f"ALL · {pooled[0].expected} inst", [pct(a.integrity_rate) for a in pooled]))
+    if sum(1 for row in all_rows if row["domain"] is None) > 1:
+        pooled = _measured([s for result in results for s in result.segments])
+        rows.append((f"ALL · {pooled['expected_instances']} inst",
+                     [pct(pooled[f"{column}_integrity_rate"]) for column in VERSIONS]))
 
     return rows
 
 
 def render_strata(results: Sequence[Result]) -> str:
-    """Pooled integrity per language pair and domain."""
-    return table("Integrity by stratum", "Stratum", [v.upper() for v in VERSIONS],
-                 stratum_rate_rows(results), heading="##")
+    """Integrity per language pair, split by the domains inside it."""
+    return table("Integrity by language pair", "Language pair", [v.upper() for v in VERSIONS],
+                 stratum_rate_rows(results), heading="###")
 
 
 def render_strata_console(results: Sequence[Result]) -> str:
-    return table("Integrity by stratum", "stratum", [v.upper() for v in VERSIONS],
+    return table("Integrity by language pair", "language pair", [v.upper() for v in VERSIONS],
                  stratum_rate_rows(results), console=True)
