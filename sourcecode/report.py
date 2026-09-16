@@ -1,5 +1,6 @@
 """Report primitives every component formats its numbers with, and the file a run writes."""
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +24,11 @@ def pct(value: float | None) -> str:
 
 
 def signed_pct(value: float | None) -> str:
-    return "n/a" if value is None else f"{value * 100:+.2f}%"
+    """A difference of two rates, so percentage points, and no sign on no change."""
+    if value is None:
+        return "n/a"
+    points = round(value * 100, 2)
+    return f"{points:+.2f} pp" if points else "0.00 pp"
 
 
 def arrow(values: Sequence[Any]) -> str:
@@ -35,6 +40,11 @@ def cell(value: Any) -> str:
     return str(value).replace("|", "\\|")
 
 
+def _numeric(value: str) -> bool:
+    """Right-aligned only when the whole column is counts and rates."""
+    return re.fullmatch(r"[-+]?[\d,.]*%?( pp)?|n/a|-", value) is not None
+
+
 def table(
     title: str,
     first: str,
@@ -42,7 +52,7 @@ def table(
     rows: Sequence[tuple[str, Sequence[str]]],
     *,
     console: bool = False,
-    heading: str = "###",
+    heading: str = "####",
     width: int = 8,
 ) -> str:
     """One table, as a Markdown grid or as columns aligned for a terminal."""
@@ -50,11 +60,13 @@ def table(
         return ""
 
     if not console:
+        aligns = ["---:" if all(_numeric(values[i]) for _, values in rows) else "---"
+                  for i in range(len(columns))]
         lines = [
             f"{heading} {title}",
             "",
             f"| {first} | {' | '.join(columns)} |",
-            f"| --- | {' | '.join('---:' for _ in columns)} |",
+            f"| --- | {' | '.join(aligns)} |",
             *(f"| {cell(name)} | {' | '.join(values)} |" for name, values in rows),
         ]
     else:
@@ -79,13 +91,14 @@ class Scorecard:
     """One dataset's headline results for both destinations; `detail` goes to the file only."""
 
     heading: str
+    dataset: str
     subheading: str
     facts: list[str]
     warnings: list[str] = field(default_factory=list)
     detail: list[str] = field(default_factory=list)
 
     def as_markdown(self) -> str:
-        lines = [f"## {self.heading}", "", self.subheading, ""]
+        lines = [f"### {self.dataset}", "", self.subheading, ""]
 
         for warning in self.warnings:
             first, *rest = warning.splitlines()
@@ -110,14 +123,20 @@ class Scorecard:
 
 
 def report_parameters(dataset: Any) -> dict[str, Any]:
-    """Canonical codes, so every component files one dataset under one stratum."""
-    parameters = dataset.parameters
+    """Canonical codes, so every component files one dataset under one stratum. A file covering
+    several post-mt tasks names every value they carry, so the stratum hides none of them."""
+    def across(name: str) -> str | None:
+        values = dict.fromkeys(
+            str(task.parameters[name]) for task in dataset.tasks if task.parameters.get(name)
+        )
+        return ", ".join(values) or None
+
     return {
-        "source_language": parameters.get("clean_source_language_code"),
-        "target_language": parameters.get("clean_target_language_code"),
-        "domain": parameters.get("domain"),
-        "cat_tool_provider": parameters.get("cat_tool_provider"),
-        "cat_project_id": parameters.get("cat_project_id"),
+        "source_language": across("clean_source_language_code"),
+        "target_language": across("clean_target_language_code"),
+        "domain": across("domain"),
+        "cat_tool_provider": across("cat_tool_provider"),
+        "cat_project_id": across("cat_project_id"),
     }
 
 
@@ -144,27 +163,29 @@ def scope_note(scored: int, named: int, reason: str) -> list[str]:
     return [f"Scored against REF {scored} of {named} segments - {reason}"]
 
 
-def spend_fact(usage: Any) -> list[str]:
-    if not (usage.cost or usage.tokens):
-        return []
-    return [
-        f"LLM spend ${usage.cost:.4f} · {usage.tokens:,} tokens "
-        f"({usage.prompt_tokens:,} prompt / {usage.completion_tokens:,} completion)"
-    ]
-
-
-def stratum_of(result: Any) -> tuple[str, str]:
-    """A stratum is one language pair in one domain — the cell a result is reported in."""
-    parameters = result.parameters
-    pair = f"{parameters.get('source_language', '?')}->{parameters.get('target_language', '?')}"
+def stratum_of(parameters: Mapping[str, Any]) -> tuple[str, str]:
+    """A stratum is one language pair in one domain — the cell a segment is reported in."""
+    pair = (f"{parameters.get('clean_source_language_code') or '?'}"
+            f"->{parameters.get('clean_target_language_code') or '?'}")
     return pair, str(parameters.get("domain") or "(no domain)")
 
 
-def by_stratum(results: Sequence[Any]) -> dict[tuple[str, str], list[Any]]:
-    grouped: dict[tuple[str, str], list[Any]] = {}
+def by_language_pair(results: Sequence[Any]) -> dict[str, dict[str, list[Any]]]:
+    """Every scored segment under its language pair, then under its domain. One dataset can
+    span several of both, so this groups segments rather than datasets."""
+    grouped: dict[str, dict[str, list[Any]]] = {}
     for result in results:
-        grouped.setdefault(stratum_of(result), []).append(result)
-    return grouped
+        for segment in result.segments:
+            pair, domain = segment.stratum
+            grouped.setdefault(pair, {}).setdefault(domain, []).append(segment)
+
+    # Widest evidence first, and a stable order inside each pair.
+    return {
+        pair: dict(sorted(domains.items()))
+        for pair, domains in sorted(
+            grouped.items(), key=lambda item: (-sum(len(s) for s in item[1].values()), item[0])
+        )
+    }
 
 
 def render_report(
@@ -183,7 +204,7 @@ def render_report(
         if not results:
             continue
         heading, render = sections[component]
-        parts.append(f"# {heading}\n")
+        parts.append(f"## {heading}\n")
         parts.extend(render(results))
 
     return "\n".join(part for part in parts if part).rstrip() + "\n"
