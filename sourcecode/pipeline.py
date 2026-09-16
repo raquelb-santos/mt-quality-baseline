@@ -3,7 +3,7 @@
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .text_processing import Dataset, load
 from .postmt import Usage, preflight_submission, preflight_tasks, raise_for_preflight, segment_error
@@ -19,9 +19,9 @@ class PipelineOutcome:
     failures: list[str] = field(default_factory=list)
 
 
-def load_dataset(path: Path, *, component: str, dry_run: bool) -> Dataset:
+def load_dataset(path: Path, *, component: str, dry_run: bool, languages: Sequence[tuple[str, str]] = ()) -> Dataset:
     """Only the submission preflight applies: these components read what a segment carries."""
-    data = load(path, component=component)
+    data = load(path, component=component, languages=languages)
 
     if not dry_run:
         raise_for_preflight(

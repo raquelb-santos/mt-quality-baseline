@@ -48,6 +48,22 @@ COMPONENT_SECTIONS = {
 }
 
 
+def _language_slots(configured: list[str], components: list[str]) -> dict[str, str]:
+    """`BENCH_LANGUAGE` lines up slot by slot with `BENCH_COMPONENT`, a blank slot scoring every pair."""
+    if len(configured) > len(components):
+        raise ValueError(
+            f"BENCH_LANGUAGE has {len(configured)} slots but BENCH_COMPONENT names "
+            f"{len(components)}; they line up slot by slot."
+        )
+    slots = dict(zip(components, configured + [""] * (len(components) - len(configured))))
+
+    # Parsed now so a typo stops the run before it measures anything.
+    for given in slots.values():
+        if given:
+            text_processing.parse_language_pairs(given)
+    return slots
+
+
 def _force_utf8_output() -> None:
     """Windows consoles default to a code page that cannot encode translated content."""
     for stream in (sys.stdout, sys.stderr):
@@ -90,6 +106,12 @@ def main(argv: list[str] | None = None) -> int:
     if unknown:
         print(f"BENCH_COMPONENT names {', '.join(unknown)}; expected one or more of: "
               f"{', '.join(COMPONENTS)}.", file=sys.stderr)
+        return 2
+
+    try:
+        slots = _language_slots(config.benchmark.languages, components)
+    except ValueError as error:
+        print(error, file=sys.stderr)
         return 2
 
     stanza = glossary = dnt = postmt = None
@@ -158,26 +180,37 @@ def main(argv: list[str] | None = None) -> int:
             if len(datasets) > 1:
                 logging.info("[BENCH] %d %s datasets to score", len(datasets), component)
 
+            wanted = slots[component]
+            languages = text_processing.parse_language_pairs(wanted) if wanted else ()
+
             _, module, _, console = COMPONENTS[component]
             results = []
             for path in datasets:
                 logging.info("[BENCH] loading %s", path)
-                if component == "glossary":
-                    data = glossary_benchmark.load_dataset(
+                data = (
+                    glossary_benchmark.load_dataset(
                         path, glossary=glossary, node=config.search_engine.node,
-                        dry_run=args.dry_run,
+                        dry_run=args.dry_run, languages=languages,
                     )
+                    if component == "glossary" else
+                    pipeline.load_dataset(
+                        path, component=component, dry_run=args.dry_run, languages=languages,
+                    )
+                )
+                if not data.tasks:
+                    logging.info("[BENCH] nothing to score in %s - skipped", path)
+                    continue
+
+                if component == "glossary":
                     scored = glossary_benchmark.run_benchmark(
                         data, postmt=postmt, stanza=stanza, glossary=glossary, config=config,
                         skip_pipeline=args.dry_run,
                     )
                 elif component == "dnt":
-                    data = pipeline.load_dataset(path, component="dnt", dry_run=args.dry_run)
                     scored = dnt_benchmark.run_benchmark(
                         data, postmt=postmt, dnt=dnt, config=config, skip_pipeline=args.dry_run
                     )
                 elif component == "tags":
-                    data = pipeline.load_dataset(path, component="tags", dry_run=args.dry_run)
                     scored = tags_benchmark.run_benchmark(
                         data, postmt=postmt, config=config, skip_pipeline=args.dry_run
                     )
@@ -189,6 +222,12 @@ def main(argv: list[str] | None = None) -> int:
                     if block:
                         print(block)
                 results.append(scored)
+
+            if not results:
+                print(f"No {component} dataset could be scored - see the warnings above. Check "
+                      f"{PATH_VARIABLES[component]}, and BENCH_LANGUAGE if it is set.",
+                      file=sys.stderr)
+                return 1
 
             results_by_component[component] = results
             if results:

@@ -16,8 +16,10 @@ from sourcecode.text_processing import (
     count_occurrences,
     count_surface,
     is_unspaced_language,
+    in_languages,
     load,
     normalize_language,
+    parse_language_pairs,
     normalize_text,
     parse_csv,
 )
@@ -32,6 +34,12 @@ from sourcecode.postmt import (
     reported_has_glossary,
     segment_error,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_standing_language(monkeypatch):
+    """`.env` may narrow every run to one pair; a test says for itself which pairs it means."""
+    monkeypatch.delenv("BENCH_LANGUAGE", raising=False)
 
 
 # matching and counting
@@ -282,6 +290,82 @@ def test_another_format_named_outright_is_refused(tmp_path):
 
     with pytest.raises(ValueError, match="Unsupported dataset format"):
         load(path, component="glossary")
+
+
+# BENCH_LANGUAGE - scoring one pair out of an export that covers many.
+
+EXPORT = (
+    "SEGMENTID,SOURCECONTENT,TARGETCONTENT,HUMAN_TARGET,ISOSOURCELANGUAGE,ISOTARGETLANGUAGE\n"
+    "1,a,b,c,en-GB,es-ES\n"
+    "2,d,e,f,en-US,es-MX\n"
+    "3,g,h,i,en-GB,fr-FR\n"
+)
+
+
+def test_a_pair_without_a_region_matches_every_region():
+    """`en_es` is how a pair is named day to day; the export spells out the locales."""
+    assert parse_language_pairs("en_es") == [("en", "es")]
+    pairs = parse_language_pairs("en_es")
+    assert in_languages({"source_language": "en-GB", "target_language": "es-ES"}, pairs)
+    assert in_languages({"source_language": "en-US", "target_language": "es-419"}, pairs)
+    assert not in_languages({"source_language": "en-GB", "target_language": "fr-FR"}, pairs)
+
+
+def test_a_language_spelled_as_a_name_still_matches():
+    """A dataset may name a language rather than code it, so the clean code is what is matched."""
+    spelled = normalize_language(
+        {"source_language": "English (United Kingdom)", "target_language": "French (France)"}
+    )
+
+    assert in_languages(spelled, parse_language_pairs("en_fr"))
+    assert not in_languages(spelled, parse_language_pairs("en_es"))
+
+
+def test_a_pinned_region_matches_only_itself():
+    pairs = parse_language_pairs("en-gb_es-es")
+    assert in_languages({"source_language": "en-GB", "target_language": "es-ES"}, pairs)
+    assert not in_languages({"source_language": "en-US", "target_language": "es-ES"}, pairs)
+
+
+def test_several_pairs_are_comma_separated():
+    assert parse_language_pairs("en_es, en_fr") == [("en", "es"), ("en", "fr")]
+
+
+@pytest.mark.parametrize("given", ["enes", "en_", "_es", ""])
+def test_a_malformed_pair_is_rejected(given):
+    with pytest.raises(ValueError, match="SOURCE_TARGET"):
+        parse_language_pairs(given)
+
+
+def test_loading_keeps_only_the_tasks_asked_for(tmp_path):
+    path = _write(tmp_path, "export.csv", EXPORT)
+
+    whole = load(path, component="tags")
+    assert len(whole.tasks) == 3
+
+    only = load(path, component="tags", languages=parse_language_pairs("en_es"))
+    assert [s["source_segment_id"] for s in only.segments] == ["1", "2"]
+
+    # The file's shared parameters are recomputed over the kept tasks, not the whole file.
+    pinned = load(path, component="tags", languages=parse_language_pairs("en-gb_es-es"))
+    assert pinned.parameters["target_language"] == "es-ES"
+
+
+def test_a_file_holding_none_of_the_pairs_loads_empty(tmp_path):
+    """A folder is scored file by file, so one that matches nothing is skipped, not an error."""
+    path = _write(tmp_path, "export.csv", EXPORT)
+
+    data = load(path, component="tags", languages=parse_language_pairs("en_ja"))
+
+    assert data.tasks == [] and data.segments == []
+
+
+def test_an_invalid_file_still_fails_when_a_pair_is_asked_for(tmp_path):
+    """Filtering happens after validation, so a broken file cannot hide behind BENCH_LANGUAGE."""
+    path = _write(tmp_path, "export.csv", EXPORT.replace(",c,", ",,"))
+
+    with pytest.raises(ValueError, match="reference_content"):
+        load(path, component="tags", languages=parse_language_pairs("en_es"))
 
 
 # the HTTP boundary
@@ -1212,6 +1296,75 @@ def test_folder_scores_every_dataset_in_and_pools(
     report = _report(tmp_path / "reports", "glossary_dry-run").read_text(encoding="utf-8")
     assert "## By stratum" in report
     assert "en-gb->fr-fr" in report
+
+
+# BENCH_LANGUAGE, over a whole run
+
+
+def test_a_pair_no_dataset_holds_stops_the_run(configure, stub_postmt, stub_glossary, monkeypatch, capsys):
+    """Scoring nothing would write an empty report and exit 0, reading like a clean result."""
+    configure()
+    monkeypatch.setenv("BENCH_LANGUAGE", "en_es")
+
+    code = run.main(["--dry-run"])
+
+    assert code == 1
+    assert "No glossary dataset could be scored" in capsys.readouterr().err
+
+
+def test_bench_language_narrows_the_run(
+    monkeypatch, tmp_path, stub_postmt, stub_glossary
+):
+    """A folder is scored file by file, so the pairs not asked for are skipped, not failed."""
+    folder = tmp_path / "many"
+    folder.mkdir()
+    _write_dataset(folder, name="fr.json")
+    _write_dataset(folder, name="es.json", target_language="es-es")
+    monkeypatch.setenv("GLOSSARY_PATH", str(folder))
+    monkeypatch.setenv("BENCH_LANGUAGE", "en_es")
+    monkeypatch.chdir(tmp_path)
+
+    assert run.main(["--dry-run"]) == 0
+
+    report = _report(tmp_path / "reports", "glossary_dry-run").read_text(encoding="utf-8")
+    assert "en-gb->es-es" in report and "en-gb->fr-fr" not in report
+
+
+def test_a_blank_slot_scores_every_pair(monkeypatch, tmp_path, stub_postmt, stub_glossary, stub_dnt):
+    """Each component gets its own slot, so narrowing one leaves the others measuring everything."""
+    monkeypatch.setenv("BENCH_COMPONENT", "dnt,glossary")
+    folder = tmp_path / "many"
+    folder.mkdir()
+    _write_dataset(folder, name="fr.json")
+    _write_dataset(folder, name="es.json", target_language="es-es")
+    monkeypatch.setenv("GLOSSARY_PATH", str(folder))
+    monkeypatch.setenv("DNT_PATH", str(_write_dataset(tmp_path, name="n.json")))
+    # DNT is asked for every pair, terminology only for en_es.
+    monkeypatch.setenv("BENCH_LANGUAGE", "[ , en_es]")
+    monkeypatch.chdir(tmp_path)
+
+    assert run.main(["--dry-run"]) == 0
+
+    report = _report(tmp_path / "reports", "dnt+glossary_dry-run").read_text(encoding="utf-8")
+    # The DNT dataset is en-gb->fr-fr, which only an unfiltered slot keeps.
+    assert "en-gb->fr-fr" in report and "en-gb->es-es" in report
+
+
+def test_more_slots_than_components_is_a_usage_error(configure, monkeypatch, capsys):
+    """A slot list that does not line up would silently narrow the wrong component."""
+    configure()
+    monkeypatch.setenv("BENCH_LANGUAGE", "[en_es, en_fr]")
+
+    assert run.main(["--dry-run"]) == 2
+    assert "line up slot by slot" in capsys.readouterr().err
+
+
+def test_a_malformed_language_is_a_usage_error(configure, monkeypatch, capsys):
+    configure()
+    monkeypatch.setenv("BENCH_LANGUAGE", "enes")
+
+    assert run.main(["--dry-run"]) == 2
+    assert "SOURCE_TARGET" in capsys.readouterr().err
 
 
 # BENCH_COMPONENT

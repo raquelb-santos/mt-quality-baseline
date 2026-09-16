@@ -26,12 +26,23 @@ def _parse_list(raw: str) -> list[str]:
     return [item for item in (part.strip().strip("\"'") for part in parts) if item]
 
 
+def _parse_slots(raw: str) -> list[str]:
+    """`_parse_list` for a setting that lines up with another - a blank slot is kept, not dropped."""
+    if not raw.strip():
+        return []
+    return [part.strip().strip("\"'") for part in raw.strip().strip("[]").split(",")]
+
+
 def _env(name: str) -> Any:
     return field(default_factory=lambda: os.getenv(name))
 
 
 def _env_list(name: str) -> Any:
     return field(default_factory=lambda: _parse_list(os.getenv(name) or ""))
+
+
+def _env_slots(name: str) -> Any:
+    return field(default_factory=lambda: _parse_slots(os.getenv(name) or ""))
 
 
 def _env_bool(name: str) -> Any:
@@ -81,6 +92,8 @@ class BenchmarkConfig:
     lemma_matching: bool = True
     # The components this run measures, in reporting order.
     components: list[str] = _env_list("BENCH_COMPONENT")
+    # One slot per component, in `components` order; a blank slot scores every language pair.
+    languages: list[str] = _env_slots("BENCH_LANGUAGE")
     # Per component: a file, or a folder to score every dataset inside it.
     paths: dict[str, str] = field(
         default_factory=lambda: {

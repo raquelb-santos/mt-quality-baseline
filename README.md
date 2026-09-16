@@ -52,6 +52,10 @@ What a run scores is configured in `.env`, as `GLOSSARY_PATH`, `DNT_PATH` and `T
 Each may name a dataset file or a folder of them (`.json` or `.csv`).
 Components are configured separately because pooling adds counts within a stratum.
 
+`BENCH_LANGUAGE` picks the language pairs, one slot per `BENCH_COMPONENT` slot, and a blank slot
+scores every pair. A code without a region matches all of its regions, so `en_es` takes every
+English–Spanish pair and `en-gb_es-es` takes only that one.
+
 A run prints each component's scorecard as it is measured and writes one Markdown report under
 `reports/`, named for what was evaluated and when it ran — `glossary+dnt_20260826-142207.md`, with
 `_dry-run` in the name when it was one.
@@ -326,6 +330,7 @@ Create a `.env` in the repo root with the following variables:
 | `SEARCH_ENGINE_USERNAME` / `SEARCH_ENGINE_PASSWORD`   | HTTP basic auth, if the cluster uses it                                                                                                                                                 |
 | `GLOSSARY_PATH` / `DNT_PATH` / `TAGS_PATH`            | the single source of what each component scores — a dataset file, or a folder of that component's datasets                                                                              |
 | `BENCH_COMPONENT`                                     | which components a run measures, one or more of `glossary`, `dnt` and `tags`                                                                                                            |
+| `BENCH_LANGUAGE`                                      | which language pairs each component scores, one slot per `BENCH_COMPONENT` entry and blank for all of them — `en_es`, or `en-gb_es-es` to pin the regions                               |
 | `DNT_BASE_URL` / `DNT_API_KEY`                        | the DNT service and its key, sent as `X-Api-Key` — note the casing, post-mt's own key is not accepted                                                                                   |
 | `ES_AWS_SIGV4_ENABLED` / `AWS_REGION` / `AWS_PROFILE` | sign requests with AWS SigV4 instead — required by AWS-managed domains, which reject basic auth. Needs `pip install -e ".[aws]"` and a live login (`aws sso login --profile <profile>`) |
 

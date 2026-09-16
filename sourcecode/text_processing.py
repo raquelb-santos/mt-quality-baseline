@@ -3,12 +3,15 @@
 import csv
 import json
 import io
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 def find_datasets(configured: str, *, variable: str) -> list[Path]:
@@ -178,7 +181,37 @@ def validate(dataset: Dataset) -> None:
         raise ValueError(f'Invalid dataset "{dataset.name}":\n  - {listed}')
 
 
-def load(path: str | Path, *, component: str) -> Dataset:
+def parse_language_pairs(given: str) -> list[tuple[str, str]]:
+    """`en_es`, or `en-gb_es-es` to pin the regions; several are separated by commas."""
+    pairs = []
+    for item in str(given).split(","):
+        source, separator, target = item.strip().lower().partition("_")
+        if not (source and separator and target):
+            raise ValueError(
+                f"BENCH_LANGUAGE wants SOURCE_TARGET, like en_es or en-gb_es-es; got {item.strip()!r}"
+            )
+        pairs.append((source, target))
+    return pairs
+
+
+def _speaks(given: Any, wanted: str) -> bool:
+    """A wanted code that names no region matches every region of that language."""
+    value = str(given or "").lower()
+    return value == wanted or value.startswith(f"{wanted}-")
+
+
+def in_languages(parameters: dict[str, Any], pairs: Sequence[tuple[str, str]]) -> bool:
+    """Matched on the clean codes, since a dataset may spell a language `English (United Kingdom)`."""
+    spoken = tuple(
+        parameters.get(f"clean_{side}_language_code") or parameters.get(f"{side}_language")
+        for side in ("source", "target")
+    )
+    return any(
+        _speaks(spoken[0], source) and _speaks(spoken[1], target) for source, target in pairs
+    )
+
+
+def load(path: str | Path, *, component: str, languages: Sequence[tuple[str, str]] = ()) -> Dataset:
     path = Path(path)
     suffix = path.suffix.lower()
 
@@ -207,6 +240,17 @@ def load(path: str | Path, *, component: str) -> Dataset:
         component=component,
     )
     validate(dataset)
+
+    # Filtered after validation, so the whole file is still checked when one pair is scored.
+    if languages:
+        kept = [task for task in dataset.tasks if in_languages(task.parameters, languages)]
+        if len(kept) != len(dataset.tasks):
+            logger.info("[BENCH] %s: %d of %d task(s) match the language filter",
+                        dataset.name, len(kept), len(dataset.tasks))
+        dataset.tasks = kept
+        # An empty dataset has nothing to agree on, and the caller skips it.
+        dataset.parameters = shared_parameters(kept) if kept else {}
+
     return dataset
 
 
