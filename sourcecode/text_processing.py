@@ -5,19 +5,15 @@ import json
 import io
 import re
 import unicodedata
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
 
 
-PARAMS_SUFFIX = ".params.json"
-
-
 def find_datasets(configured: str, *, variable: str) -> list[Path]:
     """A file, or a folder's direct children, sorted."""
-    types = (".json", ".csv", ".mxliff", ".xliff", ".xlf")
+    types = (".json", ".csv")
     if not configured.strip():
         raise ValueError(
             f"No dataset to score. Set {variable} in .env to a dataset file, or to a folder "
@@ -29,7 +25,6 @@ def find_datasets(configured: str, *, variable: str) -> list[Path]:
         found = sorted(
             child for child in candidate.iterdir()
             if child.is_file() and child.suffix.lower() in types
-            and not child.name.endswith(PARAMS_SUFFIX)
         )
         if not found:
             raise ValueError(f"No dataset files in {candidate} (looked for {', '.join(types)}).")
@@ -41,53 +36,45 @@ def find_datasets(configured: str, *, variable: str) -> list[Path]:
 
 
 @dataclass
+class Task:
+    """The segments a dataset holds under one set of post-mt parameters."""
+
+    parameters: dict[str, Any]
+    segments: list[dict[str, Any]]
+
+
+@dataclass
 class Dataset:
     name: str
+    # What the tasks agree on; a parameter that varies belongs to its task, not to the file.
     parameters: dict[str, Any]
-    glossary_ids: list[str]
-    segments: list[dict[str, Any]]
+    # post-mt takes one parameter set per task, so a file covering several jobs is sent as several.
+    tasks: list[Task]
     # Which component scores this dataset.
     component: str
     steps: list[str] = field(default_factory=lambda: ["AQE", "APE"])
 
+    @property
+    def segments(self) -> list[dict[str, Any]]:
+        """Every segment the file holds, in task order."""
+        return [segment for task in self.tasks for segment in task.segments]
 
-def _strip_namespace(tag: str) -> str:
-    return tag.split("}", 1)[-1]
+    def per_segment(self, name: str) -> list[Any]:
+        """One parameter value per segment, from the task that segment is sent in."""
+        return [task.parameters.get(name) for task in self.tasks for _ in task.segments]
 
 
-def parse_mxliff(xml_string: str) -> list[dict[str, Any]]:
-    """Namespace-agnostic; `<target>` is REF, the `<alt-trans>` beside it MT."""
-    root = ET.fromstring(xml_string)
-    segments: list[dict[str, Any]] = []
+    def parameters_per_segment(self) -> list[dict[str, Any]]:
+        """The whole parameter set each segment is sent under."""
+        return [task.parameters for task in self.tasks for _ in task.segments]
 
-    for element in root.iter():
-        if _strip_namespace(element.tag) != "trans-unit":
-            continue
 
-        source = reference = machine = ""
-        for child in element:
-            name = _strip_namespace(child.tag)
-            if name == "source":
-                source = "".join(child.itertext())
-            elif name == "target":
-                reference = "".join(child.itertext())
-            elif name == "alt-trans" and not machine:
-                for proposal in child:
-                    if _strip_namespace(proposal.tag) == "target":
-                        machine = "".join(proposal.itertext())
-                        break
-
-        if source.strip() and machine.strip() and reference.strip():
-            segments.append(
-                {
-                    "source_segment_id": element.get("id"),
-                    "source_content": source,
-                    "target_content": machine,
-                    "reference_content": reference,
-                }
-            )
-
-    return segments
+def shared_parameters(tasks: Sequence[Task]) -> dict[str, Any]:
+    first, *rest = [task.parameters for task in tasks]
+    return {
+        name: value for name, value in first.items()
+        if all(other.get(name) == value for other in rest)
+    }
 
 
 def parse_csv(text: str) -> list[dict[str, Any]]:
@@ -110,18 +97,73 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
     return segments
 
 
+# CAT export text columns; other columns are ignored, so exports score without trimming.
+EXPORT_COLUMNS = {
+    "SEGMENTID": "source_segment_id",
+    "SOURCECONTENT": "source_content",
+    "TARGETCONTENT": "target_content",
+    "HUMAN_TARGET": "reference_content",
+}
+
+# Per-row job columns; rows sharing their values become one post-mt task.
+EXPORT_PARAMETERS = {
+    "ISOSOURCELANGUAGE": "source_language",
+    "ISOTARGETLANGUAGE": "target_language",
+    "CATTOOL": "cat_tool_provider",
+    "CATPROJECTID": "cat_project_id",
+    "TEMPOTASKCODE": "tempo_task_id",
+    "DOMAIN": "domain",
+    "OPERATION": "operation",
+}
+
+
+def is_export_header(names: Sequence[str]) -> bool:
+    """Whether a header is a CAT export rather than a dataset written in the canonical names."""
+    return "SOURCECONTENT" in {str(name or "").strip().upper() for name in names}
+
+
+def parse_csv_export(text: str, name: str) -> dict[str, Any]:
+    """A CAT segment export, one row per segment, read by the columns it writes."""
+    reader = csv.DictReader(io.StringIO(text))
+    header = {(column or "").strip().upper() for column in (reader.fieldnames or ())}
+    if missing := [column for column in EXPORT_COLUMNS if column not in header]:
+        raise ValueError(f"{name} has no {' column, no '.join(missing)} column.")
+
+    tasks: dict[tuple[tuple[str, str], ...], Task] = {}
+    kept = 0
+
+    for row in reader:
+        values = {(key or "").strip().upper(): (value or "") for key, value in row.items()}
+        if not values["SOURCECONTENT"].strip():
+            continue
+
+        parameters = {
+            parameter: value
+            for column, parameter in EXPORT_PARAMETERS.items()
+            if (value := values.get(column, "").strip())
+        }
+        task = tasks.setdefault(tuple(sorted(parameters.items())), Task(parameters, []))
+
+        segment = {field: values[column] for column, field in EXPORT_COLUMNS.items()}
+        segment["source_segment_id"] = segment["source_segment_id"].strip() or str(kept)
+        task.segments.append(segment)
+        kept += 1
+
+    return {"tasks": list(tasks.values())}
+
+
 def validate(dataset: Dataset) -> None:
     errors: list[str] = []
 
-    if not dataset.parameters:
-        errors.append("missing `parameters`")
-    if not dataset.parameters.get("source_language"):
-        errors.append("missing `parameters.source_language`")
-    if not dataset.parameters.get("target_language"):
-        errors.append("missing `parameters.target_language`")
+    for index, task in enumerate(dataset.tasks):
+        where = "parameters" if len(dataset.tasks) == 1 else f"tasks[{index}].parameters"
+        if not task.parameters:
+            errors.append(f"missing `{where}`")
+        if not task.parameters.get("source_language"):
+            errors.append(f"missing `{where}.source_language`")
+        if not task.parameters.get("target_language"):
+            errors.append(f"missing `{where}.target_language`")
 
-    if dataset.component == "glossary" and not dataset.glossary_ids:
-        errors.append('missing `glossary_ids`')
     if not dataset.segments:
         errors.append("no segments")
 
@@ -136,34 +178,32 @@ def validate(dataset: Dataset) -> None:
         raise ValueError(f'Invalid dataset "{dataset.name}":\n  - {listed}')
 
 
-def read_params(path: Path) -> dict[str, Any]:
-    params_file = path.with_name(path.stem + PARAMS_SUFFIX)
-    return json.loads(params_file.read_text(encoding="utf-8")) if params_file.is_file() else {}
-
-
 def load(path: str | Path, *, component: str) -> Dataset:
     path = Path(path)
-    raw = path.read_text(encoding="utf-8")
     suffix = path.suffix.lower()
-    params = read_params(path)
 
     if suffix == ".json":
-        body = json.loads(raw)
+        body = json.loads(path.read_text(encoding="utf-8"))
     elif suffix == ".csv":
-        body = {"segments": parse_csv(raw)}
-    elif suffix in {".mxliff", ".xliff", ".xlf"}:
-        body = {"segments": parse_mxliff(raw)}
+        # Two formats share the extension, so the header says which one this is.
+        text = path.read_text(encoding="utf-8-sig")
+        header = next(csv.reader(io.StringIO(text)), [])
+        body = (
+            parse_csv_export(text, path.name) if is_export_header(header)
+            else {"segments": parse_csv(text)}
+        )
     else:
         raise ValueError(f"Unsupported dataset format: {suffix}")
 
+    # A format that describes one job parses to one task; only an export can hold several.
+    tasks = body.get("tasks") or [Task(body.get("parameters") or {}, list(body.get("segments") or []))]
+    tasks = [Task(normalize_language(task.parameters), task.segments) for task in tasks]
+
     dataset = Dataset(
-        name=params.get("name") or body.get("name") or path.stem,
-        parameters=normalize_language(
-            {**body.get("parameters", {}), **params.get("parameters", {})}
-        ),
-        glossary_ids=list(params.get("glossary_ids") or body.get("glossary_ids") or []),
-        segments=list(body.get("segments") or []),
-        steps=list(params.get("steps") or body.get("steps") or ["AQE", "APE"]),
+        name=body.get("name") or path.stem,
+        parameters=shared_parameters(tasks),
+        tasks=tasks,
+        steps=list(body.get("steps") or ["AQE", "APE"]),
         component=component,
     )
     validate(dataset)

@@ -1317,3 +1317,129 @@ def test_reference_check_reaches_both_destinations(result):
 
     for destination in (card.as_console(), card.as_markdown()):
         assert "Reference check · REF rendered" in destination
+
+
+# CAT segment exports, in the column names the export writes
+
+from sourcecode.text_processing import load, parse_csv_export   # noqa: E402
+
+
+COLUMNS = [
+    "TEMPOTASKCODE", "CATJOBID", "CATPROJECTID", "CATTOOL", "SEGMENTID",
+    "ISOSOURCELANGUAGE", "ISOTARGETLANGUAGE", "DOMAIN", "OPERATION", "ORQSCORE",
+    "SOURCECONTENT", "TARGETCONTENT", "HUMAN_TARGET",
+]
+JOB = ["task-1", "job-1", "proj-1", "MemSource", "s1", "en-gb", "fr-fr",
+       "Finance", "ExecuteMtqe", "0.71"]
+CONTENT = ["Check the sensor.", "Vérifiez le détecteur.", "Vérifiez le capteur."]
+
+
+def as_csv(rows, columns=COLUMNS, job=JOB):
+    lines = [",".join(columns)]
+    for row in rows:
+        lines.append(",".join(f'"{value}"' for value in list(job) + list(row)))
+    return "\n".join(lines) + "\n"
+
+
+def only_task(body):
+    """Most of these exports describe one job, so they parse to exactly one post-mt task."""
+    assert len(body["tasks"]) == 1
+    return body["tasks"][0]
+
+
+def test_an_export_is_read_by_the_columns_it_writes():
+    body = parse_csv_export(as_csv([CONTENT]), "x.csv")
+    assert only_task(body).segments == [{
+        "source_segment_id": "s1",
+        "source_content": "Check the sensor.",
+        "target_content": "Vérifiez le détecteur.",
+        "reference_content": "Vérifiez le capteur.",
+    }]
+
+
+def test_the_reference_is_the_human_column_not_the_mt():
+    segment = only_task(parse_csv_export(as_csv([CONTENT]), "x.csv")).segments[0]
+    assert segment["reference_content"] == "Vérifiez le capteur."
+    assert segment["target_content"] == "Vérifiez le détecteur."
+
+
+def test_extra_columns_are_ignored():
+    segment = only_task(parse_csv_export(as_csv([CONTENT]), "x.csv")).segments[0]
+    assert "ORQSCORE" not in segment
+    assert set(segment) == {
+        "source_segment_id", "source_content", "target_content", "reference_content",
+    }
+
+
+def test_job_columns_become_the_task_parameters():
+    body = parse_csv_export(as_csv([CONTENT]), "x.csv")
+    assert only_task(body).parameters == {
+        "source_language": "en-gb",
+        "target_language": "fr-fr",
+        "cat_tool_provider": "MemSource",
+        "cat_project_id": "proj-1",
+        "tempo_task_id": "task-1",
+        "domain": "Finance",
+        "operation": "ExecuteMtqe",
+    }
+
+
+def test_a_missing_content_column_stops_the_load():
+    columns = [name for name in COLUMNS if name != "HUMAN_TARGET"]
+    job = [value for value in JOB]
+    text = ",".join(columns) + "\n" + ",".join(f'"{v}"' for v in job + CONTENT[:2]) + "\n"
+    with pytest.raises(ValueError, match="HUMAN_TARGET"):
+        parse_csv_export(text, "x.csv")
+
+
+def test_a_csv_in_the_canonical_names_is_not_read_as_an_export(tmp_path):
+    path = tmp_path / "plain.csv"
+    path.write_text(
+        "source_segment_id,source_content,target_content,reference_content\n"
+        "1,The sensor.,Le détecteur.,Le capteur.\n", encoding="utf-8",
+    )
+    # No SOURCECONTENT column, so the export parser is not the one that runs.
+    with pytest.raises(ValueError, match="source_language"):
+        load(path, component="glossary")
+
+
+def test_an_export_is_recognised_by_its_header(tmp_path):
+    path = tmp_path / "export.csv"
+    path.write_text(as_csv([CONTENT]), encoding="utf-8")
+    data = load(path, component="glossary")
+    assert data.segments[0]["reference_content"] == "Vérifiez le capteur."
+    assert data.parameters["domain"] == "Finance"
+
+
+# one export can cover many jobs, and post-mt takes one parameter set per task
+
+def export_with(column, values):
+    index = COLUMNS.index(column)
+    rows = []
+    for value in values:
+        job = list(JOB)
+        job[index] = value
+        rows.append(",".join(f'"{v}"' for v in job + CONTENT))
+    return "\n".join([",".join(COLUMNS), *rows]) + "\n"
+
+
+def test_two_projects_become_two_tasks():
+    """post-mt finds the term bases through cat_project_id, so one task cannot carry both."""
+    body = parse_csv_export(export_with("CATPROJECTID", ["proj-1", "proj-2"]), "x.csv")
+    assert [task.parameters["cat_project_id"] for task in body["tasks"]] == ["proj-1", "proj-2"]
+    assert [len(task.segments) for task in body["tasks"]] == [1, 1]
+
+
+def test_rows_of_one_job_stay_in_one_task():
+    body = parse_csv_export(as_csv([CONTENT, CONTENT]), "x.csv")
+    assert len(only_task(body).segments) == 2
+
+
+def test_a_language_that_varies_splits_the_file():
+    body = parse_csv_export(export_with("ISOTARGETLANGUAGE", ["fr-ca", "fr-fr"]), "x.csv")
+    assert [task.parameters["target_language"] for task in body["tasks"]] == ["fr-ca", "fr-fr"]
+
+
+def test_a_blank_job_column_is_left_unset():
+    body = parse_csv_export(export_with("DOMAIN", ["", ""]), "x.csv")
+    assert "domain" not in only_task(body).parameters

@@ -9,7 +9,10 @@ from sourcecode import config
 from sourcecode import run
 from sourcecode import dnt
 from sourcecode.text_processing import (
+    Dataset,
+    Task,
     count_lemma,
+    find_datasets,
     count_occurrences,
     count_surface,
     is_unspaced_language,
@@ -17,13 +20,15 @@ from sourcecode.text_processing import (
     normalize_language,
     normalize_text,
     parse_csv,
-    parse_mxliff,
 )
 from sourcecode.dnt import DntClient, Reversion
 from sourcecode.glossary import GlossaryClient
+from sourcecode.pipeline import run_pipeline
+from sourcecode.postmt import RunResult
 from sourcecode.postmt import (
     extract_post_edited,
     preflight_parameters,
+    preflight_tasks,
     reported_has_glossary,
     segment_error,
 )
@@ -183,7 +188,6 @@ def test_load_json_normalizes_languages(tmp_path):
             {
                 "name": "demo",
                 "parameters": PARAMETERS,
-                "glossary_ids": ["tb1"],
                 "segments": [{"source_segment_id": "1", "source_content": "a", "target_content": "b",
                              "reference_content": "c"}],
             }
@@ -196,31 +200,18 @@ def test_load_json_normalizes_languages(tmp_path):
     assert dataset.steps == ["AQE", "APE"]
 
 
-def test_sidecar_takes_precedence_over_file(tmp_path):
+def test_steps_come_from_the_dataset(tmp_path):
     path = _write(
         tmp_path, "d.json",
         json.dumps(
             {
                 "parameters": PARAMETERS,
-                "glossary_ids": ["from-file"],
+                "steps": ["AQE"],
                 "segments": [{"source_content": "a", "target_content": "b", "reference_content": "c"}],
             }
         ),
     )
-    _write(tmp_path, "d.params.json", json.dumps({"glossary_ids": ["from-sidecar"], "steps": ["AQE"]}))
-    dataset = load(path, component="glossary")
-    assert dataset.glossary_ids == ["from-sidecar"]
-    assert dataset.steps == ["AQE"]
-
-
-def test_missing_glossary_ids_is_rejected(tmp_path):
-    """A dataset without ids cannot be scored, so it must fail rather than report a clean zero."""
-    path = _write(
-        tmp_path, "d.json",
-        json.dumps({"parameters": PARAMETERS, "segments": [{"source_content": "a", "target_content": "b", "reference_content": "c"}]}),
-    )
-    with pytest.raises(ValueError, match="glossary_ids"):
-        load(path, component="glossary")
+    assert load(path, component="glossary").steps == ["AQE"]
 
 
 def test_blank_segment_fields_are_rejected(tmp_path):
@@ -229,7 +220,6 @@ def test_blank_segment_fields_are_rejected(tmp_path):
         json.dumps(
             {
                 "parameters": PARAMETERS,
-                "glossary_ids": ["tb1"],
                 "segments": [{"source_content": "a", "target_content": "   ",
                               "reference_content": "c"}],
             }
@@ -245,7 +235,6 @@ def test_missing_languages_are_rejected(tmp_path):
         json.dumps(
             {
                 "parameters": {"cat_project_id": "P1"},
-                "glossary_ids": ["tb1"],
                 "segments": [{"source_content": "a", "target_content": "b", "reference_content": "c"}],
             }
         ),
@@ -270,47 +259,29 @@ def test_parse_csv_handles_quoted_fields_with_commas():
     assert rows[0]["target_content"] == "c, d"
 
 
-def test_load_csv_takes_parameters_from_sidecar(tmp_path):
+def test_a_csv_in_the_canonical_names_carries_no_parameters(tmp_path):
+    """The rows parse, but nothing in the file names a language, so it cannot be scored."""
     path = _write(tmp_path, "d.csv",
                   "source_content,target_content,reference_content\nhello,bonjour,salut\n")
-    _write(tmp_path, "d.params.json", json.dumps({"parameters": PARAMETERS, "glossary_ids": ["tb1"]}))
-    dataset = load(path, component="glossary")
-    assert len(dataset.segments) == 1
-    assert dataset.parameters["clean_target_language_code"] == "fr-fr"
+    with pytest.raises(ValueError, match="source_language"):
+        load(path, component="glossary")
 
 
-MXLIFF = """<?xml version="1.0" encoding="utf-8"?>
-<xliff version="1.2" xmlns="urn:oasis:names:tc:xliff:document:1.2">
-  <file source-language="en-gb" target-language="fr-fr">
-    <body>
-      <trans-unit id="1"><source>The brake pad.</source><target>La plaquette de frein.</target>
-        <alt-trans origin="machine-trans"><target>La plaquette.</target></alt-trans></trans-unit>
-      <trans-unit id="2"><source>Empty target.</source><target></target>
-        <alt-trans origin="machine-trans"><target>Cible vide.</target></alt-trans></trans-unit>
-      <trans-unit id="3"><source>Accented</source><target>Café</target>
-        <alt-trans origin="machine-trans"><target>Cafe</target></alt-trans></trans-unit>
-      <trans-unit id="4"><source>Confirmed by hand.</source><target>Saisi à la main.</target></trans-unit>
-    </body>
-  </file>
-</xliff>
-"""
+def test_only_csv_and_json_are_datasets(tmp_path):
+    """A folder may hold working files beside its datasets, and only the two formats are read."""
+    for name in ("a.json", "b.csv", "notes.txt", "job.mxliff", "job.xliff", "sheet.xlsx"):
+        _write(tmp_path, name, "{}")
+
+    found = find_datasets(str(tmp_path), variable="GLOSSARY_PATH")
+
+    assert [path.name for path in found] == ["a.json", "b.csv"]
 
 
-def test_parse_mxliff_reads_proposal():
-    segments = parse_mxliff(MXLIFF)
-    # Unit 2 has an empty target and unit 4, typed by hand, carries no machine proposal.
-    assert segments[0]["target_content"] == "La plaquette."
-    assert segments[0]["reference_content"] == "La plaquette de frein."
-    assert segments[1]["target_content"] == "Cafe"
-    assert segments[1]["reference_content"] == "Café"
+def test_another_format_named_outright_is_refused(tmp_path):
+    path = _write(tmp_path, "job.mxliff", "<xliff/>")
 
-
-def test_load_mxliff_end_to_end(tmp_path):
-    path = _write(tmp_path, "job.mxliff", MXLIFF)
-    _write(tmp_path, "job.params.json", json.dumps({"parameters": PARAMETERS, "glossary_ids": ["tb1"]}))
-    dataset = load(path, component="glossary")
-    assert dataset.name == "job"
-    assert len(dataset.segments) == 2
+    with pytest.raises(ValueError, match="Unsupported dataset format"):
+        load(path, component="glossary")
 
 
 # the HTTP boundary
@@ -582,6 +553,22 @@ def test_preflight_reports_every_problem_at_once():
     assert len(problems) == 4
 
 
+def test_preflight_names_the_tasks_a_problem_is_in():
+    """A file covering many jobs would otherwise repeat one problem once per task."""
+    tasks = [Task(GOOD, []), Task({**GOOD, "cat_tool_provider": ""}, [])]
+    problems = preflight_tasks(tasks, preflight_parameters)
+
+    assert len(problems) == 1
+    assert "cat_tool_provider" in problems[0] and "in 1 of 2 tasks" in problems[0]
+
+
+def test_preflight_leaves_a_problem_every_task_shares_unqualified():
+    tasks = [Task({**GOOD, "cat_tool_provider": ""}, []) for _ in range(3)]
+    assert preflight_tasks(tasks, preflight_parameters) == preflight_parameters(
+        {**GOOD, "cat_tool_provider": ""}
+    )
+
+
 def test_preflight_requires_tempo_task_id():
     """Without it post-mt fails every segment before any step runs, returning no APE text."""
     problems = preflight_parameters({**GOOD, "tempo_task_id": ""})
@@ -672,7 +659,7 @@ def test_revert_posts_source_and_target_pairs_to_v1_revert():
 
 
 def test_segments_are_identified_by_index():
-    """mxliff units can have no id and CSV ids can repeat, so the index is the only reliable key."""
+    """A dataset may carry no id and CSV ids can repeat, so the index is the only reliable key."""
     captured = {}
 
     def handler(request):
@@ -1330,3 +1317,56 @@ def test_missing_dnt_url_is_config(
 
     assert run.main(["--dry-run"]) == 2
     assert "DNT_BASE_URL" in capsys.readouterr().err
+
+
+# a dataset covering several jobs
+
+def _two_task_dataset():
+    first = {"source_language": "en-gb", "target_language": "fr-fr", "cat_project_id": "P1"}
+    second = {**first, "target_language": "fr-ca", "cat_project_id": "P2"}
+    return Dataset(
+        name="mixed",
+        component="tags",
+        parameters={"source_language": "en-gb"},
+        tasks=[
+            Task(normalize_language(first), [{"source_segment_id": "a"}]),
+            Task(normalize_language(second), [{"source_segment_id": "b"}, {"source_segment_id": "c"}]),
+        ],
+    )
+
+
+def test_segments_read_in_task_order():
+    dataset = _two_task_dataset()
+    assert [s["source_segment_id"] for s in dataset.segments] == ["a", "b", "c"]
+
+
+def test_a_parameter_is_carried_per_segment_from_its_own_task():
+    """Scoring reads the language of the task a segment was sent in, not the file's."""
+    assert _two_task_dataset().per_segment("clean_target_language_code") == [
+        "fr-fr", "fr-ca", "fr-ca",
+    ]
+
+
+def test_each_task_is_submitted_on_its_own_parameters():
+    """post-mt finds the term bases through these, so one submission cannot carry two sets."""
+    submitted = []
+
+    class Recorder:
+        def run(self, *, parameters, segments, steps, on_progress):
+            submitted.append((parameters["cat_project_id"], len(segments)))
+            return RunResult(task_id="t", segments=list(segments), error=None)
+
+    run_pipeline(Recorder(), _two_task_dataset(), batch_size=50)
+    assert submitted == [("P1", 1), ("P2", 2)]
+
+
+def test_a_batch_never_spans_two_tasks():
+    submitted = []
+
+    class Recorder:
+        def run(self, *, parameters, segments, steps, on_progress):
+            submitted.append((parameters["cat_project_id"], len(segments)))
+            return RunResult(task_id="t", segments=list(segments), error=None)
+
+    run_pipeline(Recorder(), _two_task_dataset(), batch_size=2)
+    assert submitted == [("P1", 1), ("P2", 2)]

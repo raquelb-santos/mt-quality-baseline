@@ -72,6 +72,19 @@ def preflight_parameters(parameters: dict[str, Any]) -> list[str]:
     return problems
 
 
+def preflight_tasks(tasks: Sequence[Any], check: Callable[[dict[str, Any]], list[str]]) -> list[str]:
+    """Each task is submitted on its own parameters, so each is checked and named once."""
+    counts: dict[str, int] = {}
+    for task in tasks:
+        for problem in check(task.parameters):
+            counts[problem] = counts.get(problem, 0) + 1
+
+    return [
+        problem if count == len(tasks) else f"{problem} - in {count} of {len(tasks)} tasks"
+        for problem, count in counts.items()
+    ]
+
+
 def raise_for_preflight(problems: list[str], message: str) -> None:
     if problems:
         for problem in problems:

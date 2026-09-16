@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .text_processing import Dataset, load
-from .postmt import Usage, preflight_submission, raise_for_preflight, segment_error
+from .postmt import Usage, preflight_submission, preflight_tasks, raise_for_preflight, segment_error
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ def load_dataset(path: Path, *, component: str, dry_run: bool) -> Dataset:
 
     if not dry_run:
         raise_for_preflight(
-            preflight_submission(data.parameters),
+            preflight_tasks(data.tasks, preflight_submission),
             "Preflight failed: post-mt would reject every segment, so there would be no "
             "APE column to score. Fix the parameters above.",
         )
@@ -34,20 +34,27 @@ def load_dataset(path: Path, *, component: str, dry_run: bool) -> Dataset:
 
 
 def run_pipeline(postmt: Any, dataset: Dataset, *, batch_size: int) -> PipelineOutcome:
-    segments = dataset.segments
-    batches = [segments[i : i + batch_size] for i in range(0, len(segments), batch_size)]
-    logger.info("[PIPELINE] %d segments in %d batch(es)", len(segments), len(batches))
+    # A batch never spans two tasks: post-mt takes one parameter set per submission.
+    batches = [
+        (task, task.segments[i : i + batch_size])
+        for task in dataset.tasks
+        for i in range(0, len(task.segments), batch_size)
+    ]
+    logger.info(
+        "[PIPELINE] %d segments in %d batch(es) across %d task(s)",
+        len(dataset.segments), len(batches), len(dataset.tasks),
+    )
 
     processed: list[dict[str, Any]] = []
     usage = Usage()
 
-    for number, batch in enumerate(batches, start=1):
+    for number, (task, batch) in enumerate(batches, start=1):
         def on_progress(body: dict[str, Any], _n: int = number) -> None:
             percent = (body.get("progress") or {}).get("percent", 0)
             logger.info("[PIPELINE] batch %d/%d - %s%%", _n, len(batches), percent)
 
         result = postmt.run(
-            parameters=dataset.parameters,
+            parameters=task.parameters,
             # REF is the answer key, dropped so it can never reach post-mt.
             segments=[
                 {k: v for k, v in segment.items() if k != "reference_content"}

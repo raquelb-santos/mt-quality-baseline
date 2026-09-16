@@ -49,9 +49,7 @@ python sourcecode/run.py --dry-run
 `pip install -e .` also puts the same entry point on the path as `mt-quality-baseline`.
 
 What a run scores is configured in `.env`, as `GLOSSARY_PATH`, `DNT_PATH` and `TAGS_PATH`.
-Each may name a dataset file or a folder of them (`.json`,
-`.csv`, `.mxliff`, `.xliff`, `.xlf`). A file that cannot describe itself needs a `<name>.params.json`
-beside it giving its own `parameters`, `steps` and `glossary_ids`.
+Each may name a dataset file or a folder of them (`.json` or `.csv`).
 Components are configured separately because pooling adds counts within a stratum.
 
 A run prints each component's scorecard as it is measured and writes one Markdown report under
@@ -100,6 +98,15 @@ pipeline that actually runs rather than a reimplementation of it.
 Terms come from the **term-bases index**, selected with the same Elasticsearch query post-mt sends,
 so both resolve the same terms from the same data. Which term bases are queried is pinned per dataset
 as `glossary_ids`.
+
+A CAT export is one row per segment, recognised by its header rather than by its extension. It is
+read by the columns `SEGMENTID`, `SOURCECONTENT`, `TARGETCONTENT` and `HUMAN_TARGET`, where
+`TARGETCONTENT` is the MT being scored and `HUMAN_TARGET` the human reference. 
+
+`ISOSOURCELANGUAGE`, `ISOTARGETLANGUAGE`, `CATTOOL`, `CATPROJECTID`, `TEMPOTASKCODE`,
+`DOMAIN` and `OPERATION` describe the job rather than the text, and become the
+dataset's parameters.
+
 
 ### Metrics
 
