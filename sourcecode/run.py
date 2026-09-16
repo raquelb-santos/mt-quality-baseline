@@ -12,8 +12,9 @@ if __package__ in (None, ""):
 
 from sourcecode import dnt_benchmark, dnt_report, glossary_benchmark, glossary_report, pipeline, report, tags_benchmark, tags_report, text_processing
 from sourcecode.config import PATH_VARIABLES, Config
+from sourcecode.cat_tool import PhraseClient, TermBaseResolver, XtmClient
 from sourcecode.dnt import DntClient
-from sourcecode.glossary import GlossaryClient
+from sourcecode.glossary import CatToolGlossary
 from sourcecode.postmt import PostMtClient, StanzaClient
 
 
@@ -114,32 +115,41 @@ def main(argv: list[str] | None = None) -> int:
         print(error, file=sys.stderr)
         return 2
 
-    stanza = glossary = dnt = postmt = None
+    stanza = glossary = term_bases = dnt = postmt = None
 
     try:
         if "glossary" in components:
-            search = config.search_engine
-            if search.aws_sigv4 and not search.aws_region:
-                print("ES_AWS_SIGV4_ENABLED is set but AWS_REGION is not.", file=sys.stderr)
-                return 2
-
-            if not search.node:
-                print("Set SEARCH_ENGINE_URL to the term-bases index post-mt queries.",
-                      file=sys.stderr)
-                return 2
-
             if not config.stanza.base_url:
                 print("Set STANZA_BASE_URL to the lemmatizer.", file=sys.stderr)
                 return 2
 
-            stanza = StanzaClient(config.stanza.base_url, config.stanza.timeout)
-            glossary = GlossaryClient(
-                search.node, search.username, search.password, search.timeout,
-                search.aws_region if search.aws_sigv4 else None, search.aws_profile,
-            )
-            if not glossary.ping():
-                print(f"Search engine unreachable at {search.node}.", file=sys.stderr)
-                return 1
+            # Terms are read from the CAT tool the task names, so without one there is no glossary.
+            if not (config.phrase.configured or config.xtm.configured):
+                print(
+                    "Set PHRASE_BASE_URL/PHRASE_USERNAME/PHRASE_PASSWORD or "
+                    "XTM_BASE_URL/XTM_CLIENT/XTM_USER_ID/XTM_PASSWORD. Terminology reads its "
+                    "terms from the CAT tool that holds the project's term bases.",
+                    file=sys.stderr,
+                )
+                return 2
+
+            stanza = StanzaClient(config.stanza.base_url, config.stanza.timeout, config.stanza.batch_size)
+            phrase = PhraseClient(
+                config.phrase.base_url, config.phrase.username, config.phrase.password,
+                config.phrase.timeout,
+            ) if config.phrase.configured else None
+            xtm = XtmClient(
+                config.xtm.base_url, config.xtm.client, config.xtm.user_id,
+                config.xtm.password, config.xtm.timeout,
+            ) if config.xtm.configured else None
+
+            term_bases = TermBaseResolver(phrase=phrase, xtm=xtm)
+            glossary = CatToolGlossary(stanza, phrase=phrase, xtm=xtm)
+
+            for name, configured in (("Phrase/Memsource", config.phrase.configured),
+                                     ("XTM", config.xtm.configured)):
+                if not configured:
+                    logging.warning("[BENCH] %s is not configured - its tasks retrieve no glossary", name)
 
         if "dnt" in components:
             if not config.dnt.base_url:
@@ -189,8 +199,7 @@ def main(argv: list[str] | None = None) -> int:
                 logging.info("[BENCH] loading %s", path)
                 data = (
                     glossary_benchmark.load_dataset(
-                        path, glossary=glossary, node=config.search_engine.node,
-                        dry_run=args.dry_run, languages=languages,
+                        path, term_bases=term_bases, dry_run=args.dry_run, languages=languages,
                     )
                     if component == "glossary" else
                     pipeline.load_dataset(
@@ -203,8 +212,8 @@ def main(argv: list[str] | None = None) -> int:
 
                 if component == "glossary":
                     scored = glossary_benchmark.run_benchmark(
-                        data, postmt=postmt, stanza=stanza, glossary=glossary, config=config,
-                        skip_pipeline=args.dry_run,
+                        data, postmt=postmt, stanza=stanza, glossary=glossary,
+                        term_bases=term_bases, config=config, skip_pipeline=args.dry_run,
                     )
                 elif component == "dnt":
                     scored = dnt_benchmark.run_benchmark(
@@ -254,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("%s", error)
         return 1
     finally:
-        for client in (stanza, glossary, dnt, postmt):
+        for client in (stanza, glossary, term_bases, dnt, postmt):
             if client is not None:
                 client.close()
 

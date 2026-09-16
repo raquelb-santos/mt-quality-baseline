@@ -64,6 +64,7 @@ class PostMtConfig:
 class StanzaConfig:
     base_url: str = _env("STANZA_BASE_URL")
     timeout: float = 120.0
+    batch_size: int = 200
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,31 @@ class SearchEngineConfig:
     aws_sigv4: bool = _env_bool("ES_AWS_SIGV4_ENABLED")
     aws_region: str | None = _env("AWS_REGION")
     aws_profile: str | None = _env("AWS_PROFILE")
+
+
+@dataclass(frozen=True)
+class PhraseConfig:
+    base_url: str | None = _env("PHRASE_BASE_URL")
+    username: str | None = _env("PHRASE_USERNAME")
+    password: str | None = _env("PHRASE_PASSWORD")
+    timeout: float = 120.0
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.base_url and self.username and self.password)
+
+
+@dataclass(frozen=True)
+class XtmConfig:
+    base_url: str | None = _env("XTM_BASE_URL")
+    client: str | None = _env("XTM_CLIENT")
+    user_id: str | None = _env("XTM_USER_ID")
+    password: str | None = _env("XTM_PASSWORD")
+    timeout: float = 120.0
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.base_url and self.client and self.user_id and self.password)
 
 
 @dataclass(frozen=True)
@@ -107,5 +133,7 @@ class Config:
     postmt: PostMtConfig = field(default_factory=PostMtConfig)
     stanza: StanzaConfig = field(default_factory=StanzaConfig)
     search_engine: SearchEngineConfig = field(default_factory=SearchEngineConfig)
+    phrase: PhraseConfig = field(default_factory=PhraseConfig)
+    xtm: XtmConfig = field(default_factory=XtmConfig)
     dnt: DntConfig = field(default_factory=DntConfig)
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)

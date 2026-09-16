@@ -1,10 +1,11 @@
 """Rendering for the terminology component: one row builder feeds the file and the terminal."""
 
+from collections import Counter
 from typing import Any, Sequence
 
-from .report import Scorecard, by_stratum, cell, delta as delta_of, failure_warning, pct, rate, scope_note, signed_pct, spend_fact, subheading_of, table
+from .report import Scorecard, by_language_pair, cell, delta as delta_of, failure_warning, pct, rate, scope_note, signed_pct, subheading_of, table
 from .glossary_benchmark import Result
-from .glossary_score import bucket_of, pool, pool_violations
+from .glossary_score import aggregate, bucket_of, pool, pool_violations
 
 VERSIONS = ("mt", "ape")
 
@@ -18,15 +19,13 @@ def scorecard(result: Result) -> Scorecard:
     totals, delta = result.totals, result.delta
     mt_v, ape_v = result.mt_violations, result.ape_violations
     check = result.ref_check
+    rows = term_rows(result)
+    buckets = [Counter(row[f"{v}_bucket"] for row in rows) for v in VERSIONS]
 
     warnings = failure_warning(result)
     never_shown = totals["segments_glossary_never_shown"]
     if never_shown:
-        warnings.append(
-            f"post-mt was shown no glossary on {never_shown}/{totals['segments_with_glossary']}"
-            " segments where terms were resolved, so the APE column is not a measurement of"
-            " terminology adherence. Check cat_project_id, cat_tool_provider and ecosystem_id."
-        )
+        warnings.append(f"post-mt reported no glossary on {never_shown}/{totals['segments_with_glossary']} segments with terms.")
     if not result.config["lemma_matching"]:
         warnings.append("Lemma matching disabled")
 
@@ -51,23 +50,20 @@ def scorecard(result: Result) -> Scorecard:
         " glossary terms"
         + (f" · {check.to_review} to review in {check.segments_to_review} segments"
            if check.items else ""),
-        f"Terms {mt.terms.distinct_terms} distinct"
-        f" · matched {mt.terms.matched_ref} → {ape.terms.matched_ref}"
-        f" · partly {mt.terms.used_partly} → {ape.terms.used_partly}"
-        f" · never {mt.terms.never_used} → {ape.terms.never_used}"
-        f" · over-used {mt.terms.over_used} → {ape.terms.over_used}",
+        f"Terms {len(rows)} distinct"
+        + "".join(f" · {bucket} {' → '.join(str(b[bucket]) for b in buckets)}"
+                  for bucket in ("matched", "partly", "never", "over-used")),
         f"APE repaired {delta.terms_fixed_by_ape} · broke {delta.terms_broken_by_ape}",
         *scope_note(mt.segments_scored, totals["segments_with_glossary"],
                     "REF rendered no glossary term in the rest"),
     ]
 
     # Over-use is adherent by the cap, so say so: it is a worklist item, not a miss.
-    if mt.terms.over_used or ape.terms.over_used:
+    if any(b["over-used"] for b in buckets):
         facts.append("over-used terms are flagged for review, never counted as violations")
 
-    facts += spend_fact(result.usage)
-
-    return Scorecard(heading="glossary", subheading=subheading_of(result), facts=facts, warnings=warnings)
+    return Scorecard(heading="glossary", dataset=result.dataset, subheading=subheading_of(result),
+                     facts=facts, warnings=warnings)
 
 
 def _bucket(rendered: int, expected: int) -> str:
@@ -123,6 +119,7 @@ def term_rows(result: Result) -> list[dict[str, Any]]:
             "ape_adherent": entry["ape_adherent"] if expected else "",
             "ape_rendered": entry["ape_rendered"],
             "mt_violations": entry["mt_violations"] if expected else "",
+            "mt_bucket": _bucket(entry["mt_rendered"], expected),
             # Against the uncapped count, so the term the cap folded away is still reviewable.
             "ape_bucket": _bucket(entry["ape_rendered"], expected),
             "ape_violations": entry["ape_violations"] if expected else "",
@@ -180,7 +177,7 @@ def render_comparison(results: Sequence[Result]) -> str:
     if len(results) < 2:
         return ""
 
-    lines = ["## Across datasets", ""]
+    lines = ["### Across datasets", ""]
     for result in results:
         lines.append(
             f"- {result.dataset} · {result.parameters['source_language']}"
@@ -192,67 +189,63 @@ def render_comparison(results: Sequence[Result]) -> str:
     return "\n".join([*lines, ""])
 
 
-def _pooled(group: Sequence[Result]) -> tuple[Any, Any, Any, Any]:
-    return (
-        pool([r.mt for r in group]),
-        pool([r.ape for r in group]),
-        pool_violations([r.mt_violations for r in group]),
-        pool_violations([r.ape_violations for r in group]),
-    )
+def _measured(segments: Sequence[Any]) -> dict[str, Any]:
+    """One group's counts, aggregated from the segments themselves rather than from datasets."""
+    mt, ape = (aggregate([getattr(s, column) for s in segments]) for column in VERSIONS)
+    affected = lambda column: sum(1 for s in segments if getattr(s, column))
+    return {
+        "segments": len(segments),
+        "expected_instances": mt.expected,
+        "mt_adherence_rate": mt.adherence_rate,
+        "ape_adherence_rate": ape.adherence_rate,
+        "delta_rate": delta_of(mt.adherence_rate, ape.adherence_rate),
+        "mt_violations": sum(s.mt_corpus_violations for s in segments),
+        "ape_violations": sum(s.ape_corpus_violations for s in segments),
+        "mt_violation_rate": rate(affected("mt_corpus_violations"), len(segments)),
+        "ape_violation_rate": rate(affected("ape_corpus_violations"), len(segments)),
+    }
 
 
 def stratum_rows(results: Sequence[Result]) -> list[dict[str, Any]]:
-    """One row per stratum, with the pooled counts its rates were computed from."""
+    """One row per language pair, then one for each domain the pair was measured in."""
     rows = []
-    for (pair, domain), group in by_stratum(results).items():
-        mt, ape, mt_v, ape_v = _pooled(group)
-        rows.append({
-            "language_pair": pair,
-            "domain": domain,
-            "datasets": len(group),
-            "segments": sum(r.totals["segments"] for r in group),
-            "expected_instances": mt.expected,
-            "mt_adherence_rate": mt.adherence_rate,
-            "ape_adherence_rate": ape.adherence_rate,
-            "delta_rate": delta_of(mt.adherence_rate, ape.adherence_rate),
-            "mt_violations": mt_v.total,
-            "ape_violations": ape_v.total,
-            "mt_violation_rate": mt_v.violation_rate,
-            "ape_violation_rate": ape_v.violation_rate,
-        })
+    for pair, domains in by_language_pair(results).items():
+        rows.append({"language_pair": pair, "domain": None, "label": pair,
+                     **_measured([s for group in domains.values() for s in group])})
+        for domain, group in domains.items():
+            rows.append({"language_pair": pair, "domain": domain, "label": f"↳ {domain}",
+                         **_measured(group)})
     return rows
+
+
+def _line(label: str, row: dict[str, Any]) -> str:
+    return (
+        f"{label} · {row['expected_instances']} inst"
+        f"  ·  MT {pct(row['mt_adherence_rate'])} → APE {pct(row['ape_adherence_rate'])}"
+        f"  ({signed_pct(row['delta_rate'])})  ·  violations {row['mt_violations']} → {row['ape_violations']}"
+        f" · segments affected {pct(row['mt_violation_rate'])}"
+        f" → {pct(row['ape_violation_rate'])}"
+    )
 
 
 def _stratum_lines(results: Sequence[Result]) -> list[str]:
     """Built once so the report's bullets and the console's list cannot disagree."""
-    lines = []
-    for row in stratum_rows(results):
-        lines.append(
-            f"{row['language_pair']} · {row['domain']} · {row['expected_instances']} inst"
-            f"  ·  MT {pct(row['mt_adherence_rate'])} → APE {pct(row['ape_adherence_rate'])}"
-            f"  ({signed_pct(row['delta_rate'])})  ·  violations {row['mt_violations']} → {row['ape_violations']}"
-            f" · segments affected {pct(row['mt_violation_rate'])}"
-            f" → {pct(row['ape_violation_rate'])}"
-        )
+    rows = stratum_rows(results)
+    lines = [_line(row["label"], row) for row in rows]
 
-    if len(lines) > 1:
-        mt, ape, mt_v, ape_v = _pooled(results)
-        lines.append(
-            f"ALL · {mt.expected} inst"
-            f"  ·  MT {pct(mt.adherence_rate)} → APE {pct(ape.adherence_rate)}"
-            f"  ·  violations {mt_v.total} → {ape_v.total}"
-            f" · segments affected {pct(mt_v.violation_rate)} → {pct(ape_v.violation_rate)}"
-        )
+    if sum(1 for row in rows if row["domain"] is None) > 1:
+        segments = [s for result in results for s in result.segments]
+        lines.append(_line("ALL", _measured(segments)))
 
     return lines
 
 
 def render_strata(results: Sequence[Result]) -> str:
-    """Pooled adherence per language pair and domain."""
+    """Adherence per language pair, split by the domains inside it."""
     lines = _stratum_lines(results)
-    return "" if not lines else "\n".join(["## By stratum", "", *(f"- {l}" for l in lines), ""])
+    return "" if not lines else "\n".join(["### By language pair", "", *(f"- {l}" for l in lines), ""])
 
 
 def render_strata_console(results: Sequence[Result]) -> str:
     lines = _stratum_lines(results)
-    return "" if not lines else "\n".join(["Adherence by stratum", "", *(f"  {l}" for l in lines), ""])
+    return "" if not lines else "\n".join(["Adherence by language pair", "", *(f"  {l}" for l in lines), ""])

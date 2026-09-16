@@ -1,10 +1,13 @@
-"""Glossary resolution against the term-bases index, sending the same queries post-mt sends."""
+"""Glossary terms, read from the CAT tool that holds the project's term bases."""
 
 import logging
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
-from .search_engine import SearchClient
+import httpx
+
+from .cat_tool import PHRASE_PROVIDERS, Term, XTM_PROVIDERS
+from .text_processing import count_surface
 
 logger = logging.getLogger(__name__)
 
@@ -21,39 +24,54 @@ def language_variants(language: str) -> list[str]:
     return list(dict.fromkeys([language, str(language).split("-")[0]]))
 
 
-def as_id_list(glossary_ids: Sequence[str]) -> list[str]:
-    return [str(gid).strip() for gid in glossary_ids if str(gid).strip()]
+class CatToolGlossary:
+    """Glossary terms read from the CAT tool that holds the project's term bases.
 
+    Terms and segments are both matched on their lemmas, so an inflected wording still counts as
+    the term having been used.
+    """
 
-def _term_index(provider: str | None) -> str:
-    return "xtm-term-bases" if str(provider or "").lower() == "xtm" else "term-bases"
-
-
-class GlossaryClient:
-
-    def __init__(
-        self,
-        node: str,
-        username: str | None = None,
-        password: str | None = None,
-        timeout: float = 120.0,
-        aws_region: str | None = None,
-        aws_profile: str | None = None,
-    ) -> None:
-        self.search = SearchClient(node, username, password, timeout, aws_region, aws_profile)
+    def __init__(self, stanza: Any, phrase: Any = None, xtm: Any = None) -> None:
+        self._stanza = stanza
+        self._clients = {
+            **{provider: phrase for provider in PHRASE_PROVIDERS if phrase is not None},
+            **{provider: xtm for provider in XTM_PROVIDERS if xtm is not None},
+        }
+        self._terms: dict[tuple[str, str], list[Term]] = {}
+        self._lemmas: dict[tuple[str, str], str] = {}
 
     def close(self) -> None:
-        self.search.close()
+        """The CAT clients belong to the resolver that shares them, and are closed there."""
 
-    def ping(self) -> bool:
-        return self.search.ping()
+    def terms_in(self, term_base_id: str, provider: str) -> list[Term]:
+        provider = str(provider or "").strip().lower()
+        client = self._clients.get(provider)
+        if client is None:
+            return []
 
-    def count_terms(self, glossary_ids: Sequence[str], provider: str | None = None) -> int:
-        """Documents the index holds for these ids — 0 means the ids are not in this cluster."""
-        return self.search.count(
-            _term_index(provider),
-            {"query": {"terms": {"glossary_id": as_id_list(glossary_ids)}}},
-        )
+        key = (provider, str(term_base_id))
+        if key not in self._terms:
+            try:
+                self._terms[key] = client.terms(str(term_base_id))
+            except (httpx.HTTPError, RuntimeError, ValueError) as error:
+                logger.error("[GLOSSARY] %s could not read term base %s: %s", provider, term_base_id, error)
+                return []
+            logger.debug("[GLOSSARY] term base %s holds %d terms", term_base_id, len(self._terms[key]))
+
+        return self._terms[key]
+
+    def _lemmatize(self, texts: Sequence[str], language: str) -> list[str]:
+        """Cached across term bases and tasks, since the same term recurs throughout a run."""
+        unknown = [text for text in dict.fromkeys(texts) if (language, text) not in self._lemmas]
+        if unknown:
+            lemmas = self._stanza.lemmatize_batch_safe(unknown, language)
+            # Degrade to surface forms rather than abort, as retrieval does elsewhere.
+            if lemmas is None:
+                logger.warning("[GLOSSARY] terms not lemmatized for %s - matching surface forms", language)
+                lemmas = unknown
+            self._lemmas.update(zip(((language, text) for text in unknown), lemmas))
+
+        return [self._lemmas[(language, text)] for text in texts]
 
     def fetch_matches(
         self,
@@ -64,75 +82,41 @@ class GlossaryClient:
         texts: Sequence[str],
         provider: str | None = None,
     ) -> GlossaryMatches:
-        """Resolve glossary matches for a batch of lemmatized texts."""
-        ids = as_id_list(glossary_ids)
+        """Resolve glossary matches for a batch of lemmatized texts, against the terms the CAT
+        tool holds in the project's own term bases."""
         for value, label in (
-            (ids, "glossary IDs"), (source_language, "source language"),
+            (glossary_ids, "glossary IDs"),
+            (source_language, "source language"),
             (target_language, "target language"), (texts, "texts"),
         ):
             if not value:
                 raise ValueError(f"No {label} provided")
 
-        index = _term_index(provider)
-        per_text_source_terms = [[] for _ in texts]
-        concept_ids: set[str] = set()
+        terms = [term for identifier in glossary_ids for term in self.terms_in(identifier, provider)]
 
-        responses = self.search.msearch(index, [
-            {
-                "query": {
-                    "bool": {
-                        "filter": [
-                            {"terms": {"glossary_id": ids}},
-                            {"terms": {"language": language_variants(source_language)}},
-                        ],
-                        "must": [{"percolate": {"field": "query", "document": {"content": str(text)}}}],
-                    }
-                },
-                "size": 50,
-                "sort": ["_score"],
-            }
-            for text in texts
-        ])
+        # Permissive language matching, over the full code and the base code.
+        wanted_source = set(language_variants(source_language))
+        wanted_target = set(language_variants(target_language))
 
-        for i, response in enumerate(responses):
-            if response.get("error"):
-                logger.warning("[GLOSSARY] percolate error on text %d: %s", i, response["error"])
-                continue
-            for hit in response.get("hits", {}).get("hits", []):
-                source = hit.get("_source", {})
-                per_text_source_terms[i].append(
-                    {"term_text": source.get("term_text"), "concept_id": source.get("concept_id")}
-                )
-                concept_ids.add(source.get("concept_id"))
-
+        source_terms = [term for term in terms if term.language.lower() in wanted_source]
         targets_by_concept: dict[str, list[str]] = {}
-        if concept_ids:
-            response = self.search.search(index, {
-                "query": {
-                    "bool": {
-                        "filter": [
-                            {"terms": {"concept_id": sorted(concept_ids)}},
-                            {"terms": {"language": language_variants(target_language)}},
-                        ]
-                    }
-                },
-                "size": 1000,
-            })
-            for hit in response.get("hits", {}).get("hits", []):
-                source = hit.get("_source", {})
-                targets_by_concept.setdefault(source.get("concept_id"), []).append(
-                    source.get("term_text")
-                )
+        for term in terms:
+            if term.language.lower() in wanted_target:
+                targets_by_concept.setdefault(term.concept_id, []).append(term.text)
+
+        source_lemmas = self._lemmatize([term.text for term in source_terms], source_language)
 
         per_text_mappings = []
-        for source_terms in per_text_source_terms:
+        for text in texts:
             mappings: list[dict[str, str]] = []
             seen: set[str] = set()
-            for source in source_terms:
-                for target_text in targets_by_concept.get(source["concept_id"], []):
+            for term, lemma in zip(source_terms, source_lemmas):
+                if not count_surface(text, lemma, source_language):
+                    continue
+                for target_text in targets_by_concept.get(term.concept_id, []):
                     if target_text not in seen:
                         seen.add(target_text)
-                        mappings.append({"source_content": source["term_text"], "target_content": target_text})
+                        mappings.append({"source_content": term.text, "target_content": target_text})
             per_text_mappings.append(mappings)
 
         # Keyed on the pair, so a target two source terms reach in different texts is kept once each.

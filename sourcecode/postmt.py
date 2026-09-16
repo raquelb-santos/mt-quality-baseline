@@ -22,9 +22,8 @@ def segment_id(returned: dict[str, Any], original: dict[str, Any], index: int) -
 
 
 def reported_has_glossary(segment: dict[str, Any]) -> bool | None:
-    """post-mt nests this inside ``aqe_results``; reading the top level always yields None."""
-    nested = (segment.get("aqe_results") or {}).get("has_glossary")
-    return nested if nested is not None else segment.get("has_glossary")
+    """Read at the top level, beside ``aqe_results``; None means the task ran no AQE step."""
+    return segment.get("has_glossary")
 
 
 def segment_error(segment: dict[str, Any]) -> str | None:
@@ -65,9 +64,6 @@ def preflight_parameters(parameters: dict[str, Any]) -> list[str]:
             f"`cat_tool_provider` is {provider!r}, which post-mt does not support "
             f"(expected one of: {', '.join(sorted(SUPPORTED_CAT_TOOLS))})"
         )
-
-    if not str(parameters.get("ecosystem_id") or "").strip():
-        problems.append("`ecosystem_id` is missing or empty — post-mt skips glossary retrieval entirely")
 
     return problems
 
@@ -264,8 +260,9 @@ class PostMtClient:
 
 
 class StanzaClient:
-    def __init__(self, base_url: str, timeout: float) -> None:
+    def __init__(self, base_url: str, timeout: float, batch_size: int) -> None:
         self._client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
+        self._batch_size = batch_size
 
     def close(self) -> None:
         self._client.close()
@@ -275,22 +272,26 @@ class StanzaClient:
         if not texts:
             return []
 
-        try:
-            response = self._client.post(
-                "/lemmatize/batch", json={"texts": texts, "language": language}
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, ValueError) as error:
-            logger.warning("[STANZA] lemmatization unavailable for %s: %s", language, error)
-            return None
+        lemmas: list[str] = []
+        for start in range(0, len(texts), self._batch_size):
+            batch = texts[start : start + self._batch_size]
+            try:
+                response = self._client.post(
+                    "/lemmatize/batch", json={"texts": batch, "language": language}
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except (httpx.HTTPError, ValueError) as error:
+                logger.warning("[STANZA] lemmatization unavailable for %s: %s", language, error)
+                return None
 
-        lemmas = payload.get("lemmatized_texts") or [] if isinstance(payload, dict) else payload or []
-        if len(lemmas) != len(texts):
-            logger.warning(
-                "[STANZA] returned %d lemmas for %d texts (%s) - ignoring",
-                len(lemmas), len(texts), language,
-            )
-            return None
+            returned = payload.get("lemmatized_texts") or [] if isinstance(payload, dict) else payload or []
+            if len(returned) != len(batch):
+                logger.warning(
+                    "[STANZA] returned %d lemmas for %d texts (%s) - ignoring",
+                    len(returned), len(batch), language,
+                )
+                return None
+            lemmas.extend(returned)
 
         return lemmas

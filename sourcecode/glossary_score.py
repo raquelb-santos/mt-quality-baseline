@@ -1,6 +1,7 @@
 """The terminology adherence metric: every version is scored against the human reference."""
 
 from dataclasses import dataclass, field
+from functools import cache
 from typing import Any, Iterable, Mapping, Sequence
 
 from .text_processing import count_occurrences, normalize_text
@@ -107,20 +108,37 @@ class Score:
     violations: list[Violation] = field(default_factory=list)
 
 
-def _count_renderings(
+def _owned_counts(
     text: str,
-    targets: Sequence[str],
+    targets: Iterable[str],
     language_code: str | None,
     text_lemmas: str | None,
     term_lemmas: Mapping[str, str] | None,
-) -> int:
-    return sum(
-        count_occurrences(
+) -> dict[str, int]:
+    """Occurrences of each target outside a longer target covering it, so one wording counts once."""
+    lemma_of = term_lemmas or {}
+    found = {}
+    for target in dict.fromkeys(targets):
+        count = count_occurrences(
             text=text, term=target, language_code=language_code,
-            text_lemmas=text_lemmas, term_lemmas=(term_lemmas or {}).get(target),
+            text_lemmas=text_lemmas, term_lemmas=lemma_of.get(target),
         )
-        for target in targets
-    )
+        if count:
+            found[target] = count
+
+    # Longest first, so each target subtracts only what the longer ones kept for themselves.
+    owned: dict[str, int] = {}
+    for target in sorted(found, key=lambda t: len(normalize_text(t)), reverse=True):
+        form = normalize_text(target)
+        covered = sum(
+            kept * count_occurrences(
+                text=longer, term=target, language_code=language_code,
+                text_lemmas=lemma_of.get(longer), term_lemmas=lemma_of.get(target),
+            )
+            for longer, kept in owned.items() if normalize_text(longer) != form
+        )
+        owned[target] = max(found[target] - covered, 0)
+    return owned
 
 
 def score_glossary(
@@ -135,15 +153,15 @@ def score_glossary(
 ) -> Score:
     """Score one translation of a segment against REF for that same segment."""
     result = Score()
+    glossary_map = build_glossary_map(mappings)
+    targets_here = [target for targets in glossary_map.values() for target in targets]
+    in_ref = _owned_counts(ref_text, targets_here, language_code, ref_lemmas, term_lemmas)
+    in_text = _owned_counts(text, targets_here, language_code, text_lemmas, term_lemmas)
 
-    for source, targets in build_glossary_map(mappings).items():
+    for source, targets in glossary_map.items():
         expected_targets = sorted(targets)
-        expected_n = _count_renderings(
-            ref_text, expected_targets, language_code, ref_lemmas, term_lemmas
-        )
-        rendered = _count_renderings(
-            text, expected_targets, language_code, text_lemmas, term_lemmas
-        )
+        expected_n = sum(in_ref.get(target, 0) for target in expected_targets)
+        rendered = sum(in_text.get(target, 0) for target in expected_targets)
         # Neither the human nor this translation used the term: no denominator, nothing to score.
         if expected_n == 0 and rendered == 0:
             continue
@@ -253,68 +271,65 @@ class ViolationReport:
     items: list[Violation] = field(default_factory=list)
 
 
-def _rendered_variants(
-    text: str,
-    targets: Sequence[str],
-    normalized_text: str,
-    normalized_lemmas: str,
-    language_code: str | None,
-    text_lemmas: str | None,
-    term_lemmas: Mapping[str, str] | None,
-) -> list[str]:
-    """Collapsed so one rendering never reads as two: case and spacing variants, and substrings."""
-    found: dict[str, str] = {}
-    for target in targets:
-        lemma = (term_lemmas or {}).get(target)
-        # Necessary for either mode and far cheaper: every term is tested against every segment.
-        if normalize_text(target) not in normalized_text and not (
-            lemma and normalized_lemmas and normalize_text(lemma) in normalized_lemmas
-        ):
-            continue
-        if count_occurrences(
-            text=text, term=target, language_code=language_code,
-            text_lemmas=text_lemmas, term_lemmas=lemma,
-        ):
-            found.setdefault(normalize_text(target), target)
-
-    return [
-        target for form, target in found.items()
-        if not any(other != form and form in other for other in found)
-    ]
-
-
 def find_violations(
     *,
     versions: Sequence[Sequence[str]],
     ref_texts: Sequence[str],
+    source_texts: Sequence[str],
     per_segment_mappings: Sequence[Iterable[Mapping[str, str]]],
     corpus_mappings: Iterable[Mapping[str, str]],
-    language_code: str | None,
-    text_lemmas: Mapping[str, str] | None = None,
-    term_lemmas: Mapping[str, str] | None = None,
+    language_codes: Sequence[str | None],
+    source_language_codes: Sequence[str | None],
+    lemmas_by_language: Mapping[str, Mapping[str, str]] | None = None,
 ) -> list[ViolationReport]:
     """One report per version. What REF rendered is the same for all of them, so it is derived
     once here rather than re-scanned for every version."""
     for texts in versions:
-        if not (len(texts) == len(ref_texts) == len(per_segment_mappings)):
+        lengths = {len(texts), len(ref_texts), len(source_texts), len(per_segment_mappings),
+                   len(language_codes), len(source_language_codes)}
+        if len(lengths) > 1:
             raise ValueError(
-                f"{len(texts)} texts, {len(ref_texts)} references and "
-                f"{len(per_segment_mappings)} segments of mappings must be the same length"
+                f"{len(texts)} texts, {len(ref_texts)} references, {len(source_texts)} sources, "
+                f"{len(per_segment_mappings)} segments of mappings, {len(language_codes)} "
+                f"language codes and {len(source_language_codes)} source language codes "
+                "must be the same length"
             )
 
     corpus_map = build_glossary_map(corpus_mappings)
 
-    def variants_in(text: str) -> dict[str, list[str]]:
-        lemmas = (text_lemmas or {}).get(text)
-        normalized_text = normalize_text(text)
-        normalized_lemmas = normalize_text(lemmas)
-        return {
-            source: _rendered_variants(
-                text, sorted(targets), normalized_text, normalized_lemmas, language_code,
-                text_lemmas=lemmas, term_lemmas=term_lemmas,
-            )
-            for source, targets in corpus_map.items()
-        }
+    def variants_in(text: str, index: int, sources: Iterable[str]) -> dict[str, list[str]]:
+        """Each source's wordings in `text`, with only these sources' targets competing for overlaps."""
+        known = (lemmas_by_language or {}).get(language_codes[index]) or {}
+        lemmas = known.get(text)
+        normalized_text, normalized_lemmas = normalize_text(text), normalize_text(lemmas)
+        sources = list(sources)
+        # Necessary for either mode and far cheaper: every term is tested against every segment.
+        candidates = [
+            target for source in sources for target in corpus_map[source]
+            if normalize_text(target) in normalized_text
+            or (known.get(target) and normalized_lemmas
+                and normalize_text(known[target]) in normalized_lemmas)
+        ]
+        owned = _owned_counts(text, candidates, language_codes[index], lemmas, known)
+
+        variants = {}
+        for source in sources:
+            # Case and spacing variants of one wording are one rendering.
+            forms: dict[str, str] = {}
+            for target in sorted(corpus_map[source]):
+                if owned.get(target):
+                    forms.setdefault(normalize_text(target), target)
+            variants[source] = list(forms.values())
+        return variants
+
+    @cache
+    def in_source(index: int, source: str) -> bool:
+        known = (lemmas_by_language or {}).get(source_language_codes[index]) or {}
+        text = source_texts[index]
+        return bool(count_occurrences(
+            text=text, term=source, language_code=source_language_codes[index],
+            text_lemmas=known.get(text), term_lemmas=known.get(source),
+        ))
 
     # Version-independent, so none of this is redone per version.
     segment_maps = [build_glossary_map(mappings) for mappings in per_segment_mappings]
@@ -323,10 +338,13 @@ def find_violations(
         {m.get("source_content") for m in mappings if m.get("source_content")}
         for mappings in per_segment_mappings
     ]
-    in_reference = [variants_in(ref_text) for ref_text in ref_texts]
+    in_reference = [
+        variants_in(ref_text, index, segment_maps[index]) for index, ref_text in enumerate(ref_texts)
+    ]
     ref_licensed = [
-        {normalize_text(variant) for variants in reference.values() for variant in variants}
-        for reference in in_reference
+        {normalize_text(variant)
+         for variants in variants_in(ref_text, index, corpus_map).values() for variant in variants}
+        for index, ref_text in enumerate(ref_texts)
     ]
 
     reports = []
@@ -336,14 +354,12 @@ def find_violations(
         for index, text in enumerate(texts):
             segment_map = segment_maps[index]
             reference = in_reference[index]
-            found = variants_in(text)
+            # Retrieved terms compete only with each other, as they do in score_glossary.
+            found = variants_in(text, index, segment_map)
 
             # Any wording the reference used, plus any a term retrieved here sanctions.
             licensed = ref_licensed[index] | {
-                normalize_text(variant)
-                for source, variants in found.items()
-                if source in segment_map
-                for variant in variants
+                normalize_text(variant) for variants in found.values() for variant in variants
             }
 
             for source in segment_map:
@@ -361,8 +377,9 @@ def find_violations(
                         report.items.append(
                             Violation(source, INCONSISTENCY, segment_index=index, detail=variant))
 
-            for source, used in found.items():
-                if source in retrieved_per_segment[index]:
+            for source, used in variants_in(text, index, corpus_map).items():
+                # A source term the segment carries is a retrieval gap, not the translation's doing.
+                if not used or source in retrieved_per_segment[index] or in_source(index, source):
                     continue
                 for variant in used:
                     if normalize_text(variant) not in licensed:
@@ -399,19 +416,25 @@ def check_reference(
     *,
     ref_texts: Sequence[str],
     per_segment_mappings: Sequence[Iterable[Mapping[str, str]]],
-    language_code: str | None,
-    text_lemmas: Mapping[str, str] | None = None,
-    term_lemmas: Mapping[str, str] | None = None,
+    language_codes: Sequence[str | None],
+    lemmas_by_language: Mapping[str, Mapping[str, str]] | None = None,
 ) -> ReferenceCheck:
     """Indicative only: percolation also retrieves terms whose sense does not apply here."""
     check = ReferenceCheck()
 
     for index, text in enumerate(ref_texts):
-        lemmas = (text_lemmas or {}).get(text)
-        for source, targets in build_glossary_map(per_segment_mappings[index]).items():
+        language_code = language_codes[index]
+        known = (lemmas_by_language or {}).get(language_code) or {}
+        lemmas = known.get(text)
+        glossary_map = build_glossary_map(per_segment_mappings[index])
+        owned = _owned_counts(
+            text, [target for targets in glossary_map.values() for target in targets],
+            language_code, lemmas, known,
+        )
+        for source, targets in glossary_map.items():
             expected_targets = sorted(targets)
             check.terms_checked += 1
-            if _count_renderings(text, expected_targets, language_code, lemmas, term_lemmas):
+            if any(owned.get(target) for target in expected_targets):
                 check.terms_rendered += 1
             else:
                 check.items.append(Violation(

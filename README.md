@@ -99,9 +99,13 @@ pipeline that actually runs rather than a reimplementation of it.
 
 ## Terminology adherence
 
-Terms come from the **term-bases index**, selected with the same Elasticsearch query post-mt sends,
-so both resolve the same terms from the same data. Which term bases are queried is pinned per dataset
-as `glossary_ids`.
+Terms come from the **CAT tool that owns them**. The tool named in `cat_tool_provider` is asked
+which term bases are attached to `cat_project_id` — `v1/projects/{id}/termBases` in Phrase, the
+project's `termCustomerIds` in XTM — and then for the terms those term bases hold.
+
+Terms and segments are both lemmatized
+through Stanza and matched on the lemmas, which is what percolating the term-bases index does, and
+the source language matches permissively over the full code and the base code.
 
 A CAT export is one row per segment, recognised by its header rather than by its extension. It is
 read by the columns `SEGMENTID`, `SOURCECONTENT`, `TARGETCONTENT` and `HUMAN_TARGET`, where
@@ -127,6 +131,9 @@ adherence_rate     = adherent_instances / expected_instances
 
 violations         = expected_instances - adherent_instances
 ```
+
+Where one target sits inside a longer one, as `crédito` sits inside `mercado de crédito`, an
+occurrence of the longer wording counts for the longer term alone.
 
 The rate is never averaged. At every grain it is recomputed from the pooled counts, so a term
 matched once cannot outweigh the same term matched forty times. It is reported again **term by
@@ -158,7 +165,8 @@ Everything below is reported for **MT** and for **APE**:
     that segment, but not the wording the reference used there.
 
   * **over-application** — output carries a target that the glossary did not propose in that
-    segment, and the reference did not use that wording there either.
+    segment, for a term the source does not contain, and the reference did not use that wording
+    there either.
 
 * **Violation rate** — segments carrying at least one violation, over *every* segment. Several
   violations in one segment count once.
@@ -326,22 +334,22 @@ Create a `.env` in the repo root with the following variables:
 | `POSTMT_BASE_URL`                                     | post-mt instance to drive                                                                                                                                                               |
 | `POSTMT_API_KEY`                                      | sent as `X-API-KEY`                                                                                                                                                                     |
 | `STANZA_BASE_URL`                                     | Stanza lemmatizer, `https://stanza.acolad.build` — no credential                                                                                                                        |
-| `SEARCH_ENGINE_URL`                                   | term-bases index                                                                                                                                                                        |
 | `SEARCH_ENGINE_USERNAME` / `SEARCH_ENGINE_PASSWORD`   | HTTP basic auth, if the cluster uses it                                                                                                                                                 |
+| `PHRASE_BASE_URL` / `PHRASE_USERNAME` / `PHRASE_PASSWORD` | the Phrase TMS that says which term bases a Memsource or Phrase project has                                                                                                        |
+| `XTM_BASE_URL` / `XTM_CLIENT` / `XTM_USER_ID` / `XTM_PASSWORD` | the same for XTM projects                                                                                                                                                     |
 | `GLOSSARY_PATH` / `DNT_PATH` / `TAGS_PATH`            | the single source of what each component scores — a dataset file, or a folder of that component's datasets                                                                              |
 | `BENCH_COMPONENT`                                     | which components a run measures, one or more of `glossary`, `dnt` and `tags`                                                                                                            |
 | `BENCH_LANGUAGE`                                      | which language pairs each component scores, one slot per `BENCH_COMPONENT` entry and blank for all of them — `en_es`, or `en-gb_es-es` to pin the regions                               |
 | `DNT_BASE_URL` / `DNT_API_KEY`                        | the DNT service and its key, sent as `X-Api-Key` — note the casing, post-mt's own key is not accepted                                                                                   |
 | `ES_AWS_SIGV4_ENABLED` / `AWS_REGION` / `AWS_PROFILE` | sign requests with AWS SigV4 instead — required by AWS-managed domains, which reject basic auth. Needs `pip install -e ".[aws]"` and a live login (`aws sso login --profile <profile>`) |
 
-The *APE* column only means anything if post-mt was shown the same terms, and it finds them by
-asking the CAT tool which term bases are attached to `cat_project_id`. Every component therefore
-requires **`tempo_task_id`** and **`cat_project_id`**. Terminology also
-requires **`cat_tool_provider`** and **`ecosystem_id`**, without which retrieval is skipped and APE
-runs blind. Before any segment is billed, terminology checks that the ids in `glossary_ids` exist in
-the term-bases index, and that these fields are present and name a CAT tool post-mt supports. Either
-failure stops the run. A well-formed `cat_project_id` naming no real project passes both checks and
-still retrieves nothing, and that case surfaces only once the dataset has been billed, as a
-scorecard warning raised from the `has_glossary` flag post-mt returns. Both ids come from the CAT
-tool and cannot be invented, and the term base named in `glossary_ids` has to be attached to that
-project.
+*APE* column only means anything if post-mt was shown the same terms, and post-mt
+finds them by asking the CAT tool which term bases are attached to `cat_project_id`. Terminology
+therefore also requires **`cat_project_id`** and **`cat_tool_provider`**, and needs one of the two
+CAT tools configured, since the CAT tool holds both the list of term bases and the terms themselves.
+Before any segment is billed, a run checks that these fields are present and that
+`cat_tool_provider` names a CAT tool post-mt supports, and a failure stops the run. A dataset none
+of whose projects has a term base attached, such as a well-formed `cat_project_id` naming no real
+project, is skipped with a warning before it is billed. A glossary the benchmark found but post-mt
+did not retrieve surfaces only once the dataset has been billed, as a scorecard warning raised from
+the `has_glossary` flag post-mt returns. Both ids come from the CAT tool and cannot be invented.

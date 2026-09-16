@@ -3,8 +3,8 @@
 from dataclasses import dataclass, field
 import pytest
 
-from sourcecode.text_processing import Dataset, normalize_language
-from sourcecode.report import by_stratum, pct, stratum_of
+from sourcecode.text_processing import Dataset, Task, normalize_language
+from sourcecode.report import by_language_pair, pct, stratum_of
 from sourcecode.glossary import GlossaryMatches
 from functools import partial
 
@@ -31,6 +31,7 @@ from sourcecode.glossary_score import (
     pool,
     pool_violations,
     ReferenceCheck,
+    Score,
     check_reference,
     score_glossary,
 )
@@ -240,6 +241,35 @@ def test_avoided_term_is_over_use():
     assert score.term_scores[0].rendered == 1
 
 
+def test_longer_target_claims_the_shorter_inside_it():
+    """One `mercado de crédito` is one instance of `credit market`, not also one of `credit`."""
+    score = score_glossary(
+        mappings=CREDIT_PAIRS, text="El mercado de crédito.", language_code="es-es",
+        ref_text="El mercado de crédito.",
+    )
+    assert [(t.source_content, t.expected) for t in score.term_scores] == [("credit market", 1)]
+
+
+def test_shorter_target_outside_the_longer_still_counts():
+    score = score_glossary(
+        mappings=CREDIT_PAIRS, text="El mercado de crédito.", language_code="es-es",
+        ref_text="El mercado de crédito y el crédito privado.",
+    )
+    terms = {t.source_content: (t.expected, t.rendered) for t in score.term_scores}
+    assert terms == {"credit": (1, 0), "credit market": (1, 1)}
+
+
+def test_nested_targets_of_one_term_count_once():
+    """A permissive entry whose targets nest must not count the long one twice."""
+    mappings = pairs(("Line Corrector", "Line Corrector"),
+                     ("Line Corrector", "ageLOC Tru Face Line Corrector"))
+    score = score_glossary(
+        mappings=mappings, text="ageLOC Tru Face Line Corrector y Line Corrector.",
+        language_code="es-es", ref_text="ageLOC Tru Face Line Corrector y Line Corrector.",
+    )
+    assert score.expected == 2
+
+
 def test_four_buckets_are_exhaustive():
     mappings = [
         {"source_content": "engine", "target_content": "moteur"},
@@ -414,11 +444,14 @@ BRAKE_PAIRS = pairs(("brake pad", "frein"))
 ENGINE_PAIRS = pairs(("engine", "moteur"))
 
 
-def run(texts, references, per_segment, corpus=None, **kwargs):
+def run(texts, references, per_segment, corpus=None, sources=None, **kwargs):
     return find_violations(
-        versions=[texts], ref_texts=references, per_segment_mappings=per_segment,
+        versions=[texts], ref_texts=references,
+        source_texts=sources if sources is not None else [""] * len(texts),
+        per_segment_mappings=per_segment,
         corpus_mappings=corpus if corpus is not None else [m for g in per_segment for m in g],
-        language_code="fr-fr", **kwargs,
+        language_codes=["fr-fr"] * len(texts), source_language_codes=["en-gb"] * len(texts),
+        **kwargs,
     )[0]
 
 
@@ -445,8 +478,11 @@ def test_empty_output_misses_every_term_reference_used():
 def test_lemma_match_is_rendering_not_miss():
     report = run(
         ["Les freins sont uses."], ["Le frein est use."], [BRAKE_PAIRS],
-        text_lemmas={"Les freins sont uses.": "le frein etre use", "Le frein est use.": "le frein etre use"},
-        term_lemmas={"frein": "frein"},
+        lemmas_by_language={"fr-fr": {
+            "Les freins sont uses.": "le frein etre use",
+            "Le frein est use.": "le frein etre use",
+            "frein": "frein",
+        }},
     )
     assert report.items == []
 
@@ -504,6 +540,42 @@ def test_target_without_its_source_is_over_application():
     """Nothing retrieved here and the human chose otherwise, so the wording is unlicensed."""
     report = run(["Le frein est ici."], ["Le dispositif est ici."], [[]], corpus=BRAKE_PAIRS)
     assert kinds(report) == [(OVER_APPLICATION, "brake pad", "frein")]
+
+
+def test_term_the_source_carries_is_not_over_application():
+    """Retrieval missed a term the source has, so the translation did not add it."""
+    report = run(["Le frein est ici."], ["Le dispositif est ici."], [[]], corpus=BRAKE_PAIRS,
+                 sources=["The brake pad is here."])
+    assert report.items == []
+
+
+def test_source_term_is_found_on_its_lemma():
+    report = run(
+        ["Les freins sont ici."], ["Le dispositif est ici."], [[]], corpus=BRAKE_PAIRS,
+        sources=["The brake pads are here."],
+        lemmas_by_language={
+            "fr-fr": {"Les freins sont ici.": "le frein etre ici", "frein": "frein"},
+            "en-gb": {"The brake pads are here.": "the brake pad be here", "brake pad": "brake pad"},
+        },
+    )
+    assert report.items == []
+
+
+CREDIT_PAIRS = pairs(("credit", "crédito"), ("credit market", "mercado de crédito"))
+
+
+def test_one_wording_is_over_applied_once():
+    """`crédito` inside `mercado de crédito` belongs to the longer term alone."""
+    report = run(["Los mercados de deuda y el mercado de crédito."], ["Los mercados."], [[]],
+                 corpus=CREDIT_PAIRS)
+    assert kinds(report) == [(OVER_APPLICATION, "credit market", "mercado de crédito")]
+
+
+def test_retrieved_longer_term_licenses_the_shorter_inside_it():
+    retrieved = pairs(("credit market", "mercado de crédito"))
+    report = run(["El mercado de crédito."], ["El mercado de crédito."], [retrieved],
+                 corpus=CREDIT_PAIRS)
+    assert report.items == []
 
 
 def test_wording_reference_also_chose_is_never_over_application():
@@ -614,12 +686,14 @@ def test_scorecard_names_stratum(result):
 def test_glossary_blind_run_says_so(result):
     """Blindness the preflight cannot see: without it the scorecard reads as a clean run."""
     # The healthy run says nothing of the kind, so the warning cannot be background noise.
-    assert "post-mt was shown no glossary" not in scorecard(result).as_markdown()
+    assert "post-mt reported no glossary" not in scorecard(result).as_markdown()
 
     result.totals["segments_glossary_never_shown"] = 2
     for rendered in (scorecard(result).as_markdown(), scorecard(result).as_console()):
-        assert "post-mt was shown no glossary on 2/2" in rendered
-        assert "cat_project_id" in rendered
+        assert "post-mt reported no glossary on 2/2" in rendered
+        # The flag is reported, not read as a verdict: a cache hit and v3 both return it.
+        assert "cached" in rendered
+        assert "not a measurement" not in rendered
 
 
 def test_summary_shows_na_not_zero(result):
@@ -767,6 +841,18 @@ def test_over_use_is_flagged_for_review():
     assert "flagged for review, never counted as violations" in scorecard(result).as_markdown()
 
 
+def test_scorecard_counts_each_term_once():
+    """A term in two segments is one distinct term, bucketed on its pooled counts."""
+    result = _run("repeated", [
+        {"source_segment_id": f"s{i}", "source_content": "Connect the cable.",
+         "target_content": "Branchez le câble de recharge.",
+         "reference_content": "Branchez le câble de recharge."}
+        for i in (1, 2)
+    ])
+
+    assert "Terms 1 distinct · matched 1 → 1 · partly 0 → 0" in scorecard(result).as_markdown()
+
+
 def test_per_term_adherence_is_only_rate(result):
     """Adherence is a share of that term's own REF count; its misses stay counts."""
     for row in term_rows(result):
@@ -809,17 +895,33 @@ def _aggregate(expected, adherent, *, segments=1, fully_adherent=1, terms=None):
     )
 
 
-class _Result:
-    """The few Result fields the stratum code reads."""
+@dataclass
+class _Segment:
+    """The few SegmentResult fields the stratum code reads."""
 
-    def __init__(self, name, source, target, domain, mt, ape=None, segments=1, violations=None):
-        self.dataset = name
-        self.parameters = {"source_language": source, "target_language": target, "domain": domain}
-        self.mt = mt
-        self.ape = ape if ape is not None else mt
-        self.totals = {"segments": segments}
-        self.mt_violations = violations or ViolationReport(segments=segments)
-        self.ape_violations = violations or ViolationReport(segments=segments)
+    stratum: tuple
+    mt: Score
+    ape: Score
+    mt_corpus_violations: int = 0
+    ape_corpus_violations: int = 0
+
+
+class _Result:
+    """A scored dataset, as the stratum code sees it - a list of segments and nothing more."""
+
+    def __init__(self, segments):
+        self.segments = segments
+
+
+def _stratum_result(source, target, domain, *counts, violations=0):
+    """A dataset whose segments all sit in one stratum; each count is (expected, adherent)."""
+    stratum = (f"{source}->{target}", domain or "(no domain)")
+    segments = []
+    for expected, adherent in counts:
+        score = Score(expected=expected, adherent=adherent, strict=Tally(expected, adherent),
+                      terms=TermBreakdown(matched_ref=adherent, never_used=expected - adherent))
+        segments.append(_Segment(stratum, score, score, violations, violations))
+    return _Result(segments)
 
 
 def test_pooling_sums_counts_rather_than_averaging_rates():
@@ -857,43 +959,72 @@ def test_empty_stratum_reports_no_rate_rather_than_zero():
 
 
 def test_stratum_is_pair_and_domain():
-    result = _Result("d", "en-gb", "fr-fr", "Automotive", _aggregate(1, 1))
+    assert stratum_of({
+        "clean_source_language_code": "en-gb",
+        "clean_target_language_code": "fr-fr",
+        "domain": "Automotive",
+    }) == ("en-gb->fr-fr", "Automotive")
 
-    assert stratum_of(result) == ("en-gb->fr-fr", "Automotive")
+
+def test_one_pair_holds_the_domains_it_was_measured_in():
+    a = _stratum_result("en-gb", "fr-fr", "Automotive", (4, 2))
+    b = _stratum_result("en-gb", "fr-fr", "Forestry", (4, 4))
+
+    grouped = by_language_pair([a, b])
+
+    assert list(grouped) == ["en-gb->fr-fr"]
+    assert list(grouped["en-gb->fr-fr"]) == ["Automotive", "Forestry"]
 
 
-def test_same_pair_different_domain_are_different_strata():
-    a = _Result("a", "en-gb", "fr-fr", "Automotive", _aggregate(4, 2))
-    b = _Result("b", "en-gb", "fr-fr", "Forestry", _aggregate(4, 4))
+def test_segments_are_grouped_not_datasets():
+    """One dataset can span several strata, so a file cannot be the unit of grouping."""
+    mixed = _Result([
+        *_stratum_result("en-gb", "fr-fr", "Automotive", (4, 2)).segments,
+        *_stratum_result("en-gb", "de-de", "Automotive", (4, 4)).segments,
+    ])
 
-    assert len(by_stratum([a, b])) == 2
+    assert list(by_language_pair([mixed])) == ["en-gb->de-de", "en-gb->fr-fr"]
 
 
 def test_one_stratum_pools_into_one_row():
-    a = _Result("a", "en-gb", "fr-fr", "Automotive", _aggregate(6, 4), segments=2)
-    b = _Result("b", "en-gb", "fr-fr", "Automotive", _aggregate(2, 1), segments=1)
+    a = _stratum_result("en-gb", "fr-fr", "Automotive", (6, 4), (0, 0))
+    b = _stratum_result("en-gb", "fr-fr", "Automotive", (2, 1))
 
     rows = stratum_rows([a, b])
 
-    assert len(rows) == 1
-    assert rows[0]["datasets"] == 2
+    assert [row["label"] for row in rows] == ["en-gb->fr-fr", "↳ Automotive"]
     assert rows[0]["segments"] == 3
     assert rows[0]["expected_instances"] == 8
     assert rows[0]["mt_adherence_rate"] == pytest.approx(5 / 8)
 
 
-def test_missing_domain_still_forms_stratum():
-    result = _Result("d", "en-gb", "fr-fr", None, _aggregate(2, 1))
+def test_the_pair_row_is_its_domains_summed():
+    rows = stratum_rows([
+        _stratum_result("en-gb", "fr-fr", "Automotive", (6, 3)),
+        _stratum_result("en-gb", "fr-fr", "Forestry", (2, 2)),
+    ])
 
-    assert stratum_of(result) == ("en-gb->fr-fr", "(no domain)")
-    assert len(stratum_rows([result])) == 1
+    pair, *domains = rows
+    assert pair["label"] == "en-gb->fr-fr"
+    assert [row["label"] for row in domains] == ["↳ Automotive", "↳ Forestry"]
+    assert pair["expected_instances"] == sum(row["expected_instances"] for row in domains)
+    assert pair["mt_adherence_rate"] == pytest.approx(5 / 8)
+
+
+def test_missing_domain_still_forms_stratum():
+    assert stratum_of({
+        "clean_source_language_code": "en-gb", "clean_target_language_code": "fr-fr",
+    }) == ("en-gb->fr-fr", "(no domain)")
+
+    rows = stratum_rows([_stratum_result("en-gb", "fr-fr", None, (2, 1))])
+    assert [row["domain"] for row in rows] == [None, "(no domain)"]
 
 
 def test_render_shows_instance_count_next_to_rate():
     """A 100% stratum resting on 2 instances and one resting on 400 must not look identical."""
     rendered = render_strata([
-        _Result("d", "en-gb", "fr-fr", "Automotive", _aggregate(2, 2)),
-        _Result("e", "en-gb", "de-de", "Forestry", _aggregate(400, 400)),
+        _stratum_result("en-gb", "fr-fr", "Automotive", (2, 2)),
+        _stratum_result("en-gb", "de-de", "Forestry", (400, 400)),
     ])
 
     assert "en-gb->fr-fr" in rendered
@@ -905,16 +1036,22 @@ def test_render_shows_instance_count_next_to_rate():
 
 def test_single_dataset_still_renders_stratum():
     """A stratum figure must not depend on how many files happened to be in the folder."""
-    rendered = render_strata([_Result("d", "en-gb", "fr-fr", "Automotive", _aggregate(2, 2))])
-    assert "en-gb->fr-fr · Automotive · 2 inst" in rendered
-    # No ALL row: pooling one stratum into itself would just repeat the line above.
+    rendered = render_strata([_stratum_result("en-gb", "fr-fr", "Automotive", (2, 2))])
+
+    assert "en-gb->fr-fr · 2 inst" in rendered
+    assert "↳ Automotive · 2 inst" in rendered
+    # No ALL row: pooling one language pair into itself would just repeat the line above.
     assert "ALL ·" not in rendered
 
 
 class FakeStanza:
     """Identity lemmatizer, so nothing here touches the network."""
 
+    def __init__(self):
+        self.calls = []
+
     def lemmatize_batch_safe(self, texts, language):
+        self.calls.append(list(texts))
         return list(texts)
 
 
@@ -923,12 +1060,31 @@ class FakeGlossary:
 
     def __init__(self, table):
         self.table = table
+        self.queried_ids = []
 
     def fetch_matches(self, *, glossary_ids, source_language, target_language, texts, provider=None):
+        if not glossary_ids:
+            raise ValueError("No glossary IDs provided")
+        self.queried_ids.append(list(glossary_ids))
         per_text = [self.table.get(text, []) for text in texts]
         return GlossaryMatches(
             mappings=[m for group in per_text for m in group], per_text_mappings=per_text
         )
+
+
+class FakeTermBases:
+    """The CAT tool answering which term bases a project has; `{}` means none anywhere."""
+
+    def __init__(self, by_project=None, default=("tb-1",)):
+        self.by_project = by_project
+        self.default = list(default)
+        self.asked = []
+
+    def ids_for(self, project_id, provider):
+        self.asked.append((project_id, provider))
+        if self.by_project is None:
+            return list(self.default)
+        return list(self.by_project.get(project_id, []))
 
 
 class FakePostMt:
@@ -1004,28 +1160,31 @@ REFERENCE_SEGMENTS = [
 
 
 def _dataset(name, segments):
+    parameters = normalize_language(
+        {
+            "source_language": "English (United Kingdom)",
+            "target_language": "French (France)",
+            "domain": "Automotive",
+            "cat_tool_provider": "MemSource",
+            "cat_project_id": "P1",
+        }
+    )
     return Dataset(
         name=name,
         component="glossary",
-        parameters=normalize_language(
-            {
-                "source_language": "English (United Kingdom)",
-                "target_language": "French (France)",
-                "domain": "Automotive",
-                "cat_tool_provider": "MemSource",
-            }
-        ),
-        glossary_ids=["tb1"],
-        segments=[dict(s) for s in segments],
+        parameters=parameters,
+        tasks=[Task(parameters, [dict(s) for s in segments])],
     )
 
 
-def _benchmark(postmt=None, *, batch_size=2, glossary=GLOSSARY, lemma_matching=False):
+def _benchmark(postmt=None, *, batch_size=2, glossary=GLOSSARY, lemma_matching=False,
+               term_bases=None):
     return partial(
         run_benchmark,
         postmt=postmt if postmt is not None else FakePostMt(fixes=FIXES, glossary=GLOSSARY),
         stanza=FakeStanza(),
         glossary=FakeGlossary(glossary),
+        term_bases=term_bases if term_bases is not None else FakeTermBases(),
         config=FakeConfig(FakeBenchmarkConfig(batch_size, lemma_matching)),
     )
 
@@ -1093,7 +1252,7 @@ def test_batching_preserves_order_and_index_alignment(dataset):
 
 def test_repairs_and_regressions_are_counted_separately(dataset):
     # One term repaired, one broken: net delta 0, which a single number would present as "no change".
-    dataset.segments = [
+    dataset.tasks[0].segments = [
         {"source_segment_id": "s1", "source_content": "The brake pad is worn.",
          "target_content": "Le frein est usé.", "reference_content": "Le frein est usé."},
         {"source_segment_id": "s2", "source_content": "The engine is electric.",
@@ -1227,7 +1386,7 @@ def test_warns_when_postmt_saw_no_glossary(dataset, caplog):
     _benchmark(FakePostMt(fixes=FIXES, glossary={}))(dataset)
 
     assert "post-mt reported no glossary" in caplog.text
-    assert "ecosystem_id" in caplog.text
+    assert "cat_project_id" in caplog.text
 
 
 def test_no_warning_when_two_agree(dataset, caplog):
@@ -1292,7 +1451,7 @@ def test_reference_check_flags_a_term_the_human_never_rendered():
     check = check_reference(
         ref_texts=ref_texts,
         per_segment_mappings=[GLOSSARY_PAIR, GLOSSARY_PAIR],
-        language_code="fr-fr",
+        language_codes=["fr-fr", "fr-fr"],
     )
 
     assert (check.terms_checked, check.terms_rendered, check.to_review) == (4, 2, 2)
@@ -1305,7 +1464,7 @@ def test_reference_check_passes_when_the_human_followed_the_glossary():
     check = check_reference(
         ref_texts=["La plaquette de frein et le câble sont neufs."],
         per_segment_mappings=[GLOSSARY_PAIR],
-        language_code="fr-fr",
+        language_codes=["fr-fr"],
     )
 
     assert (check.terms_checked, check.terms_rendered, check.to_review) == (2, 2, 0)
@@ -1443,3 +1602,40 @@ def test_a_language_that_varies_splits_the_file():
 def test_a_blank_job_column_is_left_unset():
     body = parse_csv_export(export_with("DOMAIN", ["", ""]), "x.csv")
     assert "domain" not in only_task(body).parameters
+
+
+# retrieval is scoped to the term bases the CAT project has attached
+
+def test_retrieval_asks_only_the_projects_own_term_bases(dataset):
+    """post-mt percolates those term bases alone, so a run that percolated the index would
+    credit MT with terms post-mt was never shown."""
+    glossary = FakeGlossary(GLOSSARY)
+    run_benchmark(
+        dataset, postmt=None, stanza=FakeStanza(), glossary=glossary,
+        term_bases=FakeTermBases(default=["tb-7", "tb-8"]),
+        config=FakeConfig(FakeBenchmarkConfig(2, False)), skip_pipeline=True,
+    )
+
+    assert glossary.queried_ids == [["tb-7", "tb-8"]]
+
+
+def test_the_term_bases_are_asked_for_by_project_and_tool(dataset):
+    term_bases = FakeTermBases()
+    _benchmark(term_bases=term_bases)(dataset)
+
+    assert term_bases.asked == [("P1", "MemSource")]
+
+
+def test_a_project_with_no_term_bases_never_reaches_the_lemmatizer(dataset):
+    """Lemmatizing to retrieve from nothing is spend for an answer already known."""
+    stanza, glossary = FakeStanza(), FakeGlossary(GLOSSARY)
+
+    result = run_benchmark(
+        dataset, postmt=None, stanza=stanza, glossary=glossary,
+        term_bases=FakeTermBases(by_project={}),
+        config=FakeConfig(FakeBenchmarkConfig(2, False)), skip_pipeline=True,
+    )
+
+    assert stanza.calls == []
+    assert glossary.queried_ids == []
+    assert result.totals["segments_with_glossary"] == 0

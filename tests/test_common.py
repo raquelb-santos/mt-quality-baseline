@@ -1,6 +1,9 @@
 """The parts both components share: matching, dataset loading, the HTTP clients, and the run."""
 
+import io
 import json
+import zipfile
+from functools import partial
 
 import httpx
 import pytest
@@ -24,7 +27,6 @@ from sourcecode.text_processing import (
     parse_csv,
 )
 from sourcecode.dnt import DntClient, Reversion
-from sourcecode.glossary import GlossaryClient
 from sourcecode.pipeline import run_pipeline
 from sourcecode.postmt import RunResult
 from sourcecode.postmt import (
@@ -370,220 +372,6 @@ def test_an_invalid_file_still_fails_when_a_pair_is_asked_for(tmp_path):
 
 # the HTTP boundary
 
-# Term bases - pinned queries: drift means scoring against a glossary production never sent.
-
-PERCOLATE = {
-    "responses": [
-        {"hits": {"hits": [
-            {"_source": {"term_text": "brake pad", "concept_id": "c1"}},
-            {"_source": {"term_text": "engine", "concept_id": "c2"}},
-        ]}},
-        {"hits": {"hits": [{"_source": {"term_text": "engine", "concept_id": "c2"}}]}},
-    ]
-}
-
-CONCEPTS = {
-    "hits": {"hits": [
-        {"_source": {"concept_id": "c1", "term_text": "plaquette de frein"}},
-        {"_source": {"concept_id": "c2", "term_text": "moteur"}},
-        {"_source": {"concept_id": "c2", "term_text": "bloc moteur"}},
-    ]}
-}
-
-TEXTS = ["The brake pad and the engine.", "The engine only."]
-
-
-def _glossary_client(percolate=PERCOLATE, concepts=CONCEPTS, capture=None):
-    def handler(request):
-        path = request.url.path
-        if path.endswith("/_msearch"):
-            if capture is not None:
-                capture["msearch_path"] = path
-                capture["ndjson"] = [
-                    json.loads(line)
-                    for line in request.content.decode("utf-8").splitlines()
-                    if line.strip()
-                ]
-                capture["content_type"] = request.headers.get("Content-Type")
-            return httpx.Response(200, json=percolate)
-        if capture is not None:
-            capture["search_path"] = path
-            capture["search_body"] = json.loads(request.content)
-        return httpx.Response(200, json=concepts)
-
-    client = GlossaryClient("http://search.test")
-    # The transport is the shared SearchClient's; the glossary owns the queries, not the wire.
-    client.search._client = httpx.Client(
-        base_url="http://search.test", transport=httpx.MockTransport(handler)
-    )
-    return client
-
-
-def _fetch(client, **overrides):
-    kwargs = dict(
-        glossary_ids=["tb1"], source_language="en-gb", target_language="fr-fr", texts=TEXTS
-    )
-    kwargs.update(overrides)
-    return client.fetch_matches(**kwargs)
-
-
-# request shape, pinned to what production sends
-
-def test_percolate_request_matches_post_mt():
-    capture = {}
-    _fetch(_glossary_client(capture=capture))
-
-    assert capture["content_type"] == "application/x-ndjson"
-    # One index header + one body per text, in order.
-    assert len(capture["ndjson"]) == 2 * len(TEXTS)
-
-    header, body = capture["ndjson"][0], capture["ndjson"][1]
-    assert header == {"index": "term-bases"}
-    assert body["size"] == 50
-    assert body["sort"] == ["_score"]
-    assert body["query"]["bool"]["must"] == [
-        {"percolate": {"field": "query", "document": {"content": TEXTS[0]}}}
-    ]
-    assert {"terms": {"glossary_id": ["tb1"]}} in body["query"]["bool"]["filter"]
-    # Permissive language matching: full code and base code, as post-mt does.
-    languages = next(
-        f["terms"]["language"] for f in body["query"]["bool"]["filter"] if "language" in f["terms"]
-    )
-    assert languages == ["en-gb", "en"]
-
-    assert capture["ndjson"][3]["query"]["bool"]["must"][0]["percolate"]["document"]["content"] == TEXTS[1]
-
-
-def test_concept_lookup_matches_post_mt():
-    capture = {}
-    _fetch(_glossary_client(capture=capture))
-
-    body = capture["search_body"]
-    assert capture["search_path"] == "/term-bases/_search"
-    assert body["size"] == 1000
-    filters = body["query"]["bool"]["filter"]
-    assert {"terms": {"concept_id": ["c1", "c2"]}} in filters
-    assert {"terms": {"language": ["fr-fr", "fr"]}} in filters
-
-
-def test_xtm_provider_uses_xtm_index():
-    capture = {}
-    _fetch(_glossary_client(capture=capture), provider="XTM")
-    assert capture["ndjson"][0] == {"index": "xtm-term-bases"}
-    assert capture["search_path"] == "/xtm-term-bases/_search"
-
-
-def test_non_xtm_providers_use_default_index():
-    capture = {}
-    _fetch(_glossary_client(capture=capture), provider="MemSource")
-    assert capture["ndjson"][0] == {"index": "term-bases"}
-
-
-def test_glossary_ids_are_trimmed_and_blanks_dropped():
-    capture = {}
-    _fetch(_glossary_client(capture=capture), glossary_ids=[" tb1 ", "", "tb2"])
-    body = capture["ndjson"][1]
-    assert {"terms": {"glossary_id": ["tb1", "tb2"]}} in body["query"]["bool"]["filter"]
-
-
-# result assembly
-
-def test_per_text_mappings_align_with_texts():
-    matches = _fetch(_glossary_client())
-
-    assert len(matches.per_text_mappings) == len(TEXTS)
-    assert matches.per_text_mappings[0] == [
-        {"source_content": "brake pad", "target_content": "plaquette de frein"},
-        {"source_content": "engine", "target_content": "moteur"},
-        {"source_content": "engine", "target_content": "bloc moteur"},
-    ]
-    # Second text matched only the engine concept.
-    assert {m["source_content"] for m in matches.per_text_mappings[1]} == {"engine"}
-
-
-def test_targets_are_deduplicated_per_text():
-    percolate = {
-        "responses": [
-            {"hits": {"hits": [
-                {"_source": {"term_text": "engine", "concept_id": "c2"}},
-                {"_source": {"term_text": "motor", "concept_id": "c2"}},
-            ]}},
-            {"hits": {"hits": []}},
-        ]
-    }
-    matches = _fetch(_glossary_client(percolate=percolate))
-    # Both source terms resolve to the same concept, so each target appears once.
-    assert [m["target_content"] for m in matches.per_text_mappings[0]] == ["moteur", "bloc moteur"]
-
-
-def test_global_mappings_are_deduplicated_across_texts():
-    matches = _fetch(_glossary_client())
-    assert [m["target_content"] for m in matches.mappings] == [
-        "plaquette de frein", "moteur", "bloc moteur"
-    ]
-
-
-def test_no_percolate_hits_skips_concept_lookup():
-    empty = {"responses": [{"hits": {"hits": []}}, {"hits": {"hits": []}}]}
-    capture = {}
-    matches = _fetch(_glossary_client(percolate=empty, capture=capture))
-
-    assert matches.mappings == []
-    assert matches.per_text_mappings == [[], []]
-    assert "search_body" not in capture  # second query never issued
-
-
-def test_percolate_error_spares_rest(caplog):
-    partial = {
-        "responses": [
-            {"error": {"type": "search_phase_execution_exception"}},
-            {"hits": {"hits": [{"_source": {"term_text": "engine", "concept_id": "c2"}}]}},
-        ]
-    }
-    matches = _fetch(_glossary_client(percolate=partial))
-
-    assert matches.per_text_mappings[0] == []
-    assert [m["target_content"] for m in matches.per_text_mappings[1]] == ["moteur", "bloc moteur"]
-
-
-# validation
-
-@pytest.mark.parametrize(
-    "overrides, message",
-    [
-        ({"glossary_ids": []}, "No glossary IDs provided"),
-        ({"source_language": ""}, "No source language provided"),
-        ({"target_language": ""}, "No target language provided"),
-        ({"texts": []}, "No texts provided"),
-    ],
-)
-def test_missing_inputs_are_rejected(overrides, message):
-    with pytest.raises(ValueError, match=message):
-        _fetch(_glossary_client(), **overrides)
-
-
-# term counting, backing the CLI preflight
-
-def test_count_terms_asks_right_index_for_ids():
-    seen = {}
-
-    def handler(request):
-        seen["path"] = request.url.path
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"count": 42})
-
-    client = GlossaryClient("http://search.test")
-    # The transport is the shared SearchClient's; the glossary owns the queries, not the wire.
-    client.search._client = httpx.Client(
-        base_url="http://search.test", transport=httpx.MockTransport(handler)
-    )
-
-    assert client.count_terms(["tb1", "tb2"]) == 42
-    assert seen["path"] == "/term-bases/_count"
-    assert seen["body"] == {"query": {"terms": {"glossary_id": ["tb1", "tb2"]}}}
-    assert client.count_terms(["tb1"], provider="XTM") == 42
-    assert seen["path"] == "/xtm-term-bases/_count"
-
 # post-mt - which text gets scored, and what would make the number meaningless.
 
 @pytest.mark.parametrize(
@@ -606,7 +394,6 @@ def test_extract_post_edited_handles_every_pipeline_version(segment, expected):
 GOOD = {
     "cat_project_id": "P1",
     "cat_tool_provider": "MemSource",
-    "ecosystem_id": "001Aa00000jloVrIAI_XXX",
     "tempo_task_id": "task-1",
 }
 
@@ -618,9 +405,6 @@ def test_preflight_passes_on_complete_parameters():
 
 def test_preflight_catches_each_silent_skip_condition():
     """Each of these makes post-mt retrieve no glossary at all, without raising an error."""
-    missing_ecosystem = preflight_parameters({**GOOD, "ecosystem_id": ""})
-    assert any("ecosystem_id" in p for p in missing_ecosystem)
-
     missing_provider = preflight_parameters({**GOOD, "cat_tool_provider": ""})
     assert any("cat_tool_provider" in p for p in missing_provider)
 
@@ -633,8 +417,8 @@ def test_preflight_catches_each_silent_skip_condition():
 
 def test_preflight_reports_every_problem_at_once():
     problems = preflight_parameters({})
-    # tempo_task_id, provider, ecosystem, project — not just the first
-    assert len(problems) == 4
+    # tempo_task_id, provider, project — not just the first
+    assert len(problems) == 3
 
 
 def test_preflight_names_the_tasks_a_problem_is_in():
@@ -677,11 +461,12 @@ def test_failed_ape_looks_untouched():
 
 # has_glossary
 
-def test_has_glossary_is_read_from_aqe_results():
-    """post-mt nests it under aqe_results; the top level left the warning permanently dead."""
-    assert reported_has_glossary({"aqe_results": {"has_glossary": True}}) is True
-    assert reported_has_glossary({"aqe_results": {"has_glossary": False}}) is False
-    assert reported_has_glossary({"has_glossary": True}) is True      # legacy top-level
+def test_has_glossary_is_read_beside_aqe_results():
+    """post-mt writes it as a sibling of aqe_results, so reading inside it is always None."""
+    assert reported_has_glossary({"has_glossary": True}) is True
+    assert reported_has_glossary({"has_glossary": False}) is False
+    assert reported_has_glossary({"aqe_results": {"has_glossary": True}}) is None
+    # A task that ran no AQE step carries no flag, which is not the same as a negative.
     assert reported_has_glossary({"aqe_results": {}}) is None
     assert reported_has_glossary({}) is None
 
@@ -1058,21 +843,14 @@ def stub_postmt(monkeypatch):
 
 
 class _StubGlossary:
-    """Reachable term-bases index that records the ids it was asked for."""
-    def __init__(self, *args, term_count=1, **kwargs):
+    """The CAT tool's terms, recording the language they were asked for."""
+    def __init__(self, *args, **kwargs):
         self.asked_for = None
-        self._term_count = term_count
 
-    def ping(self):
-        return True
-
-    def count_terms(self, glossary_ids, provider=None):
-        return self._term_count
-
-    def fetch_matches(self, *, glossary_ids, texts, **kwargs):
+    def fetch_matches(self, *, glossary_ids, source_language, texts, **kwargs):
         from sourcecode.glossary import GlossaryMatches
 
-        self.asked_for = list(glossary_ids)
+        self.asked_for = source_language
         return GlossaryMatches(mappings=[], per_text_mappings=[[] for _ in texts])
 
     def close(self):
@@ -1136,12 +914,37 @@ def measure_glossary_only(monkeypatch):
     monkeypatch.setenv("BENCH_COMPONENT", "glossary")
 
 
+class _StubPhrase:
+    """The CAT tool, answering that every project has one term base holding one term."""
+
+    def __init__(self, *args, term_base_ids=("tb-1",), **kwargs):
+        self.asked = []
+        self._ids = list(term_base_ids)
+
+    def term_base_ids(self, project_id):
+        self.asked.append(project_id)
+        return list(self._ids)
+
+    def terms(self, term_base_id):
+        from sourcecode.cat_tool import Term
+
+        return [Term("c1", "en-gb", "engine"), Term("c1", "fr-fr", "moteur")]
+
+    def close(self):
+        pass
+
+
 @pytest.fixture
 def stub_glossary(monkeypatch):
-    """The term-bases index is the only glossary source, so every run needs a reachable one."""
+    """The term-bases index is the only glossary source, so every run needs a reachable one, and
+    a CAT tool to say which term bases each project has."""
     glossary = _StubGlossary()
     monkeypatch.setenv("SEARCH_ENGINE_URL", "http://search.test")
-    monkeypatch.setattr(run, "GlossaryClient", lambda *a, **k: glossary)
+    monkeypatch.setenv("PHRASE_BASE_URL", "http://phrase.test")
+    monkeypatch.setenv("PHRASE_USERNAME", "u")
+    monkeypatch.setenv("PHRASE_PASSWORD", "p")
+    monkeypatch.setattr(run, "CatToolGlossary", lambda *a, **k: glossary)
+    monkeypatch.setattr(run, "PhraseClient", _StubPhrase)
     return glossary
 
 
@@ -1161,12 +964,11 @@ SEGMENT = {
 }
 
 
-def _write_dataset(folder, glossary_ids=("tb1",), name="d.json", **overrides):
-    """A pinned dataset. Pass ``key=None`` to omit a parameter and trip the preflight."""
+def _write_dataset(folder, name="d.json", **overrides):
+    """A dataset. Pass ``key=None`` to omit a parameter and trip the preflight."""
     parameters = {
         "cat_project_id": "P1",
         "cat_tool_provider": "MemSource",
-        "ecosystem_id": "E1",
         "tempo_task_id": "T1",
         "source_language": "en-gb",
         "target_language": "fr-fr",
@@ -1176,10 +978,6 @@ def _write_dataset(folder, glossary_ids=("tb1",), name="d.json", **overrides):
 
     path = folder / name
     body = {"name": path.stem, "parameters": parameters, "segments": [dict(SEGMENT)]}
-    # A dnt dataset pins no ids: its items come from the service, and carrying them is an error.
-    if glossary_ids is not None:
-        body["glossary_ids"] = list(glossary_ids)
-
     path.write_text(json.dumps(body), encoding="utf-8")
     return path
 
@@ -1216,46 +1014,74 @@ def test_preflight_blocks_skipped_glossary(
 
 
 def test_dry_run_skips_preflight_and_never_touches_postmt(configure, stub_postmt, stub_glossary):
-    configure(tempo_task_id=None, cat_tool_provider=None)
+    # tempo_task_id is preflight-only; dropping the CAT tool or the project instead would trip the
+    # term-base guard, which a dry run still applies because a run with no terms measures nothing.
+    configure(tempo_task_id=None)
 
     assert run.main(["--dry-run"]) == 0
     assert stub_postmt.submitted is False
 
 
-def test_missing_search_engine_url_is_config(
-    configure, stub_postmt, monkeypatch, capsys
+def test_no_cat_tool_is_config(
+    configure, stub_postmt, stub_glossary, monkeypatch, capsys
 ):
-    """An unset URL must say so rather than report the empty string as unreachable."""
+    """Terms come from the CAT tool, so neither one configured is a setting to fix, not a failure."""
     configure()
-    monkeypatch.setenv("SEARCH_ENGINE_URL", "")
+    for name in ("PHRASE_BASE_URL", "PHRASE_USERNAME", "PHRASE_PASSWORD"):
+        monkeypatch.setenv(name, "")
 
     code = run.main(["--dry-run"])
 
     assert code == 2
-    assert "SEARCH_ENGINE_URL" in capsys.readouterr().err
+    assert "PHRASE_BASE_URL" in capsys.readouterr().err
 
 
-def test_pinned_ids_are_ones_queried(configure, stub_postmt, stub_glossary):
-    """Ids come from the dataset, so a run is a fixed experiment rather than a live lookup."""
-    configure(glossary_ids=["tb1", "tb2"])
+def test_run_percolates_the_whole_index_for_the_source_language(
+    configure, stub_postmt, stub_glossary, tmp_path
+):
+    """Nothing names a term base, so the source language alone decides what is retrieved."""
+    configure()
 
     assert run.main(["--dry-run"]) == 0
-    assert stub_glossary.asked_for == ["tb1", "tb2"]
+    assert stub_glossary.asked_for == "en-gb"
+    assert _report(tmp_path / "reports", "glossary_dry-run").is_file()
 
 
-def test_glossary_ids_absent_from_index_stop_run(
-    configure, stub_postmt, monkeypatch, caplog
+def test_projects_without_a_term_base_stop_the_run(
+    configure, stub_postmt, stub_glossary, monkeypatch, caplog
 ):
-    """An id from another system matches nothing and would score a clean-looking zero."""
-    configure(glossary_ids=["041cf63c-3f16-4d79-a386-35cf7688faf0"])
-    monkeypatch.setattr(run, "GlossaryClient", lambda *a, **k: _StubGlossary(term_count=0))
-    monkeypatch.setenv("SEARCH_ENGINE_URL", "http://search.test")
+    """A project with nothing attached retrieves nothing and would score a clean-looking zero."""
+    configure()
+    monkeypatch.setattr(run, "PhraseClient", partial(_StubPhrase, term_base_ids=[]))
 
     code = run.main(["--dry-run"])
 
     assert code == 1
-    assert "None of the glossary ids" in caplog.text
-    assert "cluster post-mt queries" in caplog.text
+    assert "has a term base attached" in caplog.text
+
+
+def test_a_dataset_without_term_bases_is_warned_about_and_skipped(
+    monkeypatch, tmp_path, stub_postmt, stub_glossary, caplog
+):
+    """One unusable file must not cost the run the files beside it."""
+    folder = tmp_path / "many"
+    folder.mkdir()
+    _write_dataset(folder, name="a.json", cat_project_id="HAS-ONE")
+    _write_dataset(folder, name="b.json", cat_project_id="HAS-NONE")
+
+    class _SomeProjects(_StubPhrase):
+        def term_base_ids(self, project_id):
+            return ["tb-1"] if project_id == "HAS-ONE" else []
+
+    monkeypatch.setattr(run, "PhraseClient", _SomeProjects)
+    monkeypatch.setenv("GLOSSARY_PATH", str(folder))
+    monkeypatch.chdir(tmp_path)
+
+    assert run.main(["--dry-run"]) == 0
+    assert "has a term base attached" in caplog.text
+
+    report = _report(tmp_path / "reports", "glossary_dry-run").read_text(encoding="utf-8")
+    assert "a" in report and "b.json" not in report
 
 
 def test_configured_run_needs_no_arguments_at_all(
@@ -1265,7 +1091,7 @@ def test_configured_run_needs_no_arguments_at_all(
     configure()
 
     assert run.main(["--dry-run"]) == 0
-    assert stub_glossary.asked_for == ["tb1"]
+    assert stub_glossary.asked_for == "en-gb"
     assert _report(tmp_path / "reports", "glossary_dry-run").is_file()
 
 
@@ -1283,7 +1109,7 @@ def test_no_dataset_names_variable(
 def test_folder_scores_every_dataset_in_and_pools(
     monkeypatch, tmp_path, stub_postmt, stub_glossary
 ):
-    """GLOSSARY_PATH may name a folder; each dataset inside is scored and pooled by stratum."""
+    """GLOSSARY_PATH may name a folder; each dataset inside is scored and pooled by language pair."""
     folder = tmp_path / "many"
     folder.mkdir()
     _write_dataset(folder, name="a.json")
@@ -1294,7 +1120,7 @@ def test_folder_scores_every_dataset_in_and_pools(
     assert run.main(["--dry-run"]) == 0
 
     report = _report(tmp_path / "reports", "glossary_dry-run").read_text(encoding="utf-8")
-    assert "## By stratum" in report
+    assert "## By language pair" in report
     assert "en-gb->fr-fr" in report
 
 
@@ -1397,7 +1223,7 @@ def test_both_setting_spellings_agree(
     monkeypatch.setenv("BENCH_COMPONENT", written)
     monkeypatch.setenv("GLOSSARY_PATH", str(_write_dataset(tmp_path, name="g.json")))
     monkeypatch.setenv(
-        "DNT_PATH", str(_write_dataset(tmp_path, name="n.json", glossary_ids=None))
+        "DNT_PATH", str(_write_dataset(tmp_path, name="n.json"))
     )
     monkeypatch.chdir(tmp_path)
 
@@ -1415,7 +1241,7 @@ def test_every_component_prints_results(
     monkeypatch.setenv("BENCH_COMPONENT", "glossary,dnt")
     monkeypatch.setenv("GLOSSARY_PATH", str(_write_dataset(tmp_path, name="g.json")))
     monkeypatch.setenv(
-        "DNT_PATH", str(_write_dataset(tmp_path, name="n.json", glossary_ids=None))
+        "DNT_PATH", str(_write_dataset(tmp_path, name="n.json"))
     )
     monkeypatch.chdir(tmp_path)
 
@@ -1448,7 +1274,7 @@ def test_detected_items_are_printed(
     """A detector that named nothing writes a report of clean-looking zeroes, so it says so here."""
     monkeypatch.setenv("BENCH_COMPONENT", "dnt")
     monkeypatch.setenv(
-        "DNT_PATH", str(_write_dataset(tmp_path, name="n.json", glossary_ids=None))
+        "DNT_PATH", str(_write_dataset(tmp_path, name="n.json"))
     )
     monkeypatch.chdir(tmp_path)
 
@@ -1523,3 +1349,364 @@ def test_a_batch_never_spans_two_tasks():
 
     run_pipeline(Recorder(), _two_task_dataset(), batch_size=2)
     assert submitted == [("P1", 1), ("P2", 2)]
+
+
+# resolving a CAT project's term bases, the step post-mt runs before any retrieval
+
+from sourcecode.cat_tool import PhraseClient, Term, TermBaseResolver, XtmClient   # noqa: E402
+
+
+class _CountingCat:
+    def __init__(self, ids=("tb-1",)):
+        self.ids = list(ids)
+        self.calls = []
+
+    def term_base_ids(self, project_id):
+        self.calls.append(project_id)
+        return list(self.ids)
+
+    def close(self):
+        pass
+
+
+def test_memsource_and_phrase_are_one_tool():
+    """post-mt routes both names to the Phrase API, so a Memsource project must resolve."""
+    cat = _CountingCat()
+    resolver = TermBaseResolver(phrase=cat)
+
+    assert resolver.ids_for("P1", "MemSource") == ["tb-1"]
+    assert resolver.ids_for("P1", "Phrase") == ["tb-1"]
+
+
+def test_an_unsupported_cat_tool_resolves_nothing():
+    """Trados has no term-base lookup in post-mt, so its segments get no glossary rather than all."""
+    resolver = TermBaseResolver(phrase=_CountingCat(), xtm=_CountingCat())
+
+    assert resolver.ids_for("P1", "Trados") == []
+
+
+def test_a_project_is_asked_about_once():
+    cat = _CountingCat()
+    resolver = TermBaseResolver(phrase=cat)
+
+    assert resolver.ids_for("P1", "MemSource") == resolver.ids_for("P1", "MemSource")
+    assert cat.calls == ["P1"]
+
+
+def test_an_empty_answer_is_not_cached():
+    """A project mid-ingest answers with nothing; caching that would settle the whole run."""
+    cat = _CountingCat(ids=[])
+    resolver = TermBaseResolver(phrase=cat)
+
+    assert resolver.ids_for("P1", "MemSource") == []
+    assert resolver.ids_for("P1", "MemSource") == []
+    assert cat.calls == ["P1", "P1"]
+
+
+def test_a_failing_cat_tool_leaves_the_task_without_glossary():
+    """Retrieval degrades rather than stopping the run, and the error says which project."""
+    class _Broken:
+        def term_base_ids(self, project_id):
+            raise httpx.ConnectError("no route")
+
+        def close(self):
+            pass
+
+    assert TermBaseResolver(phrase=_Broken()).ids_for("P1", "MemSource") == []
+
+
+def test_phrase_reads_the_term_base_uids():
+    def handler(request):
+        if request.url.path.endswith("/v3/auth/login"):
+            return httpx.Response(200, json={"token": "t"})
+        assert request.headers["Authorization"] == "ApiToken t"
+        assert request.url.path.endswith("/web/api2/v1/projects/P1/termBases")
+        return httpx.Response(200, json={"termBases": [
+            {"termBase": {"uid": "tb-1"}}, {"termBase": {"uid": "tb-2"}},
+        ]})
+
+    client = PhraseClient("http://phrase.test", "u", "p")
+    client._client = httpx.Client(base_url="http://phrase.test/web/api2",
+                                  transport=httpx.MockTransport(handler))
+
+    assert client.term_base_ids("P1") == ["tb-1", "tb-2"]
+
+
+TBX = """<?xml version='1.0' encoding='UTF-8'?>
+<martif xml:lang="en" type="TBX"><text><body>
+  <termEntry>
+    <descrip type="conceptId">c1</descrip>
+    <langSet xml:lang="en-gb">
+      <tig><term>gearbox</term><termNote type="forbidden">false</termNote></tig>
+    </langSet>
+    <langSet xml:lang="fr-fr">
+      <tig><term>boite de vitesses</term><termNote type="forbidden">false</termNote></tig>
+      <tig><term>transmission</term><termNote type="forbidden">true</termNote></tig>
+    </langSet>
+  </termEntry>
+</body></text></martif>"""
+
+
+def _exporting_phrase(body, status=200):
+    def handler(request):
+        if request.url.path.endswith("/v3/auth/login"):
+            return httpx.Response(200, json={"token": "t"})
+        assert request.headers["Authorization"] == "ApiToken t"
+        assert request.url.path.endswith("/web/api2/v1/termBases/tb-1/export")
+        return httpx.Response(status, content=body.encode())
+
+    client = PhraseClient("http://phrase.test", "u", "p")
+    client._client = httpx.Client(base_url="http://phrase.test/web/api2",
+                                  transport=httpx.MockTransport(handler))
+    return client
+
+
+def test_phrase_terms_are_read_from_the_tbx_export():
+    """Phrase serves no term listing, so the terms can only come from the exported term base."""
+    assert _exporting_phrase(TBX).terms("tb-1") == [
+        Term("c1", "en-gb", "gearbox"),
+        Term("c1", "fr-fr", "boite de vitesses"),
+        Term("c1", "fr-fr", "transmission", forbidden=True),
+    ]
+
+
+def test_an_unreadable_export_fails_the_way_the_glossary_expects():
+    """Retrieval degrades on RuntimeError; a raw XML fault would stop the run instead."""
+    with pytest.raises(RuntimeError, match="valid TBX"):
+        _exporting_phrase("<martif>truncated").terms("tb-1")
+
+
+def test_xtm_term_bases_are_the_projects_term_customer_ids():
+    """XTM has no term-base endpoint, so post-mt reads them off the project itself."""
+    def handler(request):
+        if request.url.path.endswith("/auth/token"):
+            return httpx.Response(200, json={"token": "t"})
+        assert request.headers["Authorization"] == "XTM-Basic t"
+        # The endpoint answers with a list holding the project.
+        return httpx.Response(200, json=[{"termCustomerIds": [11, 12]}])
+
+    client = XtmClient("http://xtm.test", "acolad", "7", "p")
+    client._client = httpx.Client(base_url="http://xtm.test/project-manager-api-rest",
+                                  transport=httpx.MockTransport(handler))
+
+    assert client.term_base_ids("P1") == ["11", "12"]
+
+
+XTM_TBX = """<?xml version="1.0" encoding="UTF-8"?>
+<martif type="TBX-Basic" xml:lang="en"><text><body>
+  <termEntry>
+    <langSet xml:lang="en-US"><ntig><termGrp>
+      <term>gearbox</term><termNote type="status">VALID</termNote>
+    </termGrp></ntig></langSet>
+    <langSet xml:lang="fr-FR"><ntig><termGrp>
+      <term>transmission</term><termNote type="status">FORBIDDEN</termNote>
+    </termGrp></ntig></langSet>
+  </termEntry>
+  <termEntry>
+    <langSet xml:lang="en-US"><ntig><termGrp><term>engine</term></termGrp></ntig></langSet>
+  </termEntry>
+</body></text></martif>"""
+
+
+def test_xtm_terms_are_read_from_the_customers_terminology_export(monkeypatch):
+    """XTM serves no term listing, so the terms come from an export job, polled until it finishes."""
+    monkeypatch.setattr("sourcecode.cat_tool.time.sleep", lambda seconds: None)
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("terms.tbx", XTM_TBX)
+    statuses = iter(["IN_PROGRESS", "FINISHED"])
+
+    def handler(request):
+        path = request.url.path.removeprefix("/project-manager-api-rest")
+        if path == "/auth/token":
+            return httpx.Response(200, json={"token": "t"})
+        assert request.headers["Authorization"] == "XTM-Basic t"
+        if path == "/terminology/files/export":
+            assert json.loads(request.content)["filter"] == {"customerIds": [11]}
+            return httpx.Response(201, json={"fileId": 5})
+        if path == "/terminology/files/export/5/status":
+            return httpx.Response(200, json={"status": next(statuses)})
+        assert path == "/terminology/files/export/5/download"
+        return httpx.Response(200, content=archive.getvalue())
+
+    client = XtmClient("http://xtm.test", "acolad", "7", "p")
+    client._client = httpx.Client(base_url="http://xtm.test/project-manager-api-rest",
+                                  transport=httpx.MockTransport(handler))
+
+    # XTM names no concept, so each entry is one, kept apart from other customers' entries.
+    assert client.terms("11") == [
+        Term("11#0", "en-US", "gearbox"),
+        Term("11#0", "fr-FR", "transmission", forbidden=True),
+        Term("11#1", "en-US", "engine"),
+    ]
+
+
+def test_a_refused_token_is_earned_again_once():
+    seen = []
+    logins = []
+
+    def handler(request):
+        if request.url.path.endswith("/v3/auth/login"):
+            logins.append(f"t{len(logins) + 1}")
+            seen.append("login")
+            return httpx.Response(200, json={"token": logins[-1]})
+
+        seen.append(request.headers["Authorization"])
+        # The first token is refused, so the client earns a second and retries with it.
+        if len(logins) == 1:
+            return httpx.Response(401, json={})
+        return httpx.Response(200, json={"termBases": [{"termBase": {"uid": "tb-1"}}]})
+
+    client = PhraseClient("http://phrase.test", "u", "p")
+    client._client = httpx.Client(base_url="http://phrase.test/web/api2",
+                                  transport=httpx.MockTransport(handler))
+
+    assert client.term_base_ids("P1") == ["tb-1"]
+    assert seen == ["login", "ApiToken t1", "login", "ApiToken t2"]
+
+
+# reading the terms themselves from the CAT tool, in place of the term-bases index
+
+from sourcecode.glossary import CatToolGlossary   # noqa: E402
+
+
+class _TermCat:
+    def __init__(self, terms):
+        self.terms_by_base = terms
+        self.asked = []
+
+    def terms(self, term_base_id):
+        self.asked.append(term_base_id)
+        return list(self.terms_by_base.get(term_base_id, []))
+
+    def close(self):
+        pass
+
+
+ENGINE = [Term("c1", "en-gb", "engine"), Term("c1", "fr-fr", "moteur"),
+          Term("c2", "en-gb", "brake pad"), Term("c2", "fr-fr", "plaquette de frein")]
+
+
+def _cat_glossary(terms=None, provider="phrase"):
+    cat = _TermCat(terms if terms is not None else {"tb-1": ENGINE})
+    kwargs = {"phrase": cat} if provider == "phrase" else {"xtm": cat}
+    return CatToolGlossary(_StubStanza(), **kwargs), cat
+
+
+def test_terms_come_from_the_named_cat_tool():
+    """CATTOOL picks the client, so a Memsource task never reads XTM's term bases."""
+    glossary, cat = _cat_glossary()
+
+    glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
+                           target_language="fr-fr", texts=["the engine"], provider="MemSource")
+
+    assert cat.asked == ["tb-1"]
+
+
+def test_an_xtm_task_reads_the_xtm_client():
+    glossary, cat = _cat_glossary(provider="xtm")
+
+    glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
+                           target_language="fr-fr", texts=["the engine"], provider="XTM")
+
+    assert cat.asked == ["tb-1"]
+
+
+def test_a_tool_with_no_client_reads_nothing():
+    glossary, cat = _cat_glossary()
+
+    matches = glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
+                                     target_language="fr-fr", texts=["the engine"],
+                                     provider="XTM")
+
+    assert (matches.mappings, cat.asked) == ([], [])
+
+
+def test_a_matched_term_carries_its_target_wording():
+    glossary, _ = _cat_glossary()
+
+    matches = glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
+                                     target_language="fr-fr",
+                                     texts=["the engine is electric"], provider="phrase")
+
+    assert matches.mappings == [{"source_content": "engine", "target_content": "moteur"}]
+    assert matches.per_text_mappings == [matches.mappings]
+
+
+def test_a_term_the_text_never_uses_is_not_matched():
+    glossary, _ = _cat_glossary()
+
+    matches = glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
+                                     target_language="fr-fr", texts=["the cable is loose"],
+                                     provider="phrase")
+
+    assert matches.per_text_mappings == [[]]
+
+
+def test_the_language_filter_is_permissive():
+    """A term base written in `en` must still serve an `en-gb` task, as the index filter does."""
+    terms = {"tb-1": [Term("c1", "en", "engine"), Term("c1", "fr", "moteur")]}
+    glossary, _ = _cat_glossary(terms)
+
+    matches = glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
+                                     target_language="fr-fr", texts=["the engine"],
+                                     provider="phrase")
+
+    assert matches.mappings == [{"source_content": "engine", "target_content": "moteur"}]
+
+
+def test_a_term_base_is_read_once_across_tasks():
+    glossary, cat = _cat_glossary()
+    for _ in range(3):
+        glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
+                               target_language="fr-fr", texts=["the engine"], provider="phrase")
+
+    assert cat.asked == ["tb-1"]
+
+
+def test_several_term_bases_are_all_read():
+    terms = {"tb-1": ENGINE[:2], "tb-2": ENGINE[2:]}
+    glossary, cat = _cat_glossary(terms)
+
+    matches = glossary.fetch_matches(glossary_ids=["tb-1", "tb-2"], source_language="en-gb",
+                                     target_language="fr-fr",
+                                     texts=["the engine and the brake pad"], provider="phrase")
+
+    assert cat.asked == ["tb-1", "tb-2"]
+    assert {m["target_content"] for m in matches.mappings} == {"moteur", "plaquette de frein"}
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"glossary_ids": []}, "No glossary IDs provided"),
+        ({"source_language": ""}, "No source language provided"),
+        ({"texts": []}, "No texts provided"),
+    ],
+)
+def test_the_cat_glossary_rejects_the_same_missing_inputs(overrides, message):
+    glossary, _ = _cat_glossary()
+    kwargs = dict(glossary_ids=["tb-1"], source_language="en-gb", target_language="fr-fr",
+                  texts=["the engine"], provider="phrase")
+    kwargs.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        glossary.fetch_matches(**kwargs)
+
+
+def test_stanza_splits_texts_into_batches():
+    """A whole term base in one request is rejected as 413 Payload Too Large."""
+    from sourcecode.postmt import StanzaClient
+
+    sizes = []
+
+    def handler(request):
+        texts = json.loads(request.content)["texts"]
+        sizes.append(len(texts))
+        return httpx.Response(200, json={"lemmatized_texts": [t.upper() for t in texts]})
+
+    client = StanzaClient("http://stanza.test", 5, batch_size=2)
+    client._client = httpx.Client(base_url="http://stanza.test", transport=httpx.MockTransport(handler))
+
+    assert client.lemmatize_batch_safe(["a", "b", "c", "d", "e"], "en") == ["A", "B", "C", "D", "E"]
+    assert sizes == [2, 2, 1]
