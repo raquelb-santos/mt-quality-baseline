@@ -4,8 +4,8 @@ from collections import defaultdict
 from typing import Any, Sequence
 
 from .dnt_benchmark import Result
-from .dnt_score import pool
-from .report import Scorecard, arrow, by_stratum, cell, failure_warning, pct, rate, scope_note, signed_pct, spend_fact, subheading_of, table
+from .dnt_score import ReversionAggregate, aggregate, aggregate_reversion, pool
+from .report import Scorecard, arrow, by_language_pair, cell, delta as delta_of, failure_warning, pct, rate, scope_note, signed_pct, subheading_of, table
 from .text_processing import count_surface
 
 VERSIONS = ("mt", "ape", "rev")
@@ -53,7 +53,6 @@ def scorecard(result: Result) -> Scorecard:
         *(f"{label.ljust(width)}  {_moved(values)}" for label, values in metrics),
         *scope_note(mt.segments_scored, totals["segments_with_items"],
                     "the rest name no item that both SRC and REF carry"),
-        *spend_fact(result.usage),
     ]
 
     detail = [
@@ -72,7 +71,7 @@ def scorecard(result: Result) -> Scorecard:
     ]
 
     return Scorecard(
-        heading="dnt", subheading=subheading_of(result), facts=facts,
+        heading="dnt", dataset=result.dataset, subheading=subheading_of(result), facts=facts,
         warnings=warnings, detail=detail,
     )
 
@@ -215,7 +214,7 @@ def render_detection(result: Result) -> str:
         return ""
 
     lines = [
-        "### DNT items detected (from /v1/revert)",
+        "#### DNT items detected (from /v1/revert)",
         "",
         "| Segment | DNT item | SRC | MT | APE | REV | REF | Preservation | Flag |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
@@ -305,7 +304,7 @@ def render_comparison(results: Sequence[Result]) -> str:
     if len(results) < 2:
         return ""
 
-    lines = ["## Across datasets", ""]
+    lines = ["### Across datasets", ""]
     for result in results:
         pair = f"{result.parameters['source_language']}>{result.parameters['target_language']}"
         lines.append(
@@ -320,50 +319,238 @@ def render_comparison(results: Sequence[Result]) -> str:
     return "\n".join(lines)
 
 
-def stratum_rows(results: Sequence[Result]) -> list[dict[str, Any]]:
-    """One row per stratum, with the pooled counts its rates were computed from."""
-    rows = []
-    for (pair, domain), group in by_stratum(results).items():
-        mt, ape, rev = (pool([getattr(r, column) for r in group]) for column in VERSIONS)
+def _measured(segments: Sequence[Any]) -> dict[str, Any]:
+    """One group's counts, aggregated from the segments themselves rather than from datasets.
 
-        rows.append({
-            "language_pair": pair,
-            "domain": domain,
-            "expected_instances": mt.expected,
-            "mt_preservation_rate": mt.preservation_rate,
-            "ape_preservation_rate": ape.preservation_rate,
-            "rev_preservation_rate": rev.preservation_rate,
-            "mt_leaked": mt.leaked,
-            "mt_over_kept": mt.over_kept,
-        })
+    Segments no revert batch came back for leave the denominator, as they do on the scorecard."""
+    unread = sum(1 for s in segments if s.unread)
+    scored = [s for s in segments if not s.unread]
+    mt, ape, rev = (
+        aggregate([getattr(s, column) for s in scored], segments_unread=unread)
+        for column in VERSIONS
+    )
+    return {
+        "segments": len(segments),
+        "segments_unread": unread,
+        "expected_instances": mt.expected,
+        "mt_preservation_rate": mt.preservation_rate,
+        "ape_preservation_rate": ape.preservation_rate,
+        "rev_preservation_rate": rev.preservation_rate,
+        "mt_leaked": mt.leaked,
+        "mt_over_kept": mt.over_kept,
+    }
+
+
+def stratum_rows(results: Sequence[Result]) -> list[dict[str, Any]]:
+    """One row per language pair, then one for each domain the pair was measured in."""
+    rows = []
+    for pair, domains in by_language_pair(results).items():
+        rows.append({"language_pair": pair, "domain": None, "label": pair,
+                     **_measured([s for group in domains.values() for s in group])})
+        for domain, group in domains.items():
+            rows.append({"language_pair": pair, "domain": domain, "label": f"↳ {domain}",
+                         **_measured(group)})
     return rows
 
 
 def stratum_rate_rows(results: Sequence[Result]) -> list[tuple[str, list[str]]]:
-    """Each stratum against its pooled preservation, the instance count in the label."""
+    """Each group against its pooled preservation, the instance count in the label."""
+    all_rows = stratum_rows(results)
     rows = [
-        (
-            f"{row['language_pair']} · {row['domain']} · {row['expected_instances']} inst",
-            [pct(row[f"{column}_preservation_rate"]) for column in VERSIONS],
-        )
-        for row in stratum_rows(results)
+        (f"{row['label']} · {row['expected_instances']} inst",
+         [pct(row[f"{column}_preservation_rate"]) for column in VERSIONS])
+        for row in all_rows
     ]
 
-    if len(rows) > 1:
-        pooled = [pool([getattr(r, column) for r in results]) for column in VERSIONS]
-        rows.append(
-            (f"ALL · {pooled[0].expected} inst", [pct(a.preservation_rate) for a in pooled])
-        )
+    if sum(1 for row in all_rows if row["domain"] is None) > 1:
+        pooled = _measured([s for result in results for s in result.segments])
+        rows.append((f"ALL · {pooled['expected_instances']} inst",
+                     [pct(pooled[f"{column}_preservation_rate"]) for column in VERSIONS]))
 
     return rows
 
 
 def render_strata(results: Sequence[Result]) -> str:
-    """Pooled preservation per language pair and domain."""
-    return table("Preservation by stratum", "Stratum", [v.upper() for v in VERSIONS],
-                 stratum_rate_rows(results), heading="##")
+    """Preservation per language pair, split by the domains inside it."""
+    return table("Preservation by language pair", "Language pair", [v.upper() for v in VERSIONS],
+                 stratum_rate_rows(results), heading="###")
 
 
 def render_strata_console(results: Sequence[Result]) -> str:
-    return table("Preservation by stratum", "stratum", [v.upper() for v in VERSIONS],
+    return table("Preservation by language pair", "language pair", [v.upper() for v in VERSIONS],
                  stratum_rate_rows(results), console=True)
+
+
+def reversion_scorecard(result: Any) -> Scorecard:
+    scored, totals = result.scored, result.totals
+
+    warnings = failure_warning(result)
+    if scored.segments_unread:
+        warnings.append(
+            f"{scored.segments_unread}/{totals['segments']} pairs came back from no revert batch"
+            " and are excluded from every rate below, rather than counted as having lost"
+            " every term."
+        )
+    if not scored.expected:
+        warnings.append(
+            "No gold term on any pair scored, so every rate below is over an empty corpus."
+        )
+
+    facts = [
+        f"Pairs {totals['segments']} · with gold terms {totals['segments_with_terms']}"
+        f" · changed by APE {totals['segments_changed_by_ape']}"
+        f" · by REV {totals['segments_changed_by_rev']}"
+        f" · by REV on APE {totals['segments_changed_by_rev_ape']}"
+        f" · gold terms {scored.expected}",
+        f"Terms carried  MT {pct(scored.mt_rate)} → REV {pct(scored.rev_rate)}"
+        f" ({signed_pct(delta_of(scored.mt_rate, scored.rev_rate))})"
+        f"  ·  APE {pct(scored.ape_rate)} → REV {pct(scored.rev_ape_rate)}"
+        f" ({signed_pct(delta_of(scored.ape_rate, scored.rev_ape_rate))})",
+        f"Counts  MT {scored.in_mt}/{scored.expected} → REV {scored.in_rev}/{scored.expected}"
+        f"  ·  APE {scored.in_ape}/{scored.expected}"
+        f" → REV {scored.in_rev_ape}/{scored.expected}",
+        f"REV on MT restored {scored.repaired} · broke {scored.broken}"
+        f"  ·  on APE restored {scored.repaired_from_ape} · broke {scored.broken_from_ape}",
+        f"Pairs fully carried  from MT {pct(scored.segment_rate)}"
+        f" ({scored.segments_clean}/{scored.segments_scored})"
+        f"  ·  from APE {pct(scored.segment_rate_from_ape)}"
+        f" ({scored.segments_clean_from_ape}/{scored.segments_scored})",
+        *scope_note(scored.segments_scored, totals["segments_with_terms"],
+                    "a pair with no gold term sets no expectation"),
+    ]
+
+    return Scorecard(
+        heading="dnt reversion", dataset=result.dataset, subheading=subheading_of(result),
+        facts=facts, warnings=warnings,
+    )
+
+
+def _arm(carried: bool, broken: bool) -> str:
+    return "broken by REV" if broken else ("carried" if carried else "not restored")
+
+
+def reversion_term_rows(result: Any) -> list[dict[str, Any]]:
+    """A term is listed when either arm lost it, so the two arms can be read against each other."""
+    rows = []
+    for segment in result.segments:
+        for term in segment.score.terms:
+            if term.in_rev_mt and term.in_rev_ape:
+                continue
+            rows.append({
+                "segment_id": segment.source_segment_id,
+                "term": term.text,
+                "in_mt": "yes" if term.in_mt else "no",
+                "in_rev": "yes" if term.in_rev_mt else "no",
+                "in_ape": "yes" if term.in_ape else "no",
+                "in_rev_ape": "yes" if term.in_rev_ape else "no",
+                "outcome": _arm(term.in_rev_mt, term.broken),
+                "outcome_ape": _arm(term.in_rev_ape, term.broken_from_ape),
+            })
+    return rows
+
+
+_TERM_COLUMNS = ["In MT", "In REV", "In APE", "In REV(APE)", "From MT", "From APE"]
+
+
+def _term_cells(row: dict[str, Any]) -> list[str]:
+    return [row["in_mt"], row["in_rev"], row["in_ape"], row["in_rev_ape"],
+            row["outcome"], row["outcome_ape"]]
+
+
+def render_reversion_terms(result: Any) -> str:
+    rows = reversion_term_rows(result)
+    if not rows:
+        return ""
+
+    return table(
+        f"Gold terms reversion did not carry — {result.dataset}", "Segment",
+        ["Term", *_TERM_COLUMNS],
+        [(row["segment_id"], [cell(row["term"]), *_term_cells(row)]) for row in rows],
+    )
+
+
+def render_reversion_terms_console(result: Any) -> str:
+    rows = reversion_term_rows(result)
+    if not rows:
+        return ""
+
+    return table(
+        f"Gold terms reversion did not carry — {result.dataset}", "segment",
+        ["term", *(name.lower() for name in _TERM_COLUMNS)],
+        [(str(row["segment_id"]), [row["term"], *_term_cells(row)]) for row in rows[:40]],
+        console=True,
+    )
+
+
+def _reversion_of(segments: Sequence[Any]) -> ReversionAggregate:
+    """Aggregated from the segments themselves, so a pair drawn from several files is one row."""
+    scored = [s for s in segments if not s.unread]
+    return aggregate_reversion(
+        [s.score for s in scored], segments_unread=len(segments) - len(scored)
+    )
+
+
+def reversion_stratum_rows(results: Sequence[Any]) -> list[dict[str, Any]]:
+    """One row per language pair, then one for each domain the pair was measured in."""
+    def measured(segments: Sequence[Any]) -> dict[str, Any]:
+        pooled = _reversion_of(segments)
+        return {
+            "segments": len(segments),
+            "expected_instances": pooled.expected,
+            "mt_rate": pooled.mt_rate,
+            "rev_rate": pooled.rev_rate,
+            "ape_rate": pooled.ape_rate,
+            "rev_ape_rate": pooled.rev_ape_rate,
+        }
+
+    rows = []
+    for pair, domains in by_language_pair(results).items():
+        rows.append({"language_pair": pair, "domain": None, "label": pair,
+                     **measured([s for group in domains.values() for s in group])})
+        for domain, group in domains.items():
+            rows.append({"language_pair": pair, "domain": domain, "label": f"↳ {domain}",
+                         **measured(group)})
+    return rows
+
+
+def reversion_rate_rows(results: Sequence[Any]) -> list[tuple[str, list[str]]]:
+    all_rows = reversion_stratum_rows(results)
+    rows = [
+        (f"{row['label']} · {row['expected_instances']} terms",
+         [pct(row["mt_rate"]), pct(row["rev_rate"]),
+          pct(row["ape_rate"]), pct(row["rev_ape_rate"])])
+        for row in all_rows
+    ]
+
+    if sum(1 for row in all_rows if row["domain"] is None) > 1:
+        pooled = _reversion_of([s for r in results for s in r.segments])
+        rows.append((f"ALL · {pooled.expected} terms",
+                     [pct(pooled.mt_rate), pct(pooled.rev_rate),
+                      pct(pooled.ape_rate), pct(pooled.rev_ape_rate)]))
+
+    return rows
+
+
+def render_reversion_strata(results: Sequence[Any]) -> str:
+    return table("Gold terms carried by language pair", "Language pair",
+                 ["MT", "REV", "APE", "REV(APE)"], reversion_rate_rows(results), heading="###")
+
+
+def render_reversion_strata_console(results: Sequence[Any]) -> str:
+    return table("Gold terms carried by language pair", "language pair",
+                 ["MT", "REV", "APE", "REV(APE)"], reversion_rate_rows(results), console=True)
+
+
+def render_reversion_comparison(results: Sequence[Any]) -> str:
+    if len(results) < 2:
+        return ""
+
+    lines = ["### Across datasets", ""]
+    for result in results:
+        lines.append(
+            f"- {result.dataset} · {result.parameters['source_language']}"
+            f">{result.parameters['target_language']} · {result.scored.expected} terms"
+            f"  ·  MT {pct(result.scored.mt_rate)} → REV {pct(result.scored.rev_rate)}"
+            f"  ·  APE {pct(result.scored.ape_rate)} → REV {pct(result.scored.rev_ape_rate)}"
+        )
+    return "\n".join([*lines, ""])

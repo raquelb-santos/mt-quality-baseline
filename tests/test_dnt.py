@@ -1,11 +1,12 @@
 """The DNT preservation component: the metric, its rendering, and the orchestration around it."""
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
-from sourcecode import dnt_report, report, run
+from sourcecode import dnt_benchmark, dnt_report, report, run
 from sourcecode.dnt import Reversion
 from sourcecode.dnt_benchmark import fingerprint_of, run_benchmark
 from sourcecode.dnt_score import (
@@ -16,7 +17,7 @@ from sourcecode.dnt_score import (
     score_dnt,
 )
 from sourcecode.postmt import RunResult
-from sourcecode.text_processing import Dataset, count_surface, normalize_language
+from sourcecode.text_processing import Dataset, Task, count_surface, normalize_language
 
 
 EN, FR = "en-gb", "fr-fr"
@@ -108,14 +109,14 @@ ITEMS = ["AcoladPro", "Cleaner", "Café Pro", "Widget"]
 
 
 def _dataset(name="dnt-set", domain="Test", segments=SEGMENTS):
+    parameters = normalize_language(
+        {"source_language": EN, "target_language": FR, "domain": domain}
+    )
     return Dataset(
         name=name,
         component="dnt",
-        parameters=normalize_language(
-            {"source_language": EN, "target_language": FR, "domain": domain}
-        ),
-        glossary_ids=[],
-        segments=list(segments),
+        parameters=parameters,
+        tasks=[Task(parameters, list(segments))],
     )
 
 
@@ -627,20 +628,24 @@ def test_no_items_says_so():
 
 
 def test_single_dataset_still_gets_stratum_row():
-    """A run that measured one dataset must still say what its stratum preserved."""
+    """A run that measured one dataset must still say what its language pair preserved."""
     rendered = dnt_report.render_strata([_result()])
 
-    assert "Preservation by stratum" in rendered
+    assert "Preservation by language pair" in rendered
     assert "en-gb->fr-fr" in rendered
     assert "ALL" not in rendered                 # nothing to pool across
 
 
-def test_datasets_in_different_domains_are_different_strata():
-    """Each gets its own row, and the row across them is pooled from the counts, not averaged."""
+def test_one_pair_splits_into_the_domains_under_it():
+    """The pair leads, and each domain it was measured in is listed beneath it."""
     results = [_result("a", "Automotive"), _result("b", "Legal")]
 
-    assert len(dnt_report.stratum_rows(results)) == 2
-    assert "ALL" in dnt_report.render_strata(results)
+    rows = dnt_report.stratum_rows(results)
+
+    assert [row["label"] for row in rows] == ["en-gb->fr-fr", "↳ Automotive", "↳ Legal"]
+    assert rows[0]["expected_instances"] == sum(row["expected_instances"] for row in rows[1:])
+    # One pair, so its row is already the total; an ALL row would only repeat it.
+    assert "ALL" not in dnt_report.render_strata(results)
 
 
 def test_stratum_rows_are_printed_as_well_as_written():
@@ -834,3 +839,219 @@ def test_dry_run_mirrors_mt_baseline():
 
     assert result.mt.preserved == result.ape.preserved
     assert result.delta.ape_preservation_rate == 0.0
+
+
+# the reversion gold set: the terms to restore are given, so nothing is read off a reference
+
+from sourcecode.dnt_score import aggregate_reversion, score_reversion   # noqa: E402
+from sourcecode.postmt import preflight_submission   # noqa: E402
+from sourcecode.text_processing import load as load_dataset_file   # noqa: E402
+
+
+def _gold(tmp_path, pairs, name="gold.json"):
+    path = tmp_path / name
+    path.write_text(json.dumps({"version": "1.0", "segments": pairs}), encoding="utf-8")
+    return path
+
+
+def _pair(identifier="eval-1", target="Die RITFIT Bank.", terms=("RITFIT",), target_language="de_DE"):
+    return {
+        "id": identifier, "source_language": "en_US", "target_language": target_language,
+        "source": "The RITFIT bench.", "target": target, "expected_terms": list(terms),
+    }
+
+
+def test_a_gold_set_needs_no_reference(tmp_path):
+    """The gold names the terms outright, so there is nothing to compare against a human."""
+    data = load_dataset_file(_gold(tmp_path, [_pair()]), component="dnt")
+
+    assert data.is_gold_set
+    assert data.segments[0]["expected_terms"] == ["RITFIT"]
+    assert "reference_content" not in data.segments[0]
+
+
+def test_each_target_language_is_its_own_task(tmp_path):
+    path = _gold(tmp_path, [_pair(target_language="de_DE"), _pair(target_language="ja_JP")])
+    data = load_dataset_file(path, component="dnt")
+
+    assert [t.parameters["clean_target_language_code"] for t in data.tasks] == ["de-de", "ja-jp"]
+
+
+def test_a_pair_with_no_target_leaves_the_set(tmp_path):
+    """An empty machine translation has nothing to revert, and would score as every term lost."""
+    path = _gold(tmp_path, [_pair(), _pair("eval-2", target="   ")])
+    data = load_dataset_file(path, component="dnt")
+
+    assert [s["source_segment_id"] for s in data.segments] == ["eval-1"]
+
+
+def test_a_detection_gold_set_says_what_it_is(tmp_path):
+    path = tmp_path / "detection.json"
+    path.write_text(json.dumps({"segments": [
+        {"id": "eval-1", "text": "The RITFIT bench.", "source_language": "en_US",
+         "expected_terms": ["RITFIT"]},
+    ]}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="detection gold set"):
+        load_dataset_file(path, component="dnt")
+
+
+def _score(terms, mt_text, rev_text, *, ape_text=None, rev_ape_text=None, language="de-de"):
+    """The APE arm mirrors the MT arm unless a test is about the two coming apart."""
+    return score_reversion(
+        terms=terms,
+        mt_text=mt_text,
+        ape_text=mt_text if ape_text is None else ape_text,
+        rev_text=rev_text,
+        rev_ape_text=rev_text if rev_ape_text is None else rev_ape_text,
+        target_language_code=language,
+    )
+
+
+def test_a_term_restored_by_reversion_counts_as_repaired():
+    score = _score(["RITFIT", "LA Galaxy"], "RITFIT und LA-Galaxie", "RITFIT und LA Galaxy")
+
+    assert (score.expected, score.in_mt, score.in_rev) == (2, 1, 2)
+    assert (score.repaired, score.broken) == (1, 0)
+    assert score.clean
+
+
+def test_a_term_reversion_loses_counts_as_broken():
+    score = _score(["RITFIT"], "RITFIT hier", "Ritfit hier")
+
+    assert (score.in_mt, score.in_rev, score.broken) == (1, 0, 1)
+    assert not score.clean
+
+
+def test_the_two_arms_are_scored_against_their_own_baseline():
+    """Post-editing can lose a term the MT carried, and reverting the APE has to restore it."""
+    score = _score(
+        ["RITFIT"], "RITFIT hier", "RITFIT hier",
+        ape_text="Ritfit hier", rev_ape_text="RITFIT hier",
+    )
+
+    assert (score.in_mt, score.in_ape) == (1, 0)
+    assert (score.in_rev, score.in_rev_ape) == (1, 1)
+    # Nothing to repair on the MT arm; the APE arm restored what post-editing dropped.
+    assert (score.repaired, score.repaired_from_ape) == (0, 1)
+    assert score.clean and score.clean_from_ape
+
+
+def test_an_arm_can_fail_where_the_other_carries():
+    score = _score(["RITFIT"], "RITFIT hier", "RITFIT hier", rev_ape_text="Ritfit hier")
+
+    assert (score.in_rev, score.in_rev_ape) == (1, 0)
+    assert (score.broken, score.broken_from_ape) == (0, 1)
+    assert score.clean and not score.clean_from_ape
+
+
+def test_casing_is_part_of_carrying_the_term():
+    """A DNT item that came through in different casing did not come through."""
+    score = _score(["RITFIT"], "Ritfit", "Ritfit")
+
+    assert (score.in_mt, score.in_rev) == (0, 0)
+
+
+def test_an_unspaced_language_matches_without_word_boundaries():
+    score = _score(["RITFIT"], "RITFITのベンチ", "RITFITのベンチ", language="ja-jp")
+
+    assert (score.in_mt, score.in_rev) == (1, 1)
+
+
+def test_a_pair_with_no_gold_term_carries_no_denominator():
+    """It sets no expectation, so counting it as perfect would inflate every rate."""
+    empty = _score([], "x", "x")
+    one = _score(["RITFIT"], "RITFIT", "RITFIT")
+
+    pooled = aggregate_reversion([empty, one])
+
+    assert (pooled.expected, pooled.segments_scored) == (1, 1)
+    assert pooled.rev_rate == 1.0
+    assert pooled.rev_ape_rate == 1.0
+
+
+def test_the_same_term_twice_on_a_pair_is_one_expectation():
+    score = _score(["RITFIT", "RITFIT"], "RITFIT", "RITFIT")
+
+    assert score.expected == 1
+
+
+def test_a_gold_set_is_submitted_under_a_task_id_post_mt_accepts(tmp_path):
+    """post-mt rejects a submission with no `tempo_task_id`, so the gold set is given one."""
+    data = load_dataset_file(_gold(tmp_path, [_pair(), _pair("eval-2", target_language="fr_FR")]),
+                             component="dnt")
+
+    assert [t.parameters["tempo_task_id"] for t in data.tasks] == [
+        "mt-dnt-bench-gold-en-us_de-de", "mt-dnt-bench-gold-en-us_fr-fr",
+    ]
+    assert preflight_submission(data.tasks[0].parameters) == []
+
+
+def test_the_gold_set_goes_through_post_mt(tmp_path):
+    """The pairs are post-edited like any other dataset, so there is an APE arm to compare."""
+    data = load_dataset_file(_gold(tmp_path, [_pair()]), component="dnt")
+    postmt = FakePostMt(fixes={"The RITFIT bench.": "Die RITFIT Sitzbank."})
+
+    result = dnt_benchmark.run_reversion(
+        data, postmt=postmt, dnt=FakeDnt(reversions=[None]), config=CONFIG
+    )
+
+    [segment] = result.segments
+    assert segment.ape_text == "Die RITFIT Sitzbank."
+    assert segment.changed_by_ape
+
+
+def test_reversion_runs_on_the_mt_and_on_the_post_edited_text(tmp_path):
+    """Both arms are asked for the same pair, so the two rates are over the same terms."""
+    data = load_dataset_file(_gold(tmp_path, [_pair()]), component="dnt")
+    postmt = FakePostMt(fixes={"The RITFIT bench.": "Die Ritfit Sitzbank."})
+
+    seen = []
+
+    class _Dnt:
+        def revert(self, pairs, *, batch_size, source_language, target_language):
+            seen.extend(pair["target"] for pair in pairs)
+            return [Reversion(rev_text=p["target"].replace("Ritfit", "RITFIT"), items=[])
+                    for p in pairs]
+
+    result = dnt_benchmark.run_reversion(data, postmt=postmt, dnt=_Dnt(), config=CONFIG)
+
+    assert seen == ["Die RITFIT Bank.", "Die Ritfit Sitzbank."]
+    # The MT carried the term and APE dropped it; reverting the APE put it back.
+    assert (result.scored.in_mt, result.scored.in_ape) == (1, 0)
+    assert (result.scored.in_rev, result.scored.in_rev_ape) == (1, 1)
+    assert result.scored.repaired_from_ape == 1
+
+
+def test_reversion_runs_one_pass_per_language_pair(tmp_path):
+    path = _gold(tmp_path, [_pair(target_language="de_DE"), _pair("eval-2", target_language="fr_FR")])
+    data = load_dataset_file(path, component="dnt")
+
+    seen = []
+
+    class _Dnt:
+        def revert(self, pairs, *, batch_size, source_language, target_language):
+            seen.append((source_language, target_language, len(pairs)))
+            return [Reversion(rev_text=p["target"], items=[]) for p in pairs]
+
+    dnt_benchmark.run_reversion(data, postmt=FakePostMt(), dnt=_Dnt(), config=CONFIG)
+
+    # Two arms per pair: the MT first, then the post-edited text.
+    assert seen == [("en-us", "de-de", 1), ("en-us", "de-de", 1),
+                    ("en-us", "fr-fr", 1), ("en-us", "fr-fr", 1)]
+
+
+def test_a_pair_no_batch_came_back_for_leaves_the_denominator(tmp_path):
+    data = load_dataset_file(_gold(tmp_path, [_pair(), _pair("eval-2")]), component="dnt")
+
+    class _HalfBroken:
+        def revert(self, pairs, *, batch_size, source_language, target_language):
+            return [Reversion(rev_text=pairs[0]["target"], items=[]), None]
+
+    result = dnt_benchmark.run_reversion(
+        data, postmt=FakePostMt(), dnt=_HalfBroken(), config=CONFIG
+    )
+
+    assert result.scored.segments_unread == 1
+    assert result.scored.segments_scored == 1
+    assert result.totals["segments_read"] == 1

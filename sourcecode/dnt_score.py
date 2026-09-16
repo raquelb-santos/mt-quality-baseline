@@ -236,3 +236,189 @@ def pool(aggregates: Sequence[Aggregate]) -> Aggregate:
         total.segments_unread += agg.segments_unread
 
     return _with_rates(total)
+
+
+@dataclass(frozen=True)
+class TermOutcome:
+    """One gold term, and whether each of the four versions carries it verbatim.
+
+    Reversion is measured on two arms, because it is run over the raw MT and over the
+    post-edited text so the two can be compared on the same terms.
+    """
+
+    text: str
+    in_mt: bool
+    in_ape: bool
+    in_rev_mt: bool
+    in_rev_ape: bool
+
+    @property
+    def repaired(self) -> bool:
+        return self.in_rev_mt and not self.in_mt
+
+    @property
+    def broken(self) -> bool:
+        return self.in_mt and not self.in_rev_mt
+
+    @property
+    def repaired_from_ape(self) -> bool:
+        return self.in_rev_ape and not self.in_ape
+
+    @property
+    def broken_from_ape(self) -> bool:
+        return self.in_ape and not self.in_rev_ape
+
+
+@dataclass
+class ReversionScore:
+    terms: list[TermOutcome] = field(default_factory=list)
+
+    @property
+    def expected(self) -> int:
+        return len(self.terms)
+
+    @property
+    def in_mt(self) -> int:
+        return sum(1 for term in self.terms if term.in_mt)
+
+    @property
+    def in_ape(self) -> int:
+        return sum(1 for term in self.terms if term.in_ape)
+
+    @property
+    def in_rev(self) -> int:
+        return sum(1 for term in self.terms if term.in_rev_mt)
+
+    @property
+    def in_rev_ape(self) -> int:
+        return sum(1 for term in self.terms if term.in_rev_ape)
+
+    @property
+    def repaired(self) -> int:
+        return sum(1 for term in self.terms if term.repaired)
+
+    @property
+    def broken(self) -> int:
+        return sum(1 for term in self.terms if term.broken)
+
+    @property
+    def repaired_from_ape(self) -> int:
+        return sum(1 for term in self.terms if term.repaired_from_ape)
+
+    @property
+    def broken_from_ape(self) -> int:
+        return sum(1 for term in self.terms if term.broken_from_ape)
+
+    @property
+    def clean(self) -> bool:
+        """Every gold term carried once reversion had run over the MT."""
+        return bool(self.terms) and self.in_rev == self.expected
+
+    @property
+    def clean_from_ape(self) -> bool:
+        return bool(self.terms) and self.in_rev_ape == self.expected
+
+
+def score_reversion(
+    *,
+    terms: Iterable[str],
+    mt_text: str,
+    ape_text: str,
+    rev_text: str,
+    rev_ape_text: str,
+    target_language_code: str | None,
+) -> ReversionScore:
+    """A gold term counts as carried where it survives verbatim, casing included."""
+    def carries(text: str, term: str) -> bool:
+        return bool(count_surface(text, term, target_language_code, casefold=False))
+
+    outcomes = [
+        TermOutcome(
+            term,
+            carries(mt_text, term),
+            carries(ape_text, term),
+            carries(rev_text, term),
+            carries(rev_ape_text, term),
+        )
+        for term in dict.fromkeys(term for term in terms if term and term.strip())
+    ]
+    return ReversionScore(outcomes)
+
+
+@dataclass
+class ReversionAggregate:
+    expected: int = 0
+    in_mt: int = 0
+    in_ape: int = 0
+    in_rev: int = 0
+    in_rev_ape: int = 0
+    repaired: int = 0
+    broken: int = 0
+    repaired_from_ape: int = 0
+    broken_from_ape: int = 0
+    segments_scored: int = 0
+    segments_clean: int = 0
+    segments_clean_from_ape: int = 0
+    # Segments no revert batch came back for; excluded rather than scored as having lost everything.
+    segments_unread: int = 0
+
+    @property
+    def mt_rate(self) -> float | None:
+        return rate(self.in_mt, self.expected)
+
+    @property
+    def ape_rate(self) -> float | None:
+        return rate(self.in_ape, self.expected)
+
+    @property
+    def rev_rate(self) -> float | None:
+        return rate(self.in_rev, self.expected)
+
+    @property
+    def rev_ape_rate(self) -> float | None:
+        return rate(self.in_rev_ape, self.expected)
+
+    @property
+    def segment_rate(self) -> float | None:
+        return rate(self.segments_clean, self.segments_scored)
+
+    @property
+    def segment_rate_from_ape(self) -> float | None:
+        return rate(self.segments_clean_from_ape, self.segments_scored)
+
+
+def _combine_reversion(
+    counted: Sequence[Any], *, segments_scored: int, segments_clean: int,
+    segments_clean_from_ape: int, segments_unread: int
+) -> ReversionAggregate:
+    total = ReversionAggregate(
+        segments_scored=segments_scored,
+        segments_clean=segments_clean,
+        segments_clean_from_ape=segments_clean_from_ape,
+        segments_unread=segments_unread,
+    )
+    for item in counted:
+        total.expected += item.expected
+        total.in_mt += item.in_mt
+        total.in_ape += item.in_ape
+        total.in_rev += item.in_rev
+        total.in_rev_ape += item.in_rev_ape
+        total.repaired += item.repaired
+        total.broken += item.broken
+        total.repaired_from_ape += item.repaired_from_ape
+        total.broken_from_ape += item.broken_from_ape
+    return total
+
+
+def aggregate_reversion(
+    scores: Sequence[ReversionScore], *, segments_unread: int = 0
+) -> ReversionAggregate:
+    """A segment with no gold term sets no expectation, so it carries no denominator."""
+    scored = [score for score in scores if score.expected]
+    return _combine_reversion(
+        scored,
+        segments_scored=len(scored),
+        segments_clean=sum(1 for score in scored if score.clean),
+        segments_clean_from_ape=sum(1 for score in scored if score.clean_from_ape),
+        segments_unread=segments_unread,
+    )

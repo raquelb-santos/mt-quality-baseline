@@ -47,7 +47,7 @@ def preflight_submission(parameters: dict[str, Any]) -> list[str]:
     return [
         f"`{name}` is missing — post-mt rejects every segment with "
         f"'Missing required parameters fields: {name}' and returns no APE text"
-        for name in ("tempo_task_id", "cat_project_id")
+        for name in ("tempo_task_id",)
         if not str(parameters.get(name) or "").strip()
     ]
 
@@ -55,6 +55,9 @@ def preflight_submission(parameters: dict[str, Any]) -> list[str]:
 def preflight_parameters(parameters: dict[str, Any]) -> list[str]:
     """Reasons post-mt would reject the task or silently retrieve no glossary, at full LLM cost."""
     problems = preflight_submission(parameters)
+
+    if not str(parameters.get("cat_project_id") or "").strip():
+        problems.append("`cat_project_id` is missing — post-mt retrieves no glossary for the task")
 
     provider = str(parameters.get("cat_tool_provider") or "").strip()
     if not provider:

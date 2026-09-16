@@ -49,6 +49,18 @@ COMPONENT_SECTIONS = {
 }
 
 
+COMPONENT_SECTIONS["dnt_reversion"] = (
+    "DNT reversion against the gold set",
+    lambda results: [
+        *(part for result in results
+          for part in (dnt_report.reversion_scorecard(result).as_markdown(),
+                       dnt_report.render_reversion_terms(result))),
+        dnt_report.render_reversion_comparison(results),
+        dnt_report.render_reversion_strata(results),
+    ],
+)
+
+
 def _language_slots(configured: list[str], components: list[str]) -> dict[str, str]:
     """`BENCH_LANGUAGE` lines up slot by slot with `BENCH_COMPONENT`, a blank slot scoring every pair."""
     if len(configured) > len(components):
@@ -195,6 +207,8 @@ def main(argv: list[str] | None = None) -> int:
 
             _, module, _, console = COMPONENTS[component]
             results = []
+            # Kept apart from `results`: a gold set is a different measurement with its own report.
+            reversion_results: list[Any] = []
             for path in datasets:
                 logging.info("[BENCH] loading %s", path)
                 data = (
@@ -216,6 +230,18 @@ def main(argv: list[str] | None = None) -> int:
                         term_bases=term_bases, config=config, skip_pipeline=args.dry_run,
                     )
                 elif component == "dnt":
+                    if data.is_gold_set:
+                        scored = dnt_benchmark.run_reversion(
+                            data, postmt=postmt, dnt=dnt, config=config,
+                            skip_pipeline=args.dry_run,
+                        )
+                        for block in (dnt_report.reversion_scorecard(scored).as_console(),
+                                      dnt_report.render_reversion_terms_console(scored)):
+                            if block:
+                                print(block)
+                        reversion_results.append(scored)
+                        continue
+
                     scored = dnt_benchmark.run_benchmark(
                         data, postmt=postmt, dnt=dnt, config=config, skip_pipeline=args.dry_run
                     )
@@ -232,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
                         print(block)
                 results.append(scored)
 
-            if not results:
+            if not results and not reversion_results:
                 print(f"No {component} dataset could be scored - see the warnings above. Check "
                       f"{PATH_VARIABLES[component]}, and BENCH_LANGUAGE if it is set.",
                       file=sys.stderr)
@@ -241,6 +267,10 @@ def main(argv: list[str] | None = None) -> int:
             results_by_component[component] = results
             if results:
                 print(module.render_strata_console(results))
+
+            if reversion_results:
+                results_by_component["dnt_reversion"] = reversion_results
+                print(dnt_report.render_reversion_strata_console(reversion_results))
 
         report_file = report.write_report(
             results_by_component,

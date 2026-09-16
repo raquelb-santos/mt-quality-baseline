@@ -66,6 +66,11 @@ class Dataset:
         """One parameter value per segment, from the task that segment is sent in."""
         return [task.parameters.get(name) for task in self.tasks for _ in task.segments]
 
+    @property
+    def is_gold_set(self) -> bool:
+        """A gold set names the terms that must survive, so it needs neither post-mt nor a
+        reference — it is scored against the terms themselves."""
+        return bool(self.segments) and "expected_terms" in self.segments[0]
 
     def parameters_per_segment(self) -> list[dict[str, Any]]:
         """The whole parameter set each segment is sent under."""
@@ -120,6 +125,64 @@ EXPORT_PARAMETERS = {
 }
 
 
+def is_gold_set(body: Any) -> bool:
+    """A DNT gold set names the terms that must survive, so it carries no human reference."""
+    segments = body.get("segments") if isinstance(body, dict) else None
+    return bool(segments) and isinstance(segments[0], dict) and "expected_terms" in segments[0]
+
+
+def parse_gold_set(body: dict[str, Any], name: str) -> dict[str, Any]:
+    """The reversion gold set, one entry per source segment and target language."""
+    first = body["segments"][0]
+    if not ("source" in first and "target" in first):
+        raise ValueError(
+            f"{name} names expected_terms but carries no source and target, so it is a detection "
+            f"gold set. Point DNT_PATH at the reversion gold set instead."
+        )
+
+    tasks: dict[tuple[str, str], Task] = {}
+    untranslated = 0
+    for entry in body["segments"]:
+        # Empty MT has nothing to revert, so skip it rather than score every term lost.
+        if not str(entry.get("target") or "").strip():
+            untranslated += 1
+            continue
+
+        # The gold set spells a language `en_US`, the rest of the benchmark `en-us`.
+        languages = (
+            str(entry.get("source_language") or "").replace("_", "-"),
+            str(entry.get("target_language") or "").replace("_", "-"),
+        )
+        # post-mt requires a task id; it stays stable so post-mt's cache makes reruns free.
+        task_id = f"mt-dnt-bench-{Path(name).stem}-{languages[0]}_{languages[1]}".lower()
+        task = tasks.setdefault(languages, Task(
+            {
+                "tempo_task_id": task_id,
+                "source_language": languages[0],
+                "target_language": languages[1],
+            }, [],
+        ))
+        segment = {
+            "source_segment_id": str(entry.get("id") or len(task.segments)),
+            "source_content": entry.get("source") or "",
+            "target_content": entry.get("target") or "",
+            # The gold: the terms the reverted target has to carry, whatever MT did to them.
+            "expected_terms": list(entry.get("expected_terms") or []),
+        }
+        # A gold set needs no reference, but one written against a human keeps it for analysis.
+        if str(entry.get("reference_content") or "").strip():
+            segment["reference_content"] = entry["reference_content"]
+        task.segments.append(segment)
+
+    if untranslated:
+        logger.warning(
+            "[GOLD] %s: %d of %d pairs carry no target at all and are left out",
+            name, untranslated, len(body["segments"]),
+        )
+
+    return {"tasks": list(tasks.values())}
+
+
 def is_export_header(names: Sequence[str]) -> bool:
     """Whether a header is a CAT export rather than a dataset written in the canonical names."""
     return "SOURCECONTENT" in {str(name or "").strip().upper() for name in names}
@@ -171,7 +234,12 @@ def validate(dataset: Dataset) -> None:
         errors.append("no segments")
 
     for index, segment in enumerate(dataset.segments):
-        for field_name in ("source_content", "target_content", "reference_content"):
+        # A gold set states the terms outright, so it needs no reference to read them off.
+        required = ("source_content", "target_content")
+        if "expected_terms" not in segment:
+            required += ("reference_content",)
+
+        for field_name in required:
             value = segment.get(field_name)
             if not (isinstance(value, str) and value.strip()):
                 errors.append(f"segment[{index}] missing `{field_name}`")
@@ -217,6 +285,8 @@ def load(path: str | Path, *, component: str, languages: Sequence[tuple[str, str
 
     if suffix == ".json":
         body = json.loads(path.read_text(encoding="utf-8"))
+        if is_gold_set(body):
+            body = {"name": body.get("name"), **parse_gold_set(body, path.name)}
     elif suffix == ".csv":
         # Two formats share the extension, so the header says which one this is.
         text = path.read_text(encoding="utf-8-sig")
