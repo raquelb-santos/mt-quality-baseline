@@ -165,34 +165,24 @@ class Aggregate:
     segments_source_unpaired: int = 0
 
 
-def _with_rates(total: Aggregate) -> Aggregate:
-    total.integrity_rate = rate(total.present, total.expected)
-    total.segment_integrity_rate = rate(total.segments_clean, total.segments_scored)
-    return total
-
-
 def aggregate(scores: Sequence[Score]) -> Aggregate:
-    total = Aggregate()
-
-    for score in scores:
-        # A segment counts once either side carries a tag, so an invented tag cannot hide in a
-        # source that carried none.
-        if not score.tag_scores:
-            continue
-
-        total.expected += score.expected
-        total.present += score.present
-        total.errors.add(score.errors)
-        total.tags.add(score.tags)
-
-        total.segments_scored += 1
-        total.segments_mis_ordered += int(score.mis_ordered)
-        total.segments_unpaired += int(bool(score.unpaired))
-        total.segments_source_unpaired += int(bool(score.source_unpaired))
-        if score.defects == 0:
-            total.segments_clean += 1
-
-    return _with_rates(total)
+    # A segment counts once either side carries a tag, so an invented tag cannot hide in a
+    # source that carried none.
+    return pool([
+        Aggregate(
+            expected=score.expected,
+            present=score.present,
+            errors=score.errors,
+            tags=score.tags,
+            segments_scored=1,
+            segments_clean=int(score.defects == 0),
+            segments_mis_ordered=int(score.mis_ordered),
+            segments_unpaired=int(bool(score.unpaired)),
+            segments_source_unpaired=int(bool(score.source_unpaired)),
+        )
+        for score in scores
+        if score.tag_scores
+    ])
 
 
 def pool(aggregates: Sequence[Aggregate]) -> Aggregate:
@@ -210,4 +200,6 @@ def pool(aggregates: Sequence[Aggregate]) -> Aggregate:
         total.segments_unpaired += agg.segments_unpaired
         total.segments_source_unpaired += agg.segments_source_unpaired
 
-    return _with_rates(total)
+    total.integrity_rate = rate(total.present, total.expected)
+    total.segment_integrity_rate = rate(total.segments_clean, total.segments_scored)
+    return total

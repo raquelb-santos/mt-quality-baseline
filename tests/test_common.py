@@ -1,4 +1,4 @@
-"""The parts both components share: matching, dataset loading, the HTTP clients, and the run."""
+"""The parts every component shares: matching, dataset loading, the HTTP clients, and the run."""
 
 import io
 import json
@@ -8,9 +8,9 @@ from functools import partial
 import httpx
 import pytest
 
-from sourcecode import config
-from sourcecode import run
-from sourcecode import dnt
+from sourcecode import config, dnt, run
+from sourcecode.cat_tool import PhraseClient, Term, TermBaseResolver, XtmClient
+from sourcecode.glossary import CatToolGlossary, GlossaryMatches
 from sourcecode.text_processing import (
     Dataset,
     Task,
@@ -29,8 +29,9 @@ from sourcecode.text_processing import (
 )
 from sourcecode.dnt import DntClient, Reversion
 from sourcecode.pipeline import run_pipeline
-from sourcecode.postmt import RunResult
 from sourcecode.postmt import (
+    RunResult,
+    StanzaClient,
     extract_post_edited,
     preflight_parameters,
     preflight_tasks,
@@ -46,8 +47,6 @@ def _no_standing_language(monkeypatch):
 
 
 # matching and counting
-
-# does the term appear at all
 
 def test_word_boundary_prevents_substring_false_positives():
     assert count_surface("a category of things", "cat", "en-us") == 0
@@ -107,9 +106,6 @@ def test_lemma_fallback_is_skipped_for_unspaced_languages():
         text_lemmas="全然 違う", term_lemmas="エンジン",
     ) == 0
 
-
-# how many times it appears
-# Double-counting one rendering would read as consistency that is not there.
 
 def test_count_surface_is_boundary_aware():
     assert count_surface("the engine and the engine", "engine", "en-gb") == 2
@@ -395,9 +391,7 @@ def test_an_invalid_file_still_fails_when_a_pair_is_asked_for(tmp_path):
         load(path, component="tags", languages=parse_language_pairs("en_es"))
 
 
-# the HTTP boundary
-
-# post-mt - which text gets scored, and what would make the number meaningless.
+# post-mt - which text gets scored, and what would make the number meaningless
 
 @pytest.mark.parametrize(
     "segment,expected",
@@ -495,10 +489,11 @@ def test_has_glossary_is_read_beside_aqe_results():
     assert reported_has_glossary({"aqe_results": {}}) is None
     assert reported_has_glossary({}) is None
 
-# The DNT service - request shape, batching, and the normalizers that accept its response.
+
+# the DNT service - request shape, batching, and the normalizers that accept its response
 
 def _dnt_client(handler, api_key="k"):
-    """Reach into the private client, as the glossary tests do: the transport is the seam."""
+    """The private client is replaced, since the transport is the seam."""
     client = DntClient("http://dnt.test", api_key)
     client._client = httpx.Client(
         base_url="http://dnt.test",
@@ -511,8 +506,6 @@ def _dnt_client(handler, api_key="k"):
 PAIR = {"id": "0", "source": "AcoladPro is here.", "target": "Le Pro Acolad est ici."}
 
 
-# the header, which is the likeliest thing to get wrong
-
 def test_api_key_header_spelling():
     """post-mt sends `X-API-KEY`, DNT wants `X-Api-Key`; invisible until every call 401s."""
     captured = {}
@@ -521,18 +514,10 @@ def test_api_key_header_spelling():
         captured["headers"] = dict(request.headers)
         return httpx.Response(200, json={"segments": [{"terms": []}]})
 
-    client = DntClient("http://dnt.test", "secret")
-    client._client = httpx.Client(
-        base_url="http://dnt.test",
-        transport=httpx.MockTransport(handler),
-        headers={"X-Api-Key": "secret"},
-    )
-    client.revert([PAIR], batch_size=10)
+    _dnt_client(handler, "secret").revert([PAIR], batch_size=10)
 
     assert captured["headers"]["x-api-key"] == "secret"
 
-
-# request shape
 
 def test_revert_posts_source_and_target_pairs_to_v1_revert():
     captured = {}
@@ -588,8 +573,6 @@ def test_no_pairs_makes_no_call_at_all():
     assert _dnt_client(handler).revert([], batch_size=10) == []
 
 
-# failure
-
 def test_failed_batch_yields_none():
     """None leaves the denominator, no items scores nothing: the two must stay distinguishable."""
     def handler(request):
@@ -628,8 +611,6 @@ def test_short_response_realigns():
     assert results[1] is None and results[2] is None
 
 
-# health
-
 def test_health_is_false_when_service_cannot_be_reached():
     def handler(request):
         raise httpx.ConnectError("no route", request=request)
@@ -661,8 +642,6 @@ def test_health_is_true_when_both_probes_pass():
 
     assert _dnt_client(handler).health() is True
 
-
-# the response normalizers
 
 @pytest.mark.parametrize("raw, expected", [
     (["AcoladPro"], ["AcoladPro"]),
@@ -726,8 +705,7 @@ def test_segments_are_found_in_any_envelope(body, count):
     assert len(dnt.response_segments(body)) == count
 
 
-# what the service's own smoke test pins
-# These follow the service's documented verification calls, so the shapes below are the real ones.
+# the shapes the service's own documented verification calls use
 
 def test_detect_envelope_is_understood():
     """The service answers `results[0].terms`, not `segments[0].terms`."""
@@ -873,8 +851,6 @@ class _StubGlossary:
         self.asked_for = None
 
     def fetch_matches(self, *, glossary_ids, source_language, texts, **kwargs):
-        from sourcecode.glossary import GlossaryMatches
-
         self.asked_for = source_language
         return GlossaryMatches(mappings=[], per_text_mappings=[[] for _ in texts])
 
@@ -951,8 +927,6 @@ class _StubPhrase:
         return list(self._ids)
 
     def terms(self, term_base_id):
-        from sourcecode.cat_tool import Term
-
         return [Term("c1", "en-gb", "engine"), Term("c1", "fr-fr", "moteur")]
 
     def close(self):
@@ -961,10 +935,8 @@ class _StubPhrase:
 
 @pytest.fixture
 def stub_glossary(monkeypatch):
-    """The term-bases index is the only glossary source, so every run needs a reachable one, and
-    a CAT tool to say which term bases each project has."""
+    """Terms come from the CAT tool, so every glossary run needs one configured."""
     glossary = _StubGlossary()
-    monkeypatch.setenv("SEARCH_ENGINE_URL", "http://search.test")
     monkeypatch.setenv("PHRASE_BASE_URL", "http://phrase.test")
     monkeypatch.setenv("PHRASE_USERNAME", "u")
     monkeypatch.setenv("PHRASE_PASSWORD", "p")
@@ -1052,7 +1024,8 @@ def test_no_cat_tool_is_config(
 ):
     """Terms come from the CAT tool, so neither one configured is a setting to fix, not a failure."""
     configure()
-    for name in ("PHRASE_BASE_URL", "PHRASE_USERNAME", "PHRASE_PASSWORD"):
+    for name in ("PHRASE_BASE_URL", "PHRASE_USERNAME", "PHRASE_PASSWORD",
+                 "XTM_BASE_URL", "XTM_CLIENT", "XTM_USER_ID", "XTM_PASSWORD"):
         monkeypatch.setenv(name, "")
 
     code = run.main(["--dry-run"])
@@ -1351,8 +1324,8 @@ def test_a_parameter_is_carried_per_segment_from_its_own_task():
     ]
 
 
-def test_each_task_is_submitted_on_its_own_parameters():
-    """post-mt finds the term bases through these, so one submission cannot carry two sets."""
+def _submissions(batch_size):
+    """The project and segment count of each submission post-mt receives."""
     submitted = []
 
     class Recorder:
@@ -1360,25 +1333,33 @@ def test_each_task_is_submitted_on_its_own_parameters():
             submitted.append((parameters["cat_project_id"], len(segments)))
             return RunResult(task_id="t", segments=list(segments), error=None)
 
-    run_pipeline(Recorder(), _two_task_dataset(), batch_size=50)
-    assert submitted == [("P1", 1), ("P2", 2)]
+    run_pipeline(Recorder(), _two_task_dataset(), batch_size=batch_size)
+    return submitted
+
+
+def test_each_task_is_submitted_on_its_own_parameters():
+    """post-mt finds the term bases through these, so one submission cannot carry two sets."""
+    assert _submissions(50) == [("P1", 1), ("P2", 2)]
 
 
 def test_a_batch_never_spans_two_tasks():
-    submitted = []
-
-    class Recorder:
-        def run(self, *, parameters, segments, steps, on_progress):
-            submitted.append((parameters["cat_project_id"], len(segments)))
-            return RunResult(task_id="t", segments=list(segments), error=None)
-
-    run_pipeline(Recorder(), _two_task_dataset(), batch_size=2)
-    assert submitted == [("P1", 1), ("P2", 2)]
+    assert _submissions(2) == [("P1", 1), ("P2", 2)]
 
 
 # resolving a CAT project's term bases, the step post-mt runs before any retrieval
 
-from sourcecode.cat_tool import PhraseClient, Term, TermBaseResolver, XtmClient   # noqa: E402
+def _phrase(handler):
+    client = PhraseClient("http://phrase.test", "u", "p")
+    client._client = httpx.Client(base_url="http://phrase.test/web/api2",
+                                  transport=httpx.MockTransport(handler))
+    return client
+
+
+def _xtm(handler):
+    client = XtmClient("http://xtm.test", "acolad", "7", "p")
+    client._client = httpx.Client(base_url="http://xtm.test/project-manager-api-rest",
+                                  transport=httpx.MockTransport(handler))
+    return client
 
 
 class _CountingCat:
@@ -1394,13 +1375,12 @@ class _CountingCat:
         pass
 
 
-def test_memsource_and_phrase_are_one_tool():
-    """post-mt routes both names to the Phrase API, so a Memsource project must resolve."""
+def test_memsource_is_the_only_name_for_phrase():
     cat = _CountingCat()
     resolver = TermBaseResolver(phrase=cat)
 
     assert resolver.ids_for("P1", "MemSource") == ["tb-1"]
-    assert resolver.ids_for("P1", "Phrase") == ["tb-1"]
+    assert resolver.ids_for("P1", "Phrase") == []
 
 
 def test_an_unsupported_cat_tool_resolves_nothing():
@@ -1450,11 +1430,7 @@ def test_phrase_reads_the_term_base_uids():
             {"termBase": {"uid": "tb-1"}}, {"termBase": {"uid": "tb-2"}},
         ]})
 
-    client = PhraseClient("http://phrase.test", "u", "p")
-    client._client = httpx.Client(base_url="http://phrase.test/web/api2",
-                                  transport=httpx.MockTransport(handler))
-
-    assert client.term_base_ids("P1") == ["tb-1", "tb-2"]
+    assert _phrase(handler).term_base_ids("P1") == ["tb-1", "tb-2"]
 
 
 TBX = """<?xml version='1.0' encoding='UTF-8'?>
@@ -1480,10 +1456,7 @@ def _exporting_phrase(body, status=200):
         assert request.url.path.endswith("/web/api2/v1/termBases/tb-1/export")
         return httpx.Response(status, content=body.encode())
 
-    client = PhraseClient("http://phrase.test", "u", "p")
-    client._client = httpx.Client(base_url="http://phrase.test/web/api2",
-                                  transport=httpx.MockTransport(handler))
-    return client
+    return _phrase(handler)
 
 
 def test_phrase_terms_are_read_from_the_tbx_export():
@@ -1510,11 +1483,7 @@ def test_xtm_term_bases_are_the_projects_term_customer_ids():
         # The endpoint answers with a list holding the project.
         return httpx.Response(200, json=[{"termCustomerIds": [11, 12]}])
 
-    client = XtmClient("http://xtm.test", "acolad", "7", "p")
-    client._client = httpx.Client(base_url="http://xtm.test/project-manager-api-rest",
-                                  transport=httpx.MockTransport(handler))
-
-    assert client.term_base_ids("P1") == ["11", "12"]
+    assert _xtm(handler).term_base_ids("P1") == ["11", "12"]
 
 
 XTM_TBX = """<?xml version="1.0" encoding="UTF-8"?>
@@ -1554,12 +1523,8 @@ def test_xtm_terms_are_read_from_the_customers_terminology_export(monkeypatch):
         assert path == "/terminology/files/export/5/download"
         return httpx.Response(200, content=archive.getvalue())
 
-    client = XtmClient("http://xtm.test", "acolad", "7", "p")
-    client._client = httpx.Client(base_url="http://xtm.test/project-manager-api-rest",
-                                  transport=httpx.MockTransport(handler))
-
     # XTM names no concept, so each entry is one, kept apart from other customers' entries.
-    assert client.terms("11") == [
+    assert _xtm(handler).terms("11") == [
         Term("11#0", "en-US", "gearbox"),
         Term("11#0", "fr-FR", "transmission", forbidden=True),
         Term("11#1", "en-US", "engine"),
@@ -1582,18 +1547,11 @@ def test_a_refused_token_is_earned_again_once():
             return httpx.Response(401, json={})
         return httpx.Response(200, json={"termBases": [{"termBase": {"uid": "tb-1"}}]})
 
-    client = PhraseClient("http://phrase.test", "u", "p")
-    client._client = httpx.Client(base_url="http://phrase.test/web/api2",
-                                  transport=httpx.MockTransport(handler))
-
-    assert client.term_base_ids("P1") == ["tb-1"]
+    assert _phrase(handler).term_base_ids("P1") == ["tb-1"]
     assert seen == ["login", "ApiToken t1", "login", "ApiToken t2"]
 
 
-# reading the terms themselves from the CAT tool, in place of the term-bases index
-
-from sourcecode.glossary import CatToolGlossary   # noqa: E402
-
+# reading the terms themselves from the CAT tool
 
 class _TermCat:
     def __init__(self, terms):
@@ -1652,7 +1610,7 @@ def test_a_matched_term_carries_its_target_wording():
 
     matches = glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
                                      target_language="fr-fr",
-                                     texts=["the engine is electric"], provider="phrase")
+                                     texts=["the engine is electric"], provider="MemSource")
 
     assert matches.mappings == [{"source_content": "engine", "target_content": "moteur"}]
     assert matches.per_text_mappings == [matches.mappings]
@@ -1663,7 +1621,7 @@ def test_a_term_the_text_never_uses_is_not_matched():
 
     matches = glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
                                      target_language="fr-fr", texts=["the cable is loose"],
-                                     provider="phrase")
+                                     provider="MemSource")
 
     assert matches.per_text_mappings == [[]]
 
@@ -1675,7 +1633,7 @@ def test_the_language_filter_is_permissive():
 
     matches = glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
                                      target_language="fr-fr", texts=["the engine"],
-                                     provider="phrase")
+                                     provider="MemSource")
 
     assert matches.mappings == [{"source_content": "engine", "target_content": "moteur"}]
 
@@ -1684,7 +1642,7 @@ def test_a_term_base_is_read_once_across_tasks():
     glossary, cat = _cat_glossary()
     for _ in range(3):
         glossary.fetch_matches(glossary_ids=["tb-1"], source_language="en-gb",
-                               target_language="fr-fr", texts=["the engine"], provider="phrase")
+                               target_language="fr-fr", texts=["the engine"], provider="MemSource")
 
     assert cat.asked == ["tb-1"]
 
@@ -1695,7 +1653,7 @@ def test_several_term_bases_are_all_read():
 
     matches = glossary.fetch_matches(glossary_ids=["tb-1", "tb-2"], source_language="en-gb",
                                      target_language="fr-fr",
-                                     texts=["the engine and the brake pad"], provider="phrase")
+                                     texts=["the engine and the brake pad"], provider="MemSource")
 
     assert cat.asked == ["tb-1", "tb-2"]
     assert {m["target_content"] for m in matches.mappings} == {"moteur", "plaquette de frein"}
@@ -1712,7 +1670,7 @@ def test_several_term_bases_are_all_read():
 def test_the_cat_glossary_rejects_the_same_missing_inputs(overrides, message):
     glossary, _ = _cat_glossary()
     kwargs = dict(glossary_ids=["tb-1"], source_language="en-gb", target_language="fr-fr",
-                  texts=["the engine"], provider="phrase")
+                  texts=["the engine"], provider="MemSource")
     kwargs.update(overrides)
 
     with pytest.raises(ValueError, match=message):
@@ -1721,8 +1679,6 @@ def test_the_cat_glossary_rejects_the_same_missing_inputs(overrides, message):
 
 def test_stanza_splits_texts_into_batches():
     """A whole term base in one request is rejected as 413 Payload Too Large."""
-    from sourcecode.postmt import StanzaClient
-
     sizes = []
 
     def handler(request):

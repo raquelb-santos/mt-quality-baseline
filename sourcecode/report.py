@@ -123,8 +123,7 @@ class Scorecard:
 
 
 def report_parameters(dataset: Any) -> dict[str, Any]:
-    """Canonical codes, so every component files one dataset under one stratum. A file covering
-    several post-mt tasks names every value they carry, so the stratum hides none of them."""
+    """Canonical codes, naming every value the file's tasks carry so the stratum hides none."""
     def across(name: str) -> str | None:
         values = dict.fromkeys(
             str(task.parameters[name]) for task in dataset.tasks if task.parameters.get(name)
@@ -171,8 +170,7 @@ def stratum_of(parameters: Mapping[str, Any]) -> tuple[str, str]:
 
 
 def by_language_pair(results: Sequence[Any]) -> dict[str, dict[str, list[Any]]]:
-    """Every scored segment under its language pair, then under its domain. One dataset can
-    span several of both, so this groups segments rather than datasets."""
+    """Scored segments by language pair, then domain; segments, since one dataset can span several."""
     grouped: dict[str, dict[str, list[Any]]] = {}
     for result in results:
         for segment in result.segments:
@@ -188,12 +186,29 @@ def by_language_pair(results: Sequence[Any]) -> dict[str, dict[str, list[Any]]]:
     }
 
 
+def strata(results: Sequence[Any], measured: Callable[[list[Any]], dict[str, Any]], *,
+           total: bool = False) -> list[dict[str, Any]]:
+    """One row per language pair, then one per domain in it; with total, ALL across several pairs."""
+    pairs = by_language_pair(results)
+    rows = []
+    for pair, domains in pairs.items():
+        rows.append({"language_pair": pair, "domain": None, "label": pair,
+                     **measured([s for group in domains.values() for s in group])})
+        for domain, group in domains.items():
+            rows.append({"language_pair": pair, "domain": domain, "label": f"↳ {domain}", **measured(group)})
+    if total and len(pairs) > 1:
+        rows.append({"label": "ALL", **measured([s for result in results for s in result.segments])})
+    return rows
+
+
+def strata_rates(results: Sequence[Any], measured: Callable[[list[Any]], dict[str, Any]], unit: str,
+                 columns: Sequence[str]) -> list[tuple[str, list[str]]]:
+    return [(f"{row['label']} · {row['expected_instances']} {unit}", [pct(row[c]) for c in columns])
+            for row in strata(results, measured, total=True)]
+
+
 def render_report(
-    results_by_component: Mapping[str, Sequence[Any]],
-    sections: Sections,
-    *,
-    dry_run: bool,
-    now: datetime,
+    results_by_component: Mapping[str, Sequence[Any]], sections: Sections, *, dry_run: bool, now: datetime
 ) -> str:
     parts = [
         f"# Quality baseline — {' + '.join(results_by_component) or 'nothing'}\n\n"
@@ -211,17 +226,11 @@ def render_report(
 
 
 def report_path(components: Sequence[str], *, dry_run: bool, now: datetime) -> Path:
-    stem = "+".join(components) or "baseline"
-    suffix = "_dry-run" if dry_run else ""
-    return Path("reports") / f"{stem}{suffix}_{now.strftime('%Y%m%d-%H%M%S')}.md"
+    stem = f"{'+'.join(components) or 'baseline'}{'_dry-run' if dry_run else ''}"
+    return Path("reports") / f"{stem}_{now.strftime('%Y%m%d-%H%M%S')}.md"
 
 
-def write_report(
-    results_by_component: Mapping[str, Sequence[Any]],
-    sections: Sections,
-    *,
-    dry_run: bool,
-) -> Path:
+def write_report(results_by_component: Mapping[str, Sequence[Any]], sections: Sections, *, dry_run: bool) -> Path:
     now = datetime.now(timezone.utc)
     path = report_path(list(results_by_component), dry_run=dry_run, now=now)
     path.parent.mkdir(parents=True, exist_ok=True)

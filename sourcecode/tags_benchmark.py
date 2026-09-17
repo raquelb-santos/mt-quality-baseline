@@ -90,36 +90,32 @@ def run_benchmark(
             "markup, so a 100% result would only mean there was nothing to preserve"
         )
 
-    results: list[SegmentResult] = []
-    for index, segment in enumerate(processed):
-        src_text = src_texts[index]
-
-        results.append(SegmentResult(
+    results = [
+        SegmentResult(
             source_segment_id=segment_id(segment, originals[index], index),
             stratum=strata[index],
-            src_text=src_text,
+            src_text=src_texts[index],
             mt_text=mt_texts[index],
             ape_text=ape_texts[index],
             ref_text=ref_texts[index],
             changed_by_ape=mt_texts[index] != ape_texts[index],
             tags=per_segment_tags[index],
-            mt=score_tags(src_text=src_text, text=mt_texts[index]),
-            ape=score_tags(src_text=src_text, text=ape_texts[index]),
-            ref=score_tags(src_text=src_text, text=ref_texts[index]),
-        ))
-
-    failures = outcome.failures
+            mt=score_tags(src_text=src_texts[index], text=mt_texts[index]),
+            ape=score_tags(src_text=src_texts[index], text=ape_texts[index]),
+            ref=score_tags(src_text=src_texts[index], text=ref_texts[index]),
+        )
+        for index, segment in enumerate(processed)
+    ]
 
     mt = aggregate([r.mt for r in results])
     ape = aggregate([r.ape for r in results])
-    ref = aggregate([r.ref for r in results])
 
     return Result(
         dataset=f"{dataset.name} (dry-run)" if skip_pipeline else dataset.name,
         parameters=report_parameters(dataset),
         usage=outcome.usage,
-        failed_segments=len(failures),
-        failure_reason=failures[0] if failures else None,
+        failed_segments=len(outcome.failures),
+        failure_reason=outcome.failures[0] if outcome.failures else None,
         totals={
             "segments": len(dataset.segments),
             "segments_with_tags": carrying,
@@ -127,7 +123,7 @@ def run_benchmark(
         },
         mt=mt,
         ape=ape,
-        ref=ref,
+        ref=aggregate([r.ref for r in results]),
         delta=Delta(delta(mt.integrity_rate, ape.integrity_rate), *_repairs(results, "mt", "ape")),
         segments=results,
     )

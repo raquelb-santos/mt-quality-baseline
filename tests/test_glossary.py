@@ -1,6 +1,7 @@
 """The terminology adherence component: the metric, its rendering, and the orchestration around it."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from types import SimpleNamespace
 import pytest
 
 from sourcecode.text_processing import Dataset, Task, normalize_language
@@ -24,13 +25,11 @@ from sourcecode.glossary_score import (
     Aggregate,
     Tally,
     TermBreakdown,
-    ViolationReport,
     aggregate,
     build_glossary_map,
     find_violations,
     pool,
     pool_violations,
-    ReferenceCheck,
     Score,
     check_reference,
     score_glossary,
@@ -938,13 +937,6 @@ class _Segment:
     ape_corpus_violations: int = 0
 
 
-class _Result:
-    """A scored dataset, as the stratum code sees it - a list of segments and nothing more."""
-
-    def __init__(self, segments):
-        self.segments = segments
-
-
 def _stratum_result(source, target, domain, *counts, violations=0):
     """A dataset whose segments all sit in one stratum; each count is (expected, adherent)."""
     stratum = (f"{source}->{target}", domain or "(no domain)")
@@ -953,7 +945,7 @@ def _stratum_result(source, target, domain, *counts, violations=0):
         score = Score(expected=expected, adherent=adherent, strict=Tally(expected, adherent),
                       terms=TermBreakdown(matched_ref=adherent, never_used=expected - adherent))
         segments.append(_Segment(stratum, score, score, violations, violations))
-    return _Result(segments)
+    return SimpleNamespace(segments=segments)
 
 
 def test_pooling_sums_counts_rather_than_averaging_rates():
@@ -1010,7 +1002,7 @@ def test_one_pair_holds_the_domains_it_was_measured_in():
 
 def test_segments_are_grouped_not_datasets():
     """One dataset can span several strata, so a file cannot be the unit of grouping."""
-    mixed = _Result([
+    mixed = SimpleNamespace(segments=[
         *_stratum_result("en-gb", "fr-fr", "Automotive", (4, 2)).segments,
         *_stratum_result("en-gb", "de-de", "Automotive", (4, 4)).segments,
     ])
@@ -1147,15 +1139,9 @@ class FakePostMt:
         )
 
 
-@dataclass
-class FakeBenchmarkConfig:
-    batch_size: int = 10
-    lemma_matching: bool = False
+def _config(batch_size=2, lemma_matching=False):
+    return SimpleNamespace(benchmark=SimpleNamespace(batch_size=batch_size, lemma_matching=lemma_matching))
 
-
-@dataclass
-class FakeConfig:
-    benchmark: FakeBenchmarkConfig = field(default_factory=FakeBenchmarkConfig)
 
 # "brake pad" -> frein (strict); "engine" -> moteur (strict); "battery" -> two variants (permissive).
 GLOSSARY = {
@@ -1217,7 +1203,7 @@ def _benchmark(postmt=None, *, batch_size=2, glossary=GLOSSARY, lemma_matching=F
         stanza=FakeStanza(),
         glossary=FakeGlossary(glossary),
         term_bases=term_bases if term_bases is not None else FakeTermBases(),
-        config=FakeConfig(FakeBenchmarkConfig(batch_size, lemma_matching)),
+        config=_config(batch_size, lemma_matching),
     )
 
 
@@ -1639,13 +1625,12 @@ def test_a_blank_job_column_is_left_unset():
 # retrieval is scoped to the term bases the CAT project has attached
 
 def test_retrieval_asks_only_the_projects_own_term_bases(dataset):
-    """post-mt percolates those term bases alone, so a run that percolated the index would
-    credit MT with terms post-mt was never shown."""
+    """post-mt percolates those term bases alone; the index would credit terms it never showed."""
     glossary = FakeGlossary(GLOSSARY)
     run_benchmark(
         dataset, postmt=None, stanza=FakeStanza(), glossary=glossary,
         term_bases=FakeTermBases(default=["tb-7", "tb-8"]),
-        config=FakeConfig(FakeBenchmarkConfig(2, False)), skip_pipeline=True,
+        config=_config(), skip_pipeline=True,
     )
 
     assert glossary.queried_ids == [["tb-7", "tb-8"]]
@@ -1665,7 +1650,7 @@ def test_a_project_with_no_term_bases_never_reaches_the_lemmatizer(dataset):
     result = run_benchmark(
         dataset, postmt=None, stanza=stanza, glossary=glossary,
         term_bases=FakeTermBases(by_project={}),
-        config=FakeConfig(FakeBenchmarkConfig(2, False)), skip_pipeline=True,
+        config=_config(), skip_pipeline=True,
     )
 
     assert stanza.calls == []

@@ -303,8 +303,8 @@ def find_violations(
     source_language_codes: Sequence[str | None],
     lemmas_by_language: Mapping[str, Mapping[str, str]] | None = None,
 ) -> list[ViolationReport]:
-    """One report per version. What REF rendered is the same for all of them, so it is derived
-    once here rather than re-scanned for every version."""
+    """One report per version, with what REF rendered derived once for all of them."""
+    lemmas_by_language = lemmas_by_language or {}
     for texts in versions:
         lengths = {len(texts), len(ref_texts), len(source_texts), len(per_segment_mappings),
                    len(language_codes), len(source_language_codes)}
@@ -320,7 +320,7 @@ def find_violations(
 
     def variants_in(text: str, index: int, sources: Iterable[str]) -> dict[str, list[str]]:
         """Each source's wordings in `text`, with only these sources' targets competing for overlaps."""
-        known = (lemmas_by_language or {}).get(language_codes[index]) or {}
+        known = lemmas_by_language.get(language_codes[index]) or {}
         lemmas = known.get(text)
         normalized_text, normalized_lemmas = normalize_text(text), normalize_text(lemmas)
         sources = list(sources)
@@ -345,11 +345,10 @@ def find_violations(
 
     @cache
     def in_source(index: int, source: str) -> bool:
-        known = (lemmas_by_language or {}).get(source_language_codes[index]) or {}
-        text = source_texts[index]
+        known = lemmas_by_language.get(source_language_codes[index]) or {}
         return bool(count_occurrences(
-            text=text, term=source, language_code=source_language_codes[index],
-            text_lemmas=known.get(text), term_lemmas=known.get(source),
+            text=source_texts[index], term=source, language_code=source_language_codes[index],
+            text_lemmas=known.get(source_texts[index]), term_lemmas=known.get(source),
         ))
 
     # Version-independent, so none of this is redone per version.
@@ -408,9 +407,9 @@ def find_violations(
                             Violation(source, OVER_APPLICATION, segment_index=index, detail=variant))
 
         report.items.sort(key=lambda item: (item.segment_index, str(item.source_content), item.kind))
-        report.miss = sum(1 for item in report.items if item.kind == MISS)
-        report.inconsistency = sum(1 for item in report.items if item.kind == INCONSISTENCY)
-        report.over_application = sum(1 for item in report.items if item.kind == OVER_APPLICATION)
+        kinds = Counter(item.kind for item in report.items)
+        report.miss, report.inconsistency, report.over_application = (
+            kinds[MISS], kinds[INCONSISTENCY], kinds[OVER_APPLICATION])
         report.total = len(report.items)
         report.segments_with_violation = len({item.segment_index for item in report.items})
         report.violation_rate = rate(report.segments_with_violation, report.segments)

@@ -191,28 +191,29 @@ def _with_rates(total: Aggregate) -> Aggregate:
     return total
 
 
+def _add(total: Aggregate, part: Score | Aggregate) -> None:
+    """The counts a segment's score and a dataset's aggregate share, so both pool by addition."""
+    total.expected += part.expected
+    total.preserved += part.preserved
+    total.over_kept += part.over_kept
+    total.leaks.add(part.leaks)
+    total.items.add(part.items)
+    total.not_in_src += part.not_in_src
+    total.not_in_ref += part.not_in_ref
+    total.in_src += part.in_src
+    total.kept_from_src += part.kept_from_src
+
+
 def aggregate(scores: Sequence[Score], *, segments_unread: int = 0) -> Aggregate:
     total = Aggregate(segments_unread=segments_unread)
 
     for score in scores:
-        total.not_in_src += score.not_in_src
-        total.not_in_ref += score.not_in_ref
-        total.in_src += score.in_src
-        total.kept_from_src += score.kept_from_src
-
-        if not score.item_scores:
-            continue
-
-        total.expected += score.expected
-        total.preserved += score.preserved
-        total.over_kept += score.over_kept
-        total.leaks.add(score.leaks)
-        total.items.add(score.items)
-
+        _add(total, score)
         # Every scored item is kept at least once in REF, so a segment with any has a denominator.
-        total.segments_scored += 1
-        if score.preserved == score.expected and score.over_kept == 0:
-            total.segments_clean += 1
+        if score.item_scores:
+            total.segments_scored += 1
+            if score.preserved == score.expected and score.over_kept == 0:
+                total.segments_clean += 1
 
     return _with_rates(total)
 
@@ -222,15 +223,7 @@ def pool(aggregates: Sequence[Aggregate]) -> Aggregate:
     total = Aggregate()
 
     for agg in aggregates:
-        total.expected += agg.expected
-        total.preserved += agg.preserved
-        total.over_kept += agg.over_kept
-        total.leaks.add(agg.leaks)
-        total.items.add(agg.items)
-        total.not_in_src += agg.not_in_src
-        total.not_in_ref += agg.not_in_ref
-        total.in_src += agg.in_src
-        total.kept_from_src += agg.kept_from_src
+        _add(total, agg)
         total.segments_scored += agg.segments_scored
         total.segments_clean += agg.segments_clean
         total.segments_unread += agg.segments_unread
@@ -240,11 +233,7 @@ def pool(aggregates: Sequence[Aggregate]) -> Aggregate:
 
 @dataclass(frozen=True)
 class TermOutcome:
-    """One gold term, and whether each of the four versions carries it verbatim.
-
-    Reversion is measured on two arms, because it is run over the raw MT and over the
-    post-edited text so the two can be compared on the same terms.
-    """
+    """One gold term, and whether each version carries it verbatim; reversion runs on MT and APE."""
 
     text: str
     in_mt: bool
@@ -332,17 +321,10 @@ def score_reversion(
     def carries(text: str, term: str) -> bool:
         return bool(count_surface(text, term, target_language_code, casefold=False))
 
-    outcomes = [
-        TermOutcome(
-            term,
-            carries(mt_text, term),
-            carries(ape_text, term),
-            carries(rev_text, term),
-            carries(rev_ape_text, term),
-        )
+    return ReversionScore([
+        TermOutcome(term, *(carries(text, term) for text in (mt_text, ape_text, rev_text, rev_ape_text)))
         for term in dict.fromkeys(term for term in terms if term and term.strip())
-    ]
-    return ReversionScore(outcomes)
+    ])
 
 
 @dataclass
@@ -387,36 +369,17 @@ class ReversionAggregate:
         return rate(self.segments_clean_from_ape, self.segments_scored)
 
 
-def _combine_reversion(
-    counted: Sequence[Any], *, segments_scored: int, segments_clean: int,
-    segments_clean_from_ape: int, segments_unread: int
-) -> ReversionAggregate:
-    total = ReversionAggregate(
-        segments_scored=segments_scored,
-        segments_clean=segments_clean,
-        segments_clean_from_ape=segments_clean_from_ape,
-        segments_unread=segments_unread,
-    )
-    for item in counted:
-        total.expected += item.expected
-        total.in_mt += item.in_mt
-        total.in_ape += item.in_ape
-        total.in_rev += item.in_rev
-        total.in_rev_ape += item.in_rev_ape
-        total.repaired += item.repaired
-        total.broken += item.broken
-        total.repaired_from_ape += item.repaired_from_ape
-        total.broken_from_ape += item.broken_from_ape
-    return total
-
-
 def aggregate_reversion(
     scores: Sequence[ReversionScore], *, segments_unread: int = 0
 ) -> ReversionAggregate:
     """A segment with no gold term sets no expectation, so it carries no denominator."""
     scored = [score for score in scores if score.expected]
-    return _combine_reversion(
-        scored,
+    return ReversionAggregate(
+        **{
+            name: sum(getattr(score, name) for score in scored)
+            for name in ("expected", "in_mt", "in_ape", "in_rev", "in_rev_ape", "repaired",
+                         "broken", "repaired_from_ape", "broken_from_ape")
+        },
         segments_scored=len(scored),
         segments_clean=sum(1 for score in scored if score.clean),
         segments_clean_from_ape=sum(1 for score in scored if score.clean_from_ape),

@@ -7,7 +7,7 @@ import pytest
 
 from sourcecode import report, run, tags_report
 from sourcecode.postmt import RunResult
-from sourcecode.tags import ENTITY, PAIRED_CLOSE, PAIRED_OPEN, PRINTF, STANDALONE, XML, extract_tags, unpaired
+from sourcecode.tags import ENTITY, PAIRED_CLOSE, PAIRED_OPEN, STANDALONE, XML, extract_tags, unpaired
 from sourcecode.tags_benchmark import run_benchmark
 from sourcecode.tags_score import aggregate, pool, score_tags
 from sourcecode.text_processing import Dataset, Task, normalize_language

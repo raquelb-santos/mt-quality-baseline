@@ -44,48 +44,30 @@ def _section(module: Any, own: tuple[Any, ...]) -> Any:
 
 
 COMPONENT_SECTIONS = {
-    component: (heading, _section(module, own))
-    for component, (heading, module, own, _) in COMPONENTS.items()
-}
-
-
-COMPONENT_SECTIONS["dnt_reversion"] = (
-    "DNT reversion against the gold set",
-    lambda results: [
+    **{component: (heading, _section(module, own))
+       for component, (heading, module, own, _) in COMPONENTS.items()},
+    "dnt_reversion": ("DNT reversion against the gold set", lambda results: [
         *(part for result in results
           for part in (dnt_report.reversion_scorecard(result).as_markdown(),
                        dnt_report.render_reversion_terms(result))),
         dnt_report.render_reversion_comparison(results),
         dnt_report.render_reversion_strata(results),
-    ],
-)
+    ]),
+}
 
 
-def _language_slots(configured: list[str], components: list[str]) -> dict[str, str]:
+def _language_slots(configured: list[str], components: list[str]) -> dict[str, list[tuple[str, str]]]:
     """`BENCH_LANGUAGE` lines up slot by slot with `BENCH_COMPONENT`, a blank slot scoring every pair."""
     if len(configured) > len(components):
         raise ValueError(
             f"BENCH_LANGUAGE has {len(configured)} slots but BENCH_COMPONENT names "
             f"{len(components)}; they line up slot by slot."
         )
-    slots = dict(zip(components, configured + [""] * (len(components) - len(configured))))
-
     # Parsed now so a typo stops the run before it measures anything.
-    for given in slots.values():
-        if given:
-            text_processing.parse_language_pairs(given)
-    return slots
-
-
-def _force_utf8_output() -> None:
-    """Windows consoles default to a code page that cannot encode translated content."""
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-            except (ValueError, OSError):  # detached or already-wrapped stream
-                pass
+    return {
+        component: text_processing.parse_language_pairs(given) if given else []
+        for component, given in zip(components, configured + [""] * len(components))
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -99,7 +81,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    _force_utf8_output()
+    # Windows consoles default to a code page that cannot encode translated content.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):  # not reconfigurable, or detached
+            pass
 
     logging.basicConfig(
         level=logging.INFO,
@@ -179,12 +166,8 @@ def main(argv: list[str] | None = None) -> int:
                 print("Set POSTMT_BASE_URL to the post-mt instance to drive.", file=sys.stderr)
                 return 2
 
-            postmt = PostMtClient(
-                config.postmt.base_url,
-                config.postmt.poll_interval,
-                config.postmt.timeout,
-                config.postmt.api_key,
-            )
+            postmt = PostMtClient(config.postmt.base_url, config.postmt.poll_interval,
+                                  config.postmt.timeout, config.postmt.api_key)
             if not postmt.health():
                 fix = "Check POSTMT_API_KEY." if postmt.authenticated else "Set POSTMT_API_KEY."
                 print(f"Cannot use post-mt at {config.postmt.base_url}. {fix}", file=sys.stderr)
@@ -202,9 +185,7 @@ def main(argv: list[str] | None = None) -> int:
             if len(datasets) > 1:
                 logging.info("[BENCH] %d %s datasets to score", len(datasets), component)
 
-            wanted = slots[component]
-            languages = text_processing.parse_language_pairs(wanted) if wanted else ()
-
+            languages = slots[component]
             _, module, _, console = COMPONENTS[component]
             results = []
             # Kept apart from `results`: a gold set is a different measurement with its own report.
@@ -224,39 +205,33 @@ def main(argv: list[str] | None = None) -> int:
                     logging.info("[BENCH] nothing to score in %s - skipped", path)
                     continue
 
-                if component == "glossary":
-                    scored = glossary_benchmark.run_benchmark(
-                        data, postmt=postmt, stanza=stanza, glossary=glossary,
-                        term_bases=term_bases, config=config, skip_pipeline=args.dry_run,
-                    )
-                elif component == "dnt":
-                    if data.is_gold_set:
-                        scored = dnt_benchmark.run_reversion(
-                            data, postmt=postmt, dnt=dnt, config=config,
-                            skip_pipeline=args.dry_run,
-                        )
-                        for block in (dnt_report.reversion_scorecard(scored).as_console(),
-                                      dnt_report.render_reversion_terms_console(scored)):
-                            if block:
-                                print(block)
-                        reversion_results.append(scored)
-                        continue
-
-                    scored = dnt_benchmark.run_benchmark(
+                if component == "dnt" and data.is_gold_set:
+                    scored = dnt_benchmark.run_reversion(
                         data, postmt=postmt, dnt=dnt, config=config, skip_pipeline=args.dry_run
                     )
-                elif component == "tags":
-                    scored = tags_benchmark.run_benchmark(
-                        data, postmt=postmt, config=config, skip_pipeline=args.dry_run
-                    )
+                    blocks = (dnt_report.reversion_scorecard(scored).as_console(),
+                              dnt_report.render_reversion_terms_console(scored))
+                    reversion_results.append(scored)
                 else:
-                    raise ValueError(f"{component} is in COMPONENTS but has no branch here.")
+                    if component == "glossary":
+                        scored = glossary_benchmark.run_benchmark(
+                            data, postmt=postmt, stanza=stanza, glossary=glossary,
+                            term_bases=term_bases, config=config, skip_pipeline=args.dry_run,
+                        )
+                    elif component == "dnt":
+                        scored = dnt_benchmark.run_benchmark(
+                            data, postmt=postmt, dnt=dnt, config=config, skip_pipeline=args.dry_run
+                        )
+                    else:
+                        scored = tags_benchmark.run_benchmark(
+                            data, postmt=postmt, config=config, skip_pipeline=args.dry_run
+                        )
+                    blocks = (module.scorecard(scored).as_console(),
+                              *(render(scored) for render in console))
+                    results.append(scored)
 
-                for block in (module.scorecard(scored).as_console(),
-                              *(render(scored) for render in console)):
-                    if block:
-                        print(block)
-                results.append(scored)
+                for block in filter(None, blocks):
+                    print(block)
 
             if not results and not reversion_results:
                 print(f"No {component} dataset could be scored - see the warnings above. Check "
@@ -272,13 +247,8 @@ def main(argv: list[str] | None = None) -> int:
                 results_by_component["dnt_reversion"] = reversion_results
                 print(dnt_report.render_reversion_strata_console(reversion_results))
 
-        report_file = report.write_report(
-            results_by_component,
-            COMPONENT_SECTIONS,
-            dry_run=args.dry_run,
-        )
+        report_file = report.write_report(results_by_component, COMPONENT_SECTIONS, dry_run=args.dry_run)
         logging.info("[BENCH] report: %s", report_file)
-
         return 0
 
     except KeyboardInterrupt:

@@ -5,15 +5,16 @@ import logging
 import time
 import zipfile
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 from xml.etree import ElementTree
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-PHRASE_PROVIDERS = {"memsource"}
-XTM_PROVIDERS = {"xtm"}
+
+def clients_by_provider(phrase: Any, xtm: Any) -> dict[str, Any]:
+    return {name: client for name, client in (("memsource", phrase), ("xtm", xtm)) if client is not None}
 
 
 @dataclass(frozen=True)
@@ -51,17 +52,46 @@ def read_tbx(content: bytes, term_base_id: str) -> list[Term]:
     return found
 
 
-class PhraseClient:
-    """A token from `v3/auth/login`, sent back as `ApiToken`."""
+class _TokenClient:
+    """A token that outlives one project, so it is re-earned only once it is refused."""
 
-    def __init__(self, base_url: str, username: str, password: str, timeout: float = 120.0) -> None:
-        self._client = httpx.Client(base_url=f"{base_url.rstrip('/')}/web/api2", timeout=timeout)
-        self._username = username
-        self._password = password
+    tool: str
+    scheme: str
+
+    def __init__(self, base_url: str, timeout: float) -> None:
+        self._client = httpx.Client(base_url=base_url, timeout=timeout)
         self._token: str | None = None
 
     def close(self) -> None:
         self._client.close()
+
+    def _fetch(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        for attempt in (1, 2):
+            if self._token is None:
+                self._token = self._authenticate()
+
+            response = self._client.request(
+                method, path, headers={"Authorization": f"{self.scheme} {self._token}"}, **kwargs
+            )
+            if response.status_code == 401 and attempt == 1:
+                self._token = None
+                continue
+
+            response.raise_for_status()
+            return response
+
+        raise RuntimeError(f"{self.tool} refused the token twice for {path}.")
+
+
+class PhraseClient(_TokenClient):
+    """A token from `v3/auth/login`, sent back as `ApiToken`."""
+
+    tool, scheme = "Phrase", "ApiToken"
+
+    def __init__(self, base_url: str, username: str, password: str, timeout: float = 120.0) -> None:
+        super().__init__(f"{base_url.rstrip('/')}/web/api2", timeout)
+        self._username = username
+        self._password = password
 
     def _authenticate(self) -> str:
         response = self._client.post(
@@ -74,53 +104,28 @@ class PhraseClient:
         return str(token)
 
     def term_base_ids(self, project_id: str) -> list[str]:
-        body = self._get(f"/v1/projects/{project_id}/termBases")
+        body = self._fetch("GET", f"/v1/projects/{project_id}/termBases").json() or {}
         return [
             uid for entry in (body.get("termBases") or [])
             if (uid := str(((entry or {}).get("termBase") or {}).get("uid") or ""))
         ]
 
     def terms(self, term_base_id: str) -> list[Term]:
-        return read_tbx(self._fetch(f"/v1/termBases/{term_base_id}/export").content, term_base_id)
-
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._fetch(path, params).json() or {}
-
-    def _fetch(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
-        """A token outlives one project, so it is re-earned only once it is refused."""
-        for attempt in (1, 2):
-            if self._token is None:
-                self._token = self._authenticate()
-
-            response = self._client.get(
-                path, params=params, headers={"Authorization": f"ApiToken {self._token}"}
-            )
-            if response.status_code == 401 and attempt == 1:
-                self._token = None
-                continue
-
-            response.raise_for_status()
-            return response
-
-        raise RuntimeError(f"Phrase refused the token twice for {path}.")
+        return read_tbx(self._fetch("GET", f"/v1/termBases/{term_base_id}/export").content, term_base_id)
 
 
-class XtmClient:
+class XtmClient(_TokenClient):
     """A token from `/auth/token`, sent back as `XTM-Basic`; term bases are `termCustomerIds`."""
+
+    tool, scheme = "XTM", "XTM-Basic"
 
     def __init__(
         self, base_url: str, client: str, user_id: str, password: str, timeout: float = 120.0
     ) -> None:
-        self._client = httpx.Client(
-            base_url=f"{base_url.rstrip('/')}/project-manager-api-rest", timeout=timeout
-        )
+        super().__init__(f"{base_url.rstrip('/')}/project-manager-api-rest", timeout)
         self._name = client
         self._user_id = user_id
         self._password = password
-        self._token: str | None = None
-
-    def close(self) -> None:
-        self._client.close()
 
     def _authenticate(self) -> str:
         response = self._client.post(
@@ -134,7 +139,7 @@ class XtmClient:
         return str(token)
 
     def term_base_ids(self, project_id: str) -> list[str]:
-        body = self._get(f"/projects/{project_id}")
+        body = self._fetch("GET", f"/projects/{project_id}").json()
         # The endpoint answers with the project, or with a list holding it.
         project = body[0] if isinstance(body, list) and body else body
         if not isinstance(project, dict):
@@ -142,8 +147,7 @@ class XtmClient:
         return [str(identifier) for identifier in (project.get("termCustomerIds") or [])]
 
     def terms(self, term_base_id: str) -> list[Term]:
-        """Every term the customer holds. XTM serves no term listing, so the customer's
-        terminology is exported as TBX, the way post-mt exports a TM."""
+        """XTM serves no term listing, so the customer's terminology is exported as TBX."""
         export = self._fetch("POST", "/terminology/files/export", json={
             "fileExtensionType": "TBX", "filter": {"customerIds": [int(term_base_id)]},
         }).json() or {}
@@ -166,44 +170,17 @@ class XtmClient:
         except (zipfile.BadZipFile, StopIteration) as error:
             raise RuntimeError(f"XTM terminology export {file_id} holds no TBX file.") from error
 
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        return self._fetch("GET", path, params=params).json()
-
-    def _fetch(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
-        for attempt in (1, 2):
-            if self._token is None:
-                self._token = self._authenticate()
-
-            response = self._client.request(
-                method, path, headers={"Authorization": f"XTM-Basic {self._token}"}, **kwargs
-            )
-            if response.status_code == 401 and attempt == 1:
-                self._token = None
-                continue
-
-            response.raise_for_status()
-            return response
-
-        raise RuntimeError(f"XTM refused the token twice for {path}.")
-
 
 class TermBaseResolver:
     """Which term bases a CAT project has attached, so retrieval reads the same ones post-mt does."""
 
     def __init__(self, phrase: Any = None, xtm: Any = None) -> None:
-        self._clients = {
-            **{provider: phrase for provider in PHRASE_PROVIDERS if phrase is not None},
-            **{provider: xtm for provider in XTM_PROVIDERS if xtm is not None},
-        }
+        self._clients = clients_by_provider(phrase, xtm)
         self._cache: dict[tuple[str, str], list[str]] = {}
 
     def close(self) -> None:
         for client in dict.fromkeys(self._clients.values()):
             client.close()
-
-    @property
-    def providers(self) -> set[str]:
-        return set(self._clients)
 
     def ids_for(self, project_id: Any, provider: Any) -> list[str]:
         """The ids, or none — which tells the caller to skip the glossary step for this task."""
@@ -213,10 +190,10 @@ class TermBaseResolver:
         provider = str(provider).strip().lower()
         client = self._clients.get(provider)
         if client is None:
-            known = PHRASE_PROVIDERS | XTM_PROVIDERS
             logger.error(
                 "[TERMBASE] %s for project %s: %s", provider, project_id,
-                "post-mt has no term-base lookup for this CAT tool" if provider not in known
+                "post-mt has no term-base lookup for this CAT tool"
+                if provider not in ("memsource", "xtm")
                 else "no credentials configured for this CAT tool",
             )
             return []

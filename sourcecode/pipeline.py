@@ -22,14 +22,12 @@ class PipelineOutcome:
 def load_dataset(path: Path, *, component: str, dry_run: bool, languages: Sequence[tuple[str, str]] = ()) -> Dataset:
     """Only the submission preflight applies: these components read what a segment carries."""
     data = load(path, component=component, languages=languages)
-
     if not dry_run:
         raise_for_preflight(
             preflight_tasks(data.tasks, preflight_submission),
             "Preflight failed: post-mt would reject every segment, so there would be no "
             "APE column to score. Fix the parameters above.",
         )
-
     return data
 
 
@@ -49,19 +47,14 @@ def run_pipeline(postmt: Any, dataset: Dataset, *, batch_size: int) -> PipelineO
     usage = Usage()
 
     for number, (task, batch) in enumerate(batches, start=1):
-        def on_progress(body: dict[str, Any], _n: int = number) -> None:
-            percent = (body.get("progress") or {}).get("percent", 0)
-            logger.info("[PIPELINE] batch %d/%d - %s%%", _n, len(batches), percent)
-
         result = postmt.run(
             parameters=task.parameters,
             # REF is the answer key, dropped so it can never reach post-mt.
-            segments=[
-                {k: v for k, v in segment.items() if k != "reference_content"}
-                for segment in batch
-            ],
+            segments=[{k: v for k, v in segment.items() if k != "reference_content"} for segment in batch],
             steps=dataset.steps,
-            on_progress=on_progress,
+            on_progress=lambda body, n=number: logger.info(
+                "[PIPELINE] batch %d/%d - %s%%", n, len(batches), (body.get("progress") or {}).get("percent", 0)
+            ),
         )
 
         if result.error:
@@ -74,7 +67,6 @@ def run_pipeline(postmt: Any, dataset: Dataset, *, batch_size: int) -> PipelineO
             )
 
         usage += result.usage
-
         for i, original in enumerate(batch):
             returned = result.segments[i] if i < len(result.segments) else None
             processed.append(returned if returned is not None else original)

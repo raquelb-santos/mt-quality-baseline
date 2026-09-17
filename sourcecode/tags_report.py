@@ -3,10 +3,10 @@
 from collections import defaultdict
 from typing import Any, Sequence
 
-from .report import Scorecard, arrow, by_language_pair, cell, failure_warning, pct, rate, signed_pct, subheading_of, table
+from .report import Scorecard, arrow, cell, failure_warning, pct, rate, signed_pct, strata, strata_rates, subheading_of, table
 from .tags import KINDS
 from .tags_benchmark import Result
-from .tags_score import aggregate, Score, pool
+from .tags_score import Score, aggregate
 
 # The versions a run scores, in delivery order.
 VERSIONS = ("mt", "ape", "ref")
@@ -111,21 +111,13 @@ def family_cells(result: Result) -> list[tuple[str, list[str]]]:
 
 
 def render_families(result: Result) -> str:
-    rows = family_cells(result)
-    if not rows:
-        return "No tags were found in the source segments.\n"
-    return table("Integrity by tag family", "Family", [v.upper() for v in VERSIONS], rows)
+    return table("Integrity by tag family", "Family", [v.upper() for v in VERSIONS], family_cells(result)) or "No tags were found in the source segments.\n"
 
 
 def render_families_console(result: Result) -> str:
-    rows = family_cells(result)
-    if not rows:
-        return "\n".join(
-            [f"Integrity by tag family — {result.dataset}", "",
-             "  No tags were found in the source segments.", ""]
-        )
-    return table(f"Integrity by tag family — {result.dataset}", "family",
-                 [v.upper() for v in VERSIONS], rows, console=True)
+    title = f"Integrity by tag family — {result.dataset}"
+    return table(title, "family", [v.upper() for v in VERSIONS], family_cells(result),
+                 console=True) or f"{title}\n\n  No tags were found in the source segments.\n"
 
 
 def tag_rows(result: Result) -> list[dict[str, Any]]:
@@ -182,25 +174,17 @@ def tag_cells(result: Result) -> list[tuple[str, list[str]]]:
 
 
 def render_tags(result: Result) -> str:
-    rows = tag_cells(result)
-    if not rows:
-        return "No tags were found in any version.\n"
-    return table("Integrity by tag (integrity is APE against SRC, worst first)",
-                 "Tag", TAG_COLUMNS, rows)
+    return table("Integrity by tag (integrity is APE against SRC, worst first)", "Tag",
+                 TAG_COLUMNS, tag_cells(result)) or "No tags were found in any version.\n"
 
 
 def render_tags_console(result: Result) -> str:
-    rows = tag_cells(result)
-    if not rows:
-        # Silence here would leave a scorecard of zeroes looking like a clean result.
-        return "\n".join(
-            [f"Integrity by tag — {result.dataset}", "", "  No tags were found in any version.", ""]
-        )
+    # Silence on no rows would leave a scorecard of zeroes looking like a clean result.
     # The counts need no more room than their headers; only the rate column is wide.
     return table(
         f"Integrity by tag — {result.dataset} (integrity is APE against SRC, worst first)",
-        "tag", TAG_COLUMNS, rows, console=True, width=4,
-    )
+        "tag", TAG_COLUMNS, tag_cells(result), console=True, width=4,
+    ) or f"Integrity by tag — {result.dataset}\n\n  No tags were found in any version.\n"
 
 
 def _defects(score: Score) -> str:
@@ -285,32 +269,11 @@ def _measured(segments: Sequence[Any]) -> dict[str, Any]:
 
 
 def stratum_rows(results: Sequence[Result]) -> list[dict[str, Any]]:
-    """One row per language pair, then one for each domain the pair was measured in."""
-    rows = []
-    for pair, domains in by_language_pair(results).items():
-        rows.append({"language_pair": pair, "domain": None, "label": pair,
-                     **_measured([s for group in domains.values() for s in group])})
-        for domain, group in domains.items():
-            rows.append({"language_pair": pair, "domain": domain, "label": f"↳ {domain}",
-                         **_measured(group)})
-    return rows
+    return strata(results, _measured)
 
 
 def stratum_rate_rows(results: Sequence[Result]) -> list[tuple[str, list[str]]]:
-    """Each group against its pooled integrity, the instance count in the label."""
-    all_rows = stratum_rows(results)
-    rows = [
-        (f"{row['label']} · {row['expected_instances']} inst",
-         [pct(row[f"{column}_integrity_rate"]) for column in VERSIONS])
-        for row in all_rows
-    ]
-
-    if sum(1 for row in all_rows if row["domain"] is None) > 1:
-        pooled = _measured([s for result in results for s in result.segments])
-        rows.append((f"ALL · {pooled['expected_instances']} inst",
-                     [pct(pooled[f"{column}_integrity_rate"]) for column in VERSIONS]))
-
-    return rows
+    return strata_rates(results, _measured, "inst", [f"{c}_integrity_rate" for c in VERSIONS])
 
 
 def render_strata(results: Sequence[Result]) -> str:

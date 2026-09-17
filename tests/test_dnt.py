@@ -9,15 +9,10 @@ import pytest
 from sourcecode import dnt_benchmark, dnt_report, report, run
 from sourcecode.dnt import Reversion
 from sourcecode.dnt_benchmark import fingerprint_of, run_benchmark
-from sourcecode.dnt_score import (
-    CASE_DRIFT,
-    TRANSLATED,
-    aggregate,
-    pool,
-    score_dnt,
-)
-from sourcecode.postmt import RunResult
+from sourcecode.dnt_score import CASE_DRIFT, TRANSLATED, aggregate, aggregate_reversion, pool, score_dnt, score_reversion
+from sourcecode.postmt import RunResult, preflight_submission
 from sourcecode.text_processing import Dataset, Task, count_surface, normalize_language
+from sourcecode.text_processing import load as load_dataset_file
 
 
 EN, FR = "en-gb", "fr-fr"
@@ -127,10 +122,9 @@ def _result(name="dnt-set", domain="Test"):
     )
 
 
-def _run(dnt, *, skip_pipeline=True, postmt=None):
+def _run(dnt, *, segments=SEGMENTS[:2], skip_pipeline=True, postmt=None):
     return run_benchmark(
-        _dataset(segments=SEGMENTS[:2]), postmt=postmt, dnt=dnt, config=CONFIG,
-        skip_pipeline=skip_pipeline,
+        _dataset(segments=segments), postmt=postmt, dnt=dnt, config=CONFIG, skip_pipeline=skip_pipeline
     )
 
 
@@ -406,10 +400,7 @@ def test_defect_list_leaves_out_items_every_version_kept():
     """A row per preserved item would bury the failures, which is what the grid already does."""
     segments = [{"source_segment_id": "s1", "source_content": "AcoladPro is here.",
                  "target_content": "AcoladPro est ici.", "reference_content": "AcoladPro est ici."}]
-    result = run_benchmark(
-        _dataset(segments=segments), postmt=None, dnt=FakeDnt(items=["AcoladPro"]),
-        config=CONFIG, skip_pipeline=True,
-    )
+    result = _run(FakeDnt(items=["AcoladPro"]), segments=segments)
 
     assert dnt_report.defect_rows(result) == []
     assert dnt_report.render_defects(result) == ""
@@ -419,10 +410,7 @@ def test_defect_list_separates_case_drift_from_translation():
     """The two failures need different fixes, so the worklist must not call them both a leak."""
     segments = [{"source_segment_id": "s1", "source_content": "AcoladPro is here.",
                  "target_content": "acoladpro est ici.", "reference_content": "AcoladPro est ici."}]
-    result = run_benchmark(
-        _dataset(segments=segments), postmt=None, dnt=FakeDnt(items=["AcoladPro"]),
-        config=CONFIG, skip_pipeline=True,
-    )
+    result = _run(FakeDnt(items=["AcoladPro"]), segments=segments)
 
     assert "MT case drift" in dnt_report.defect_rows(result)[0]["faults"]
 
@@ -437,10 +425,7 @@ def test_src_retention_counts_items_the_reference_translated():
         {"source_segment_id": "s2", "source_content": "AcoladPro is sold.",
          "target_content": "AcoladPro est vendu.", "reference_content": "Le produit est vendu."},
     ]
-    result = run_benchmark(
-        _dataset(segments=segments), postmt=None, dnt=FakeDnt(items=["AcoladPro"]),
-        config=CONFIG, skip_pipeline=True,
-    )
+    result = _run(FakeDnt(items=["AcoladPro"]), segments=segments)
 
     assert result.mt.in_src == 2
     assert result.ref.src_retention_rate == 0.5   # the human kept one of the two
@@ -459,10 +444,7 @@ def test_scorecard_says_when_fewer_segments_were_scored_than_counted():
         {"source_segment_id": "s2", "source_content": "AcoladPro is here.",
          "target_content": "AcoladPro est ici.", "reference_content": "Le produit est ici."},
     ]
-    result = run_benchmark(
-        _dataset(segments=segments), postmt=None, dnt=FakeDnt(items=["AcoladPro"]),
-        config=CONFIG, skip_pipeline=True,
-    )
+    result = _run(FakeDnt(items=["AcoladPro"]), segments=segments)
 
     assert result.totals["segments_with_items"] == 2
     assert result.mt.segments_scored == 1
@@ -476,10 +458,7 @@ def test_scorecard_stays_quiet_when_every_counted_segment_was_scored():
         {"source_segment_id": "s2", "source_content": "AcoladPro is sold.",
          "target_content": "AcoladPro est vendu.", "reference_content": "AcoladPro est vendu."},
     ]
-    result = run_benchmark(
-        _dataset(segments=segments), postmt=None, dnt=FakeDnt(items=["AcoladPro"]),
-        config=CONFIG, skip_pipeline=True,
-    )
+    result = _run(FakeDnt(items=["AcoladPro"]), segments=segments)
 
     assert result.totals["segments_with_items"] == result.mt.segments_scored
     assert "Scored against REF" not in dnt_report.scorecard(result).as_console()
@@ -842,10 +821,6 @@ def test_dry_run_mirrors_mt_baseline():
 
 
 # the reversion gold set: the terms to restore are given, so nothing is read off a reference
-
-from sourcecode.dnt_score import aggregate_reversion, score_reversion   # noqa: E402
-from sourcecode.postmt import preflight_submission   # noqa: E402
-from sourcecode.text_processing import load as load_dataset_file   # noqa: E402
 
 
 def _gold(tmp_path, pairs, name="gold.json"):

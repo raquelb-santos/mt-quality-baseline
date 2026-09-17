@@ -6,7 +6,7 @@ from typing import Any, Sequence
 
 import httpx
 
-from .cat_tool import PHRASE_PROVIDERS, Term, XTM_PROVIDERS
+from .cat_tool import Term, clients_by_provider
 from .text_processing import count_surface
 
 logger = logging.getLogger(__name__)
@@ -15,33 +15,21 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class GlossaryMatches:
     mappings: list[dict[str, str]]
-    # Aligned with the texts queried: per_text_mappings[i] belongs to texts[i].
+    # per_text_mappings[i] belongs to texts[i].
     per_text_mappings: list[list[dict[str, str]]]
 
 
-def language_variants(language: str) -> list[str]:
-    """Full code and base code (en-us -> [en-us, en])."""
-    return list(dict.fromkeys([language, str(language).split("-")[0]]))
-
-
 class CatToolGlossary:
-    """Glossary terms read from the CAT tool that holds the project's term bases.
-
-    Terms and segments are both matched on their lemmas, so an inflected wording still counts as
-    the term having been used.
-    """
+    """Terms and segments are matched on lemmas, so an inflected wording still counts as used."""
 
     def __init__(self, stanza: Any, phrase: Any = None, xtm: Any = None) -> None:
         self._stanza = stanza
-        self._clients = {
-            **{provider: phrase for provider in PHRASE_PROVIDERS if phrase is not None},
-            **{provider: xtm for provider in XTM_PROVIDERS if xtm is not None},
-        }
+        self._clients = clients_by_provider(phrase, xtm)
         self._terms: dict[tuple[str, str], list[Term]] = {}
         self._lemmas: dict[tuple[str, str], str] = {}
 
     def close(self) -> None:
-        """The CAT clients belong to the resolver that shares them, and are closed there."""
+        """The CAT clients are closed by the resolver that shares them."""
 
     def terms_in(self, term_base_id: str, provider: str) -> list[Term]:
         provider = str(provider or "").strip().lower()
@@ -82,8 +70,7 @@ class CatToolGlossary:
         texts: Sequence[str],
         provider: str | None = None,
     ) -> GlossaryMatches:
-        """Resolve glossary matches for a batch of lemmatized texts, against the terms the CAT
-        tool holds in the project's own term bases."""
+        """Match lemmatized texts against the terms in the project's own term bases."""
         for value, label in (
             (glossary_ids, "glossary IDs"),
             (source_language, "source language"),
@@ -94,9 +81,9 @@ class CatToolGlossary:
 
         terms = [term for identifier in glossary_ids for term in self.terms_in(identifier, provider)]
 
-        # Permissive language matching, over the full code and the base code.
-        wanted_source = set(language_variants(source_language))
-        wanted_target = set(language_variants(target_language))
+        # Permissive language matching, over the full code and the base code (en-us, en).
+        wanted_source = {source_language, str(source_language).split("-")[0]}
+        wanted_target = {target_language, str(target_language).split("-")[0]}
 
         source_terms = [term for term in terms if term.language.lower() in wanted_source]
         targets_by_concept: dict[str, list[str]] = {}

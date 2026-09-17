@@ -1,4 +1,4 @@
-"""Clients for the post-mt async workflow API (``/api/workflow/async``) and for Stanza."""
+"""Clients for post-mt's async workflow API and for Stanza, and reading what post-mt returns."""
 
 import logging
 import time
@@ -35,20 +35,13 @@ def segment_error(segment: dict[str, Any]) -> str | None:
     return None
 
 
-class PostMtError(RuntimeError):
-    pass
-
-
-SUPPORTED_CAT_TOOLS = {"memsource", "phrase", "xtm"}
-
-
 def preflight_submission(parameters: dict[str, Any]) -> list[str]:
     """Reasons post-mt would reject the task outright, whatever is being measured."""
+    if str(parameters.get("tempo_task_id") or "").strip():
+        return []
     return [
-        f"`{name}` is missing — post-mt rejects every segment with "
-        f"'Missing required parameters fields: {name}' and returns no APE text"
-        for name in ("tempo_task_id",)
-        if not str(parameters.get(name) or "").strip()
+        "`tempo_task_id` is missing — post-mt rejects every segment with "
+        "'Missing required parameters fields: tempo_task_id' and returns no APE text"
     ]
 
 
@@ -62,10 +55,10 @@ def preflight_parameters(parameters: dict[str, Any]) -> list[str]:
     provider = str(parameters.get("cat_tool_provider") or "").strip()
     if not provider:
         problems.append("`cat_tool_provider` is missing — post-mt skips glossary retrieval entirely")
-    elif provider.lower() not in SUPPORTED_CAT_TOOLS:
+    elif provider.lower() not in {"memsource", "xtm"}:
         problems.append(
             f"`cat_tool_provider` is {provider!r}, which post-mt does not support "
-            f"(expected one of: {', '.join(sorted(SUPPORTED_CAT_TOOLS))})"
+            "(expected one of: memsource, xtm)"
         )
 
     return problems
@@ -104,15 +97,6 @@ class Usage:
             self.tokens + other.tokens,
             self.prompt_tokens + other.prompt_tokens,
             self.completion_tokens + other.completion_tokens,
-        )
-
-    @classmethod
-    def from_task(cls, task: dict[str, Any]) -> Usage:
-        return cls(
-            cost=float(task.get("totalCost") or 0),
-            tokens=int(task.get("totalTokens") or 0),
-            prompt_tokens=int(task.get("totalPromptTokens") or 0),
-            completion_tokens=int(task.get("totalCompletionTokens") or 0),
         )
 
 
@@ -171,29 +155,12 @@ class PostMtClient:
 
         return True
 
-    def submit(
-        self, *, parameters: dict[str, Any], steps: Sequence[str], segments: Sequence[dict[str, Any]]
-    ) -> str:
-        response = self._client.post(
-            "/api/workflow/async",
-            json={"parameters": parameters, "steps": list(steps), "segments": list(segments)},
-        )
-        response.raise_for_status()
-        task_id = response.json().get("taskId")
-        if not task_id:
-            raise PostMtError("submit returned no taskId")
-        return task_id
-
     def get_task(self, task_id: str) -> dict[str, Any]:
         response = self._client.get(f"/api/workflow/async/{task_id}")
         response.raise_for_status()
         return response.json()
 
-    def wait_for_completion(
-        self,
-        task_id: str,
-        on_progress: Callable[[dict[str, Any]], None] | None = None,
-    ) -> dict[str, Any]:
+    def wait_for_completion(self, task_id: str, on_progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         deadline = time.monotonic() + self.timeout
         last_percent = -1
 
@@ -213,13 +180,16 @@ class PostMtClient:
                 return self.get_task(task_id)
             if status in {"failed", "canceled"}:
                 task = self.get_task(task_id)
-                raise PostMtError(f"task {task_id} {status}: {task.get('error') or 'no error detail'}")
+                raise RuntimeError(f"task {task_id} {status}: {task.get('error') or 'no error detail'}")
 
             time.sleep(self.poll_interval)
 
-        raise PostMtError(f"task {task_id} timed out after {self.timeout}s")
+        raise RuntimeError(f"task {task_id} timed out after {self.timeout}s")
 
-    def cancel(self, task_id: str) -> bool:
+    def cancel_active(self) -> bool:
+        task_id = self.active_task_id
+        if not task_id:
+            return False
         try:
             response = self._client.post(f"/api/workflow/async/{task_id}/cancel")
             if response.status_code == 400:
@@ -231,9 +201,6 @@ class PostMtClient:
             logger.warning("[POST-MT] could not cancel task %s: %s", task_id, error)
             return False
 
-    def cancel_active(self) -> bool:
-        return self.cancel(self.active_task_id) if self.active_task_id else False
-
     def run(
         self,
         *,
@@ -242,7 +209,14 @@ class PostMtClient:
         steps: Sequence[str],
         on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> RunResult:
-        task_id = self.submit(parameters=parameters, steps=steps, segments=segments)
+        response = self._client.post(
+            "/api/workflow/async",
+            json={"parameters": parameters, "steps": list(steps), "segments": list(segments)},
+        )
+        response.raise_for_status()
+        task_id = response.json().get("taskId")
+        if not task_id:
+            raise RuntimeError("submit returned no taskId")
         logger.info("[POST-MT] submitted task %s (%d segments, steps=%s)", task_id, len(segments), "+".join(steps))
 
         self.active_task_id = task_id
@@ -255,7 +229,12 @@ class PostMtClient:
         if error:
             logger.warning("[POST-MT] task %s completed with errors: %s", task_id, error)
 
-        usage = Usage.from_task(task)
+        usage = Usage(
+            cost=float(task.get("totalCost") or 0),
+            tokens=int(task.get("totalTokens") or 0),
+            prompt_tokens=int(task.get("totalPromptTokens") or 0),
+            completion_tokens=int(task.get("totalCompletionTokens") or 0),
+        )
         if usage.cost:
             logger.info("[POST-MT] task %s cost $%.4f (%s tokens)", task_id, usage.cost, f"{usage.tokens:,}")
 

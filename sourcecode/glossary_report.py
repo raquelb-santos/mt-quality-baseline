@@ -3,9 +3,9 @@
 from collections import Counter
 from typing import Any, Sequence
 
-from .report import Scorecard, by_language_pair, cell, delta as delta_of, failure_warning, pct, rate, scope_note, signed_pct, subheading_of, table
+from .report import Scorecard, delta as delta_of, failure_warning, pct, rate, scope_note, signed_pct, strata, subheading_of, table
 from .glossary_benchmark import Result
-from .glossary_score import aggregate, bucket_of, pool, pool_violations
+from .glossary_score import aggregate, bucket_of
 
 VERSIONS = ("mt", "ape")
 
@@ -16,9 +16,8 @@ def _moved(values: Sequence[Any]) -> str:
 
 def scorecard(result: Result) -> Scorecard:
     mt, ape = result.mt, result.ape
-    totals, delta = result.totals, result.delta
+    totals, delta, check = result.totals, result.delta, result.ref_check
     mt_v, ape_v = result.mt_violations, result.ape_violations
-    check = result.ref_check
     rows = term_rows(result)
     buckets = [Counter(row[f"{v}_bucket"] for row in rows) for v in VERSIONS]
 
@@ -69,7 +68,7 @@ def scorecard(result: Result) -> Scorecard:
 
 
 def _bucket(rendered: int, expected: int) -> str:
-    """The scorer's ladder, relabelled - it runs on the pooled counts, not the per-segment ones."""
+    """The scorer's ladder relabelled, run on the pooled counts rather than per segment."""
     return {"never_used": "never", "used_partly": "partly", "matched_ref": "matched",
             "over_used": "over-used", "": ""}[bucket_of(rendered, expected)]
 
@@ -79,10 +78,7 @@ def term_rows(result: Result) -> list[dict[str, Any]]:
     pooled: dict[str, dict[str, Any]] = {}
 
     for segment in result.segments:
-        columns = {
-            "mt": {t.source_content: t for t in segment.mt.term_scores},
-            "ape": {t.source_content: t for t in segment.ape.term_scores},
-        }
+        columns = {v: {t.source_content: t for t in getattr(segment, v).term_scores} for v in VERSIONS}
         # The union, not MT alone: keying off one column would drop the other's over-use.
         for source in dict.fromkeys([*columns["mt"], *columns["ape"]]):
             term = columns["mt"].get(source) or columns["ape"][source]
@@ -213,15 +209,7 @@ def _measured(segments: Sequence[Any]) -> dict[str, Any]:
 
 
 def stratum_rows(results: Sequence[Result]) -> list[dict[str, Any]]:
-    """One row per language pair, then one for each domain the pair was measured in."""
-    rows = []
-    for pair, domains in by_language_pair(results).items():
-        rows.append({"language_pair": pair, "domain": None, "label": pair,
-                     **_measured([s for group in domains.values() for s in group])})
-        for domain, group in domains.items():
-            rows.append({"language_pair": pair, "domain": domain, "label": f"↳ {domain}",
-                         **_measured(group)})
-    return rows
+    return strata(results, _measured)
 
 
 def _line(label: str, row: dict[str, Any]) -> str:
@@ -234,24 +222,12 @@ def _line(label: str, row: dict[str, Any]) -> str:
     )
 
 
-def _stratum_lines(results: Sequence[Result]) -> list[str]:
-    """Built once so the report's bullets and the console's list cannot disagree."""
-    rows = stratum_rows(results)
-    lines = [_line(row["label"], row) for row in rows]
-
-    if sum(1 for row in rows if row["domain"] is None) > 1:
-        segments = [s for result in results for s in result.segments]
-        lines.append(_line("ALL", _measured(segments)))
-
-    return lines
-
-
 def render_strata(results: Sequence[Result]) -> str:
     """Adherence per language pair, split by the domains inside it."""
-    lines = _stratum_lines(results)
+    lines = [_line(row["label"], row) for row in strata(results, _measured, total=True)]
     return "" if not lines else "\n".join(["### By language pair", "", *(f"- {l}" for l in lines), ""])
 
 
 def render_strata_console(results: Sequence[Result]) -> str:
-    lines = _stratum_lines(results)
+    lines = [_line(row["label"], row) for row in strata(results, _measured, total=True)]
     return "" if not lines else "\n".join(["Adherence by language pair", "", *(f"  {l}" for l in lines), ""])

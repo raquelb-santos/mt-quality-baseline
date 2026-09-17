@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 def load_dataset(path: Path, *, term_bases: Any, dry_run: bool, languages: Sequence[tuple[str, str]] = ()) -> Dataset:
     data = load(path, component="glossary", languages=languages)
 
-    # Nothing in this file is in the pairs asked for, so there is no term base to expect either.
+    # Nothing in the pairs asked for, so no term base to expect either.
     if not data.tasks:
         return data
 
@@ -30,14 +30,11 @@ def load_dataset(path: Path, *, term_bases: Any, dry_run: bool, languages: Seque
             "Fix the parameters above.",
         )
 
-    # Term bases that are not there do not fail: they match nothing and score a clean-looking 0.
-    resolved = sum(
-        1 for task in data.tasks
-        if term_bases.ids_for(task.parameters.get("cat_project_id"),
-                              task.parameters.get("cat_tool_provider"))
-    )
-    if not resolved:
-        # Dropped rather than scored, because a 0 from no terms reads like a clean result.
+    # Dropped rather than scored, because a 0 from no terms reads like a clean result.
+    if not any([
+        term_bases.ids_for(task.parameters.get("cat_project_id"), task.parameters.get("cat_tool_provider"))
+        for task in data.tasks
+    ]):
         logger.warning(
             "[BENCH] none of the %d CAT projects in %s has a term base attached - not scored. "
             "Check cat_project_id and cat_tool_provider, and that these credentials can see "
@@ -112,8 +109,7 @@ def _repairs(results: list[SegmentResult], before: str, after: str) -> tuple[int
 def _resolve_task(
     task: Task, *, stanza: Any, glossary: Any, term_bases: Any
 ) -> list[list[dict[str, str]]]:
-    """Each task retrieves from the term bases its own CAT project has attached, for its own
-    language pair. A project with none retrieves nothing, and never reaches the lemmatizer."""
+    """Retrieve from the task's own project term bases; with none, never reach the lemmatizer."""
     source_language = task.parameters.get("clean_source_language_code")
     provider = task.parameters.get("cat_tool_provider")
 
@@ -121,9 +117,7 @@ def _resolve_task(
     if not glossary_ids:
         return [[] for _ in task.segments]
 
-    # Order-preserving dedup — index alignment below depends on stable ordering.
     unique_sources = list(dict.fromkeys(s["source_content"] for s in task.segments))
-
     logger.debug("[GLOSSARY] lemmatizing %d unique sources (%s)", len(unique_sources), source_language)
 
     # Degrade rather than abort: no glossary at all reads as a clean 0-instance scorecard.
@@ -144,23 +138,6 @@ def _resolve_task(
 
     by_source = dict(zip(unique_sources, matches.per_text_mappings))
     return [by_source[s["source_content"]] for s in task.segments]
-
-
-def _resolve_glossary(
-    dataset: Dataset, *, stanza: Any, glossary: Any, term_bases: Any
-) -> list[list[dict[str, str]]]:
-    per_segment = [
-        mappings
-        for task in dataset.tasks
-        for mappings in _resolve_task(task, stanza=stanza, glossary=glossary, term_bases=term_bases)
-    ]
-
-    distinct = {(m["source_content"], m["target_content"]) for mappings in per_segment for m in mappings}
-    logger.info(
-        "[GLOSSARY] %d distinct term mappings across %d segments in %d task(s)",
-        len(distinct), len(per_segment), len(dataset.tasks),
-    )
-    return per_segment
 
 
 def _build_lemmas(
@@ -197,8 +174,15 @@ def run_benchmark(
     source_languages = dataset.per_segment("clean_source_language_code")
     strata = [stratum_of(p) for p in dataset.parameters_per_segment()]
 
-    per_segment_mappings = _resolve_glossary(
-        dataset, stanza=stanza, glossary=glossary, term_bases=term_bases
+    per_segment_mappings = [
+        mappings
+        for task in dataset.tasks
+        for mappings in _resolve_task(task, stanza=stanza, glossary=glossary, term_bases=term_bases)
+    ]
+    distinct = {(m["source_content"], m["target_content"]) for ms in per_segment_mappings for m in ms}
+    logger.info(
+        "[GLOSSARY] %d distinct term mappings across %d segments in %d task(s)",
+        len(distinct), len(per_segment_mappings), len(dataset.tasks),
     )
 
     glossary_bearing = sum(1 for m in per_segment_mappings if m)
@@ -216,8 +200,6 @@ def run_benchmark(
         postmt, dataset, batch_size=config.benchmark.batch_size
     )
     processed = outcome.segments
-    failures = outcome.failures
-
     originals = dataset.segments
     mt_texts = [s.get("target_content") or "" for s in originals]
     ape_texts = [extract_post_edited(s) for s in processed]
@@ -242,23 +224,18 @@ def run_benchmark(
 
     results: list[SegmentResult] = []
     for i, segment in enumerate(processed):
-        original = originals[i]
         mappings = per_segment_mappings[i]
         mt_text, ape_text, ref_text = mt_texts[i], ape_texts[i], ref_texts[i]
         lemmas = lemmas_by_language.get(target_languages[i], {})
-
         common = dict(
-            mappings=mappings,
-            language_code=target_languages[i],
-            term_lemmas=lemmas,
-            ref_text=ref_text,
-            ref_lemmas=lemmas.get(ref_text),
+            mappings=mappings, language_code=target_languages[i], term_lemmas=lemmas,
+            ref_text=ref_text, ref_lemmas=lemmas.get(ref_text),
         )
 
         results.append(SegmentResult(
-            source_segment_id=segment_id(segment, original, i),
+            source_segment_id=segment_id(segment, originals[i], i),
             stratum=strata[i],
-            src_text=original.get("source_content", ""),
+            src_text=originals[i].get("source_content", ""),
             mt_text=mt_text,
             ape_text=ape_text,
             ref_text=ref_text,
@@ -274,7 +251,6 @@ def run_benchmark(
     resolved = [r for r in results if r.has_glossary_resolved]
     # Resolved here but never shown to post-mt, so the APE column measures something else.
     blind = [] if skip_pipeline else [r for r in resolved if r.has_glossary_reported is False]
-
     if blind:
         logger.warning(
             "[BENCH] post-mt reported no glossary on %d/%d segments where terms were resolved - "
@@ -285,7 +261,7 @@ def run_benchmark(
     mt_aggregate = aggregate([r.mt for r in results])
     ape_aggregate = aggregate([r.ape for r in results])
 
-    # Corpus-level, so it runs once over every segment rather than inside the loop above.
+    # Corpus-level, so it runs once rather than inside the loop above.
     mt_violations, ape_violations = find_violations(
         versions=[mt_texts, ape_texts],
         ref_texts=ref_texts,
@@ -308,8 +284,8 @@ def run_benchmark(
         parameters=report_parameters(dataset),
         config={"lemma_matching": config.benchmark.lemma_matching},
         usage=outcome.usage,
-        failed_segments=len(failures),
-        failure_reason=failures[0] if failures else None,
+        failed_segments=len(outcome.failures),
+        failure_reason=outcome.failures[0] if outcome.failures else None,
         totals={
             "segments": len(dataset.segments),
             "segments_with_glossary": glossary_bearing,

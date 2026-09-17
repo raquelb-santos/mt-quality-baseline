@@ -83,6 +83,28 @@ def _repairs(results: list[SegmentResult], before: str, after: str) -> tuple[int
     return fixed, broken
 
 
+def _revert(dnt: Any, dataset: Dataset, config: Any, src_texts: list[str], *arms: list[str]) -> list[list[Any]]:
+    """Each arm reverted one language pair at a time: the service detects for the pair it is told."""
+    by_pair: dict[tuple[str, str], list[int]] = {}
+    languages = zip(dataset.per_segment("clean_source_language_code"),
+                    dataset.per_segment("clean_target_language_code"))
+    for index, pair in enumerate(languages):
+        by_pair.setdefault(pair, []).append(index)
+
+    reverted: list[list[Any]] = [[None] * len(src_texts) for _ in arms]
+    for (source_language, target_language), indexes in by_pair.items():
+        for texts, into in zip(arms, reverted):
+            returned = dnt.revert(
+                [{"id": str(i), "source": src_texts[i], "target": texts[i]} for i in indexes],
+                batch_size=config.dnt.batch_size,
+                source_language=source_language,
+                target_language=target_language,
+            )
+            for i, reversion in zip(indexes, returned):
+                into[i] = reversion
+    return reverted
+
+
 def run_benchmark(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any, skip_pipeline: bool = False) -> Result:
     source_languages = dataset.per_segment("clean_source_language_code")
     target_languages = dataset.per_segment("clean_target_language_code")
@@ -91,35 +113,18 @@ def run_benchmark(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any, skip_
     outcome = stub_pipeline(dataset) if skip_pipeline else run_pipeline(
         postmt, dataset, batch_size=config.benchmark.batch_size
     )
-    processed = outcome.segments
+    failures = outcome.failures
 
     originals = dataset.segments
     src_texts = [s.get("source_content") or "" for s in originals]
     ref_texts = [s.get("reference_content") or "" for s in originals]
     mt_texts = [s.get("target_content") or "" for s in originals]
-    ape_texts = [extract_post_edited(s) for s in processed]
-
-    # One pass per language pair: the service detects for the pair it is told.
-    by_pair: dict[tuple[str, str], list[int]] = {}
-    for index, pair in enumerate(zip(source_languages, target_languages)):
-        by_pair.setdefault(pair, []).append(index)
+    ape_texts = [extract_post_edited(s) for s in outcome.segments]
 
     # Reversion runs on the last version there is; --dry-run makes that MT.
-    reversions: list[Any] = [None] * len(originals)
-    for (source_language, target_language), indexes in by_pair.items():
-        returned = dnt.revert(
-            [
-                {"id": str(index), "source": src_texts[index], "target": ape_texts[index]}
-                for index in indexes
-            ],
-            batch_size=config.dnt.batch_size,
-            source_language=source_language,
-            target_language=target_language,
-        )
-        for index, reversion in zip(indexes, returned):
-            reversions[index] = reversion
+    [reversions] = _revert(dnt, dataset, config, src_texts, ape_texts)
 
-    unread = sum(1 for reversion in reversions if reversion is None)
+    unread = reversions.count(None)
     if unread:
         logger.error(
             "[DNT] %d/%d segments came back from no revert batch. They are excluded from the "
@@ -130,7 +135,7 @@ def run_benchmark(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any, skip_
 
     per_segment_items = [[] if r is None else list(r.items) for r in reversions]
     carrying = sum(1 for items in per_segment_items if items)
-    logger.info("[DNT] %d/%d segments carry at least one DNT item", carrying, len(dataset.segments))
+    logger.info("[DNT] %d/%d segments carry at least one DNT item", carrying, len(originals))
     if carrying == 0 and unread < len(reversions):
         logger.warning(
             "[DNT] no DNT items at all - check DNT_BASE_URL and the language pair before "
@@ -138,9 +143,8 @@ def run_benchmark(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any, skip_
         )
 
     results: list[SegmentResult] = []
-    for index, segment in enumerate(processed):
-        reversion = reversions[index]
-        items = per_segment_items[index]
+    for index, segment in enumerate(outcome.segments):
+        reversion, items = reversions[index], per_segment_items[index]
         src_text, ref_text = src_texts[index], ref_texts[index]
         mt_text, ape_text = mt_texts[index], ape_texts[index]
         rev_text = ape_text if reversion is None else reversion.rev_text
@@ -171,13 +175,11 @@ def run_benchmark(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any, skip_
             ref=score_dnt(text=ref_text, **common),
         ))
 
-    failures = outcome.failures
-
     scored = [r for r in results if not r.unread]
-    mt = aggregate([r.mt for r in scored], segments_unread=unread)
-    ape = aggregate([r.ape for r in scored], segments_unread=unread)
-    rev = aggregate([r.rev for r in scored], segments_unread=unread)
-    ref = aggregate([r.ref for r in scored], segments_unread=unread)
+    mt, ape, rev, ref = (
+        aggregate([getattr(r, version) for r in scored], segments_unread=unread)
+        for version in ("mt", "ape", "rev", "ref")
+    )
 
     return Result(
         dataset=f"{dataset.name} (dry-run)" if skip_pipeline else dataset.name,
@@ -187,7 +189,7 @@ def run_benchmark(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any, skip_
         failed_segments=len(failures),
         failure_reason=failures[0] if failures else None,
         totals={
-            "segments": len(dataset.segments),
+            "segments": len(originals),
             "segments_read": len(scored),
             "segments_with_items": carrying,
             "segments_changed_by_ape": sum(1 for r in results if r.changed_by_ape),
@@ -251,27 +253,10 @@ def run_reversion(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any,
     outcome = stub_pipeline(dataset) if skip_pipeline else run_pipeline(
         postmt, dataset, batch_size=config.benchmark.batch_size
     )
+    failures = outcome.failures
     ape_texts = [extract_post_edited(s) for s in outcome.segments]
 
-    # One pass per language pair, which is also how the gold set is grouped into tasks.
-    reversions: list[Any] = [None] * len(originals)
-    ape_reversions: list[Any] = [None] * len(originals)
-    index = 0
-    for task in dataset.tasks:
-        span = range(index, index + len(task.segments))
-        languages = dict(
-            source_language=task.parameters.get("clean_source_language_code"),
-            target_language=task.parameters.get("clean_target_language_code"),
-        )
-        for texts, into in ((mt_texts, reversions), (ape_texts, ape_reversions)):
-            returned = dnt.revert(
-                [{"id": str(i), "source": src_texts[i], "target": texts[i]} for i in span],
-                batch_size=config.dnt.batch_size,
-                **languages,
-            )
-            for i, reversion in zip(span, returned):
-                into[i] = reversion
-        index += len(task.segments)
+    reversions, ape_reversions = _revert(dnt, dataset, config, src_texts, mt_texts, ape_texts)
 
     # A pair is unread when either arm came back from no batch: one arm alone cannot be compared.
     unread = sum(1 for mt, ape in zip(reversions, ape_reversions) if mt is None or ape is None)
@@ -287,6 +272,7 @@ def run_reversion(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any,
         reversion, ape_reversion = reversions[i], ape_reversions[i]
         rev_text = mt_texts[i] if reversion is None else reversion.rev_text
         rev_ape_text = ape_texts[i] if ape_reversion is None else ape_reversion.rev_text
+        terms = list(segment.get("expected_terms") or [])
         results.append(ReversionSegmentResult(
             source_segment_id=segment.get("source_segment_id", str(i)),
             stratum=strata[i],
@@ -299,10 +285,10 @@ def run_reversion(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any,
             changed_by_rev=mt_texts[i] != rev_text,
             changed_by_rev_ape=ape_texts[i] != rev_ape_text,
             unread=reversion is None or ape_reversion is None,
-            expected_terms=list(segment.get("expected_terms") or []),
+            expected_terms=terms,
             detected_items=[] if reversion is None else list(reversion.items),
             score=score_reversion(
-                terms=segment.get("expected_terms") or [],
+                terms=terms,
                 mt_text=mt_texts[i],
                 ape_text=ape_texts[i],
                 rev_text=rev_text,
@@ -312,8 +298,6 @@ def run_reversion(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any,
         ))
 
     scored = [r for r in results if not r.unread]
-    carrying = sum(1 for r in results if r.expected_terms)
-    failures = outcome.failures
 
     return ReversionResult(
         dataset=f"{dataset.name} (dry-run)" if skip_pipeline else dataset.name,
@@ -325,7 +309,7 @@ def run_reversion(dataset: Dataset, *, postmt: Any, dnt: Any, config: Any,
         totals={
             "segments": len(originals),
             "segments_read": len(scored),
-            "segments_with_terms": carrying,
+            "segments_with_terms": sum(1 for r in results if r.expected_terms),
             "segments_changed_by_ape": sum(1 for r in results if r.changed_by_ape),
             "segments_changed_by_rev": sum(1 for r in results if r.changed_by_rev),
             "segments_changed_by_rev_ape": sum(1 for r in results if r.changed_by_rev_ape),

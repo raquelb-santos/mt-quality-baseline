@@ -4,8 +4,8 @@ from collections import defaultdict
 from typing import Any, Sequence
 
 from .dnt_benchmark import Result
-from .dnt_score import ReversionAggregate, aggregate, aggregate_reversion, pool
-from .report import Scorecard, arrow, by_language_pair, cell, delta as delta_of, failure_warning, pct, rate, scope_note, signed_pct, subheading_of, table
+from .dnt_score import aggregate, aggregate_reversion
+from .report import Scorecard, arrow, cell, delta as delta_of, failure_warning, pct, rate, scope_note, signed_pct, strata, strata_rates, subheading_of, table
 from .text_processing import count_surface
 
 VERSIONS = ("mt", "ape", "rev")
@@ -320,9 +320,7 @@ def render_comparison(results: Sequence[Result]) -> str:
 
 
 def _measured(segments: Sequence[Any]) -> dict[str, Any]:
-    """One group's counts, aggregated from the segments themselves rather than from datasets.
-
-    Segments no revert batch came back for leave the denominator, as they do on the scorecard."""
+    """One group's counts from its segments; unread ones leave the denominator, as on the scorecard."""
     unread = sum(1 for s in segments if s.unread)
     scored = [s for s in segments if not s.unread]
     mt, ape, rev = (
@@ -342,32 +340,11 @@ def _measured(segments: Sequence[Any]) -> dict[str, Any]:
 
 
 def stratum_rows(results: Sequence[Result]) -> list[dict[str, Any]]:
-    """One row per language pair, then one for each domain the pair was measured in."""
-    rows = []
-    for pair, domains in by_language_pair(results).items():
-        rows.append({"language_pair": pair, "domain": None, "label": pair,
-                     **_measured([s for group in domains.values() for s in group])})
-        for domain, group in domains.items():
-            rows.append({"language_pair": pair, "domain": domain, "label": f"↳ {domain}",
-                         **_measured(group)})
-    return rows
+    return strata(results, _measured)
 
 
 def stratum_rate_rows(results: Sequence[Result]) -> list[tuple[str, list[str]]]:
-    """Each group against its pooled preservation, the instance count in the label."""
-    all_rows = stratum_rows(results)
-    rows = [
-        (f"{row['label']} · {row['expected_instances']} inst",
-         [pct(row[f"{column}_preservation_rate"]) for column in VERSIONS])
-        for row in all_rows
-    ]
-
-    if sum(1 for row in all_rows if row["domain"] is None) > 1:
-        pooled = _measured([s for result in results for s in result.segments])
-        rows.append((f"ALL · {pooled['expected_instances']} inst",
-                     [pct(pooled[f"{column}_preservation_rate"]) for column in VERSIONS]))
-
-    return rows
+    return strata_rates(results, _measured, "inst", [f"{c}_preservation_rate" for c in VERSIONS])
 
 
 def render_strata(results: Sequence[Result]) -> str:
@@ -459,9 +436,6 @@ def _term_cells(row: dict[str, Any]) -> list[str]:
 
 def render_reversion_terms(result: Any) -> str:
     rows = reversion_term_rows(result)
-    if not rows:
-        return ""
-
     return table(
         f"Gold terms reversion did not carry — {result.dataset}", "Segment",
         ["Term", *_TERM_COLUMNS],
@@ -471,9 +445,6 @@ def render_reversion_terms(result: Any) -> str:
 
 def render_reversion_terms_console(result: Any) -> str:
     rows = reversion_term_rows(result)
-    if not rows:
-        return ""
-
     return table(
         f"Gold terms reversion did not carry — {result.dataset}", "segment",
         ["term", *(name.lower() for name in _TERM_COLUMNS)],
@@ -482,53 +453,16 @@ def render_reversion_terms_console(result: Any) -> str:
     )
 
 
-def _reversion_of(segments: Sequence[Any]) -> ReversionAggregate:
+def _reversion_measured(segments: Sequence[Any]) -> dict[str, Any]:
     """Aggregated from the segments themselves, so a pair drawn from several files is one row."""
-    scored = [s for s in segments if not s.unread]
-    return aggregate_reversion(
-        [s.score for s in scored], segments_unread=len(segments) - len(scored)
-    )
-
-
-def reversion_stratum_rows(results: Sequence[Any]) -> list[dict[str, Any]]:
-    """One row per language pair, then one for each domain the pair was measured in."""
-    def measured(segments: Sequence[Any]) -> dict[str, Any]:
-        pooled = _reversion_of(segments)
-        return {
-            "segments": len(segments),
-            "expected_instances": pooled.expected,
-            "mt_rate": pooled.mt_rate,
-            "rev_rate": pooled.rev_rate,
-            "ape_rate": pooled.ape_rate,
-            "rev_ape_rate": pooled.rev_ape_rate,
-        }
-
-    rows = []
-    for pair, domains in by_language_pair(results).items():
-        rows.append({"language_pair": pair, "domain": None, "label": pair,
-                     **measured([s for group in domains.values() for s in group])})
-        for domain, group in domains.items():
-            rows.append({"language_pair": pair, "domain": domain, "label": f"↳ {domain}",
-                         **measured(group)})
-    return rows
+    pooled = aggregate_reversion([s.score for s in segments if not s.unread])
+    return {"expected_instances": pooled.expected, "mt_rate": pooled.mt_rate,
+            "rev_rate": pooled.rev_rate, "ape_rate": pooled.ape_rate, "rev_ape_rate": pooled.rev_ape_rate}
 
 
 def reversion_rate_rows(results: Sequence[Any]) -> list[tuple[str, list[str]]]:
-    all_rows = reversion_stratum_rows(results)
-    rows = [
-        (f"{row['label']} · {row['expected_instances']} terms",
-         [pct(row["mt_rate"]), pct(row["rev_rate"]),
-          pct(row["ape_rate"]), pct(row["rev_ape_rate"])])
-        for row in all_rows
-    ]
-
-    if sum(1 for row in all_rows if row["domain"] is None) > 1:
-        pooled = _reversion_of([s for r in results for s in r.segments])
-        rows.append((f"ALL · {pooled.expected} terms",
-                     [pct(pooled.mt_rate), pct(pooled.rev_rate),
-                      pct(pooled.ape_rate), pct(pooled.rev_ape_rate)]))
-
-    return rows
+    return strata_rates(results, _reversion_measured, "terms",
+                        ["mt_rate", "rev_rate", "ape_rate", "rev_ape_rate"])
 
 
 def render_reversion_strata(results: Sequence[Any]) -> str:

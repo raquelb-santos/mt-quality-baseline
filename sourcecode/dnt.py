@@ -25,36 +25,27 @@ class Reversion:
 
 
 def parse_reversion(segment: Mapping[str, Any], sent_target: str) -> Reversion:
-    # An empty result means the text we sent, not a segment that lost its translation.
+    """An empty result means the text we sent, not a segment that lost its translation."""
     result = segment.get("result")
     rev_text = result if isinstance(result, str) and result else sent_target
 
     items = item_list(segment.get("terms"))
     if items is not None:
-        return Reversion(rev_text=rev_text, items=items)
-
-    return Reversion(
-        rev_text=rev_text,
-        items=item_list(segment.get("reverted")) or [],
-        items_are_repairs_only=True,
-    )
+        return Reversion(rev_text, items)
+    return Reversion(rev_text, item_list(segment.get("reverted")) or [], items_are_repairs_only=True)
 
 
 def response_segments(body: Any) -> list[Mapping[str, Any]]:
     """The per-segment entries, however the response wraps them."""
-    if isinstance(body, list):
-        return [entry for entry in body if isinstance(entry, Mapping)]
-
     if isinstance(body, Mapping):
-        for key in ("segments", "results", "data"):
-            raw = body.get(key)
-            if isinstance(raw, list):
-                return [entry for entry in raw if isinstance(entry, Mapping)]
+        wrapped = [body[key] for key in ("segments", "results", "data") if isinstance(body.get(key), list)]
         # A single-segment body with no envelope around it.
-        if any(key in body for key in ("terms", "reverted", "result")):
-            return [body]
+        unwrapped = [body] if any(key in body for key in ("terms", "reverted", "result")) else []
+        body = wrapped[0] if wrapped else unwrapped
 
-    return []
+    if not isinstance(body, list):
+        return []
+    return [entry for entry in body if isinstance(entry, Mapping)]
 
 
 class DntClient:
@@ -92,8 +83,19 @@ class DntClient:
             )
             return False
 
-        if not self._dependencies_are_up(response):
-            return False
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+
+        for name in ("llm_gateway", "cache"):
+            status = body.get(name) if isinstance(body, dict) else None
+            if isinstance(status, str) and status.strip().lower() not in {"connected", "ok", "up", "healthy"}:
+                logger.error(
+                    "[DNT] %s reports %s = %r. Reverting depends on it, so every batch fails.",
+                    self.base_url, name, status,
+                )
+                return False
 
         try:
             keyed = self._client.get("/v1/prompts")
@@ -112,26 +114,6 @@ class DntClient:
 
         return True
 
-    def _dependencies_are_up(self, response: httpx.Response) -> bool:
-        """A disconnected LLM gateway fails every revert; unknown fields are not a failure."""
-        try:
-            body = response.json()
-        except ValueError:
-            return True
-        if not isinstance(body, dict):
-            return True
-
-        for name in ("llm_gateway", "cache"):
-            status = body.get(name)
-            if isinstance(status, str) and status.strip().lower() not in {"connected", "ok", "up", "healthy"}:
-                logger.error(
-                    "[DNT] %s reports %s = %r. Reverting depends on it, so every batch fails.",
-                    self.base_url, name, status,
-                )
-                return False
-
-        return True
-
     def revert(
         self,
         pairs: Sequence[Mapping[str, str]],
@@ -144,13 +126,30 @@ class DntClient:
         if not pairs:
             return []
 
+        options = {
+            key: str(value).split("-")[0].lower()
+            for key, value in (("source_language", source_language), ("target_language", target_language))
+            if value
+        }
+
         results: list[Reversion | None] = []
         batches = [pairs[i : i + batch_size] for i in range(0, len(pairs), batch_size)]
         logger.info("[DNT] %d segments in %d batch(es)", len(pairs), len(batches))
 
         for number, batch in enumerate(batches, start=1):
+            payload: dict[str, Any] = {
+                "segments": [
+                    {"id": pair["id"], "source": pair.get("source", ""), "target": pair.get("target", "")}
+                    for pair in batch
+                ]
+            }
+            if options:
+                payload["options"] = options
+
             try:
-                returned = self._revert_batch(batch, source_language, target_language)
+                response = self._client.post("/v1/revert", json=payload)
+                response.raise_for_status()
+                returned = response_segments(response.json())
             except (httpx.HTTPError, ValueError) as error:
                 logger.error("[DNT] batch %d/%d failed: %s", number, len(batches), error)
                 results.extend([None] * len(batch))
@@ -162,12 +161,10 @@ class DntClient:
                     number, len(returned), len(batch),
                 )
 
-            for i, pair in enumerate(batch):
-                entry = returned[i] if i < len(returned) else None
-                results.append(
-                    None if entry is None else parse_reversion(entry, pair.get("target", ""))
-                )
-
+            results.extend(
+                parse_reversion(returned[i], pair.get("target", "")) if i < len(returned) else None
+                for i, pair in enumerate(batch)
+            )
             logger.info("[DNT] batch %d/%d done", number, len(batches))
 
         repairs_only = sum(1 for r in results if r is not None and r.items_are_repairs_only)
@@ -179,32 +176,3 @@ class DntClient:
             )
 
         return results
-
-    def _revert_batch(
-        self,
-        batch: Sequence[Mapping[str, str]],
-        source_language: str | None,
-        target_language: str | None,
-    ) -> list[Mapping[str, Any]]:
-        payload: dict[str, Any] = {
-            "segments": [
-                {"id": pair["id"], "source": pair.get("source", ""), "target": pair.get("target", "")}
-                for pair in batch
-            ]
-        }
-
-        # The service detects better for knowing the pair, as a base code (`en-gb` -> `en`).
-        options = {
-            key: str(value).split("-")[0].lower()
-            for key, value in (
-                ("source_language", source_language),
-                ("target_language", target_language),
-            )
-            if value
-        }
-        if options:
-            payload["options"] = options
-
-        response = self._client.post("/v1/revert", json=payload)
-        response.raise_for_status()
-        return response_segments(response.json())

@@ -8,41 +8,27 @@ from dotenv import load_dotenv
 
 
 def _settings_file() -> str | None:
-    """`ENV_FILE` points a run at a settings file other than `.env`; a named file that is not
-    there stops the run rather than silently falling back."""
+    """`ENV_FILE` names a settings file other than `.env`; a missing one stops the run."""
     named = (os.getenv("ENV_FILE") or "").strip()
-    if not named:
-        return None
-    if not os.path.isfile(named):
+    if named and not os.path.isfile(named):
         raise RuntimeError(f"ENV_FILE names {named}, which is not a file.")
-    return named
+    return named or None
 
 
 load_dotenv(_settings_file(), override=True)
-
-
-def _parse_list(raw: str) -> list[str]:
-    parts = raw.strip().strip("[]").split(",")
-    return [item for item in (part.strip().strip("\"'") for part in parts) if item]
-
-
-def _parse_slots(raw: str) -> list[str]:
-    """`_parse_list` for a setting that lines up with another - a blank slot is kept, not dropped."""
-    if not raw.strip():
-        return []
-    return [part.strip().strip("\"'") for part in raw.strip().strip("[]").split(",")]
 
 
 def _env(name: str) -> Any:
     return field(default_factory=lambda: os.getenv(name))
 
 
-def _env_list(name: str) -> Any:
-    return field(default_factory=lambda: _parse_list(os.getenv(name) or ""))
-
-
-def _env_slots(name: str) -> Any:
-    return field(default_factory=lambda: _parse_slots(os.getenv(name) or ""))
+def _env_list(name: str, *, keep_blanks: bool = False) -> Any:
+    """A comma-separated setting, brackets optional; `keep_blanks` keeps slots lined up."""
+    def parse() -> list[str]:
+        raw = (os.getenv(name) or "").strip()
+        items = [part.strip().strip("\"'") for part in raw.strip("[]").split(",")] if raw else []
+        return items if keep_blanks else [item for item in items if item]
+    return field(default_factory=parse)
 
 
 def _env_bool(name: str) -> Any:
@@ -119,7 +105,7 @@ class BenchmarkConfig:
     # The components this run measures, in reporting order.
     components: list[str] = _env_list("BENCH_COMPONENT")
     # One slot per component, in `components` order; a blank slot scores every language pair.
-    languages: list[str] = _env_slots("BENCH_LANGUAGE")
+    languages: list[str] = _env_list("BENCH_LANGUAGE", keep_blanks=True)
     # Per component: a file, or a folder to score every dataset inside it.
     paths: dict[str, str] = field(
         default_factory=lambda: {

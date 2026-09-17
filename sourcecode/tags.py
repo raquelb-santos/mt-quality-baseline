@@ -32,15 +32,6 @@ TAG_PATTERN = re.compile("|".join((
     r"(?P<entity>&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]{1,31});)",
 )))
 
-_XML_NAME = re.compile(r"</?([a-zA-Z][\w:.\-]*)")
-
-# Elements that never take a closer, so a lone one is not a broken pair.
-VOID_ELEMENTS = frozenset({
-    "area", "base", "br", "col", "embed", "hr", "img", "input",
-    "link", "meta", "param", "source", "track", "wbr",
-})
-
-
 @dataclass(frozen=True)
 class Tag:
     text: str    # the token as written, whitespace collapsed — this is what has to survive
@@ -54,7 +45,7 @@ def _tag_id(kind: str, text: str) -> str:
     if kind == DOUBLE_BRACE:
         return text[2:-2]
     if kind == XML:
-        return _XML_NAME.match(text).group(1)
+        return re.match(r"</?([a-zA-Z][\w:.\-]*)", text).group(1)
     return text
 
 
@@ -76,7 +67,11 @@ def _pairing_role(tag: Tag) -> tuple[str, str] | None:
         return "open", f"phrase:{tag.tag_id}"
     if tag.kind == PAIRED_CLOSE:
         return "close", f"phrase:{tag.tag_id}"
-    if tag.kind == XML and tag.tag_id.lower() not in VOID_ELEMENTS:
+    # Void elements never take a closer, so a lone one is not a broken pair.
+    if tag.kind == XML and tag.tag_id.lower() not in {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }:
         if tag.text.startswith("</"):
             return "close", f"xml:{tag.tag_id}"
         if not tag.text.endswith("/>"):
