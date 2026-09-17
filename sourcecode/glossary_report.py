@@ -35,6 +35,8 @@ def scorecard(result: Result) -> Scorecard:
         f" · REF instances {mt.expected}",
         f"Adherence {_moved([pct(a.adherence_rate) for a in (mt, ape)])}"
         f" ({signed_pct(delta.ape_adherence_rate)})",
+        f"Exact match {_moved([pct(a.exact_rate) for a in (mt, ape)])}"
+        f" · lemma match only {_moved([pct(rate(a.adherent - a.exact, a.expected)) for a in (mt, ape)])}",
         f"Violations {_moved([a.violations for a in (mt, ape)])}",
         f"Strict {_moved([pct(a.strict.adherence_rate) for a in (mt, ape)])}"
         f" ({mt.strict.expected} inst.)"
@@ -88,10 +90,9 @@ def term_rows(result: Result) -> list[dict[str, Any]]:
                 "expected_targets": " | ".join(term.expected_targets),
                 "strictness": term.strictness,
                 "segments": 0,
-                # REF's own count: the denominator, identical for every version scored.
+                # REF's own count, the denominator for every version.
                 "expected": 0,
-                **{f"{c}_{f}": 0 for c in ("mt", "ape")
-                   for f in ("adherent", "rendered", "violations")},
+                **{f"{v}_{f}": 0 for v in VERSIONS for f in ("adherent", "rendered", "violations", "exact")},
             })
             entry["segments"] += 1
             entry["expected"] += term.expected
@@ -101,6 +102,7 @@ def term_rows(result: Result) -> list[dict[str, Any]]:
                     entry[f"{column}_adherent"] += scored.adherent
                     entry[f"{column}_rendered"] += scored.rendered
                     entry[f"{column}_violations"] += scored.violations
+                    entry[f"{column}_exact"] += scored.exact
 
     rows = []
     for source, entry in pooled.items():
@@ -118,6 +120,8 @@ def term_rows(result: Result) -> list[dict[str, Any]]:
             "mt_adherent": entry["mt_adherent"] if expected else "",
             "ape_adherent": entry["ape_adherent"] if expected else "",
             "ape_rendered": entry["ape_rendered"],
+            "mt_exact": entry["mt_exact"] if expected else "",
+            "ape_exact": entry["ape_exact"] if expected else "",
             "mt_violations": entry["mt_violations"] if expected else "",
             "mt_bucket": _bucket(entry["mt_rendered"], expected),
             # Against the uncapped count, so the term the cap folded away is still reviewable.
@@ -132,11 +136,12 @@ def term_rows(result: Result) -> list[dict[str, Any]]:
 
 
 def render_terms(result: Result) -> str:
-    """Every term matched, worst first. Not a top-N and never truncated."""
+    """Every term matched, worst first, never truncated."""
     rows = [
         (
             row["entry"],
             [str(row["mt_rendered"]), str(row["ape_rendered"]), str(row["ref_rendered"]),
+             str(row["mt_exact"]), str(row["ape_exact"]),
              str(row["mt_violations"]), str(row["ape_violations"]),
              pct(row["ape_adherence_rate"]), row["ape_bucket"], row["strictness"]],
         )
@@ -146,7 +151,8 @@ def render_terms(result: Result) -> str:
         return "No glossary terms matched.\n"
     return table(
         "Per-term adherence (adherence is APE against REF, worst first)", "Glossary entry",
-        ("MT", "APE", "REF", "Violations MT", "Violations APE", "Adherence", "Bucket", "Kind"),
+        ("MT", "APE", "REF", "Exact MT", "Exact APE", "Violations MT", "Violations APE",
+         "Adherence", "Bucket", "Kind"),
         rows,
     )
 

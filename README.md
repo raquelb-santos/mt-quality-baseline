@@ -129,11 +129,21 @@ adherent_instances = sum of the version counts
 
 adherence_rate     = adherent_instances / expected_instances
 
+exact_instances    = adherent instances worded as in the human reference
+exact_rate         = exact_instances / expected_instances
+
 violations         = expected_instances - adherent_instances
 ```
 
+Every adherent instance is either an **exact match**, using the same words as the reference, or a
+**lemma match only**, where just the lemmas agree, as with `contrat` against the human's
+`contrats`. The lemma matches only are therefore `adherent_instances - exact_instances`. 
+
 Where one target sits inside a longer one, as `crédito` sits inside `mercado de crédito`, an
 occurrence of the longer wording counts for the longer term alone.
+
+REF counts a term only where it uses an approved target as written, or inflected when lemmas can be
+compared. A term REF renders any other way is not scored, and its segment is listed for review.
 
 The rate is never averaged. At every grain it is recomputed from the pooled counts, so a term
 matched once cannot outweigh the same term matched forty times. It is reported again **term by
@@ -155,6 +165,9 @@ Everything below is reported for **MT** and for **APE**:
 
 * **Adherence rate** — the share of expected instances where the target term actually appears,
   computed at three grains: **per term**, **per dataset** and **per stratum**.
+
+* **Exact match and lemma match only** — the adherence rate split in two for each dataset, with
+  the exact count also given per term.
 
 * **Violations** — the sum of three failures, counted over the whole corpus rather than segment by
   segment, because one of them is only visible once every segment has been read:

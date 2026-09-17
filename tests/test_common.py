@@ -18,6 +18,7 @@ from sourcecode.text_processing import (
     find_datasets,
     count_occurrences,
     count_surface,
+    find_occurrences,
     is_unspaced_language,
     in_languages,
     load,
@@ -138,6 +139,30 @@ def test_surface_and_lemma_never_double_count():
         text="le moteur", term="moteur", language_code="fr-fr",
         text_lemmas="le moteur", term_lemmas="moteur",
     ) == 1
+
+
+def test_lemma_match_keeps_the_words_the_text_used():
+    # Stanza splits punctuation and expands "du" into "de le"; the words must still line up.
+    found = find_occurrences(
+        text="Les contrats du client, signés hier.", term="contrat du client", language_code="fr-fr",
+        text_lemmas="le contrat de le client , signer hier .", term_lemmas="contrat de le client",
+    )
+    assert found == ["contrats du client"]
+
+
+def test_surface_match_is_worded_as_the_term():
+    assert find_occurrences(
+        text="Le Moteur et le moteur", term="moteur", language_code="fr-fr",
+    ) == ["moteur", "moteur"]
+
+
+def test_count_occurrences_counts_what_find_occurrences_finds():
+    arguments = dict(
+        text="Die Verträge zum Kunden wurden unterschrieben.", term="Kunde", language_code="de-de",
+        text_lemmas="der Vertrag zu der Kunde werden unterschreiben .", term_lemmas="Kunde",
+    )
+    assert find_occurrences(**arguments) == ["kunden"]
+    assert count_occurrences(**arguments) == 1
 
 
 # languages

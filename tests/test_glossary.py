@@ -204,6 +204,30 @@ def test_inflected_reference_still_sets_denominator():
     assert score.adherent == 1
 
 
+@pytest.mark.parametrize("text, lemmas, exact", [
+    ("Branchez le câble.", "brancher le câble .", 0),     # the glossary's word, not the human's
+    ("Branchez les câbles.", "brancher le câble .", 1),   # the human's word, though inflected
+])
+def test_exact_match_is_against_the_reference_wording(text, lemmas, exact):
+    """Adherent either way; exact only where the translation words the term as REF does."""
+    score = score_glossary(
+        mappings=[{"source_content": "cable", "target_content": "câble"}],
+        text=text, text_lemmas=lemmas, language_code="fr-fr",
+        ref_text="Branchez les câbles.", ref_lemmas="brancher le câble .",
+        term_lemmas={"câble": "câble"},
+    )
+    assert (score.expected, score.adherent, score.exact) == (1, 1, exact)
+    assert score.term_scores[0].exact == exact
+
+
+def test_exact_match_is_capped_like_adherence():
+    score = score_glossary(
+        mappings=ENGINE, text="Le moteur, le moteur et le moteur.", language_code="fr-fr",
+        ref_text="Le moteur.",
+    )
+    assert (score.expected, score.adherent, score.exact) == (1, 1, 1)
+
+
 def test_permissive_variants_sum_toward_denominator():
     mappings = [
         {"source_content": "battery", "target_content": "batterie"},
@@ -696,6 +720,14 @@ def test_glossary_blind_run_says_so(result):
         assert "not a measurement" not in rendered
 
 
+def test_scorecard_splits_adherence_into_exact_and_lemma_only(result):
+    result.mt.expected, result.mt.adherent, result.mt.exact, result.mt.exact_rate = 4, 3, 2, 0.5
+    card = scorecard(result).as_markdown()
+
+    assert f"Exact match MT 50.00% → APE {pct(result.ape.exact_rate)}" in card
+    assert "lemma match only MT 25.00%" in card
+
+
 def test_summary_shows_na_not_zero(result):
     result.mt.adherence_rate = None
     result.ape.adherence_rate = None
@@ -756,8 +788,8 @@ def test_per_term_table_shows_counts_and_violations(result):
     table = render_terms(result)
     header = next(line for line in table.splitlines() if "Glossary entry" in line)
     assert [column.strip() for column in header.strip("|").split("|")] == [
-        "Glossary entry", "MT", "APE", "REF", "Violations MT", "Violations APE",
-        "Adherence", "Bucket", "Kind",
+        "Glossary entry", "MT", "APE", "REF", "Exact MT", "Exact APE", "Violations MT",
+        "Violations APE", "Adherence", "Bucket", "Kind",
     ]
     # No legend under it: the columns are named in the header and nowhere else.
     assert "renderings in the human reference" not in table

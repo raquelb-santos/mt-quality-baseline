@@ -1,10 +1,11 @@
 """The terminology adherence metric: every version is scored against the human reference."""
 
+from collections import Counter
 from dataclasses import dataclass, field
 from functools import cache
 from typing import Any, Iterable, Mapping, Sequence
 
-from .text_processing import count_occurrences, normalize_text
+from .text_processing import count_occurrences, find_occurrences, normalize_text
 from .report import rate
 
 MISS = "miss"                              # no sanctioned target form in the output
@@ -34,6 +35,7 @@ def build_glossary_map(mappings: Iterable[Mapping[str, str]] | None) -> dict[str
 class Tally:
     expected: int = 0
     adherent: int = 0
+    exact: int = 0
 
     @property
     def violations(self) -> int:
@@ -43,9 +45,14 @@ class Tally:
     def adherence_rate(self) -> float | None:
         return rate(self.adherent, self.expected)
 
+    @property
+    def exact_rate(self) -> float | None:
+        return rate(self.exact, self.expected)
+
     def add(self, other: Any) -> None:
         self.expected += other.expected
         self.adherent += other.adherent
+        self.exact += other.exact
 
 
 @dataclass
@@ -91,6 +98,7 @@ class TermScore:
     expected: int   # occurrences in REF
     adherent: int   # occurrences found in this translation, bounded by REF's
     rendered: int   # occurrences found in this translation, unbounded
+    exact: int      # adherent occurrences worded as REF words them
 
     @property
     def violations(self) -> int:
@@ -101,6 +109,7 @@ class TermScore:
 class Score:
     expected: int = 0
     adherent: int = 0
+    exact: int = 0
     strict: Tally = field(default_factory=Tally)
     permissive: Tally = field(default_factory=Tally)
     terms: TermBreakdown = field(default_factory=TermBreakdown)
@@ -108,36 +117,36 @@ class Score:
     violations: list[Violation] = field(default_factory=list)
 
 
-def _owned_counts(
+def _owned(
     text: str,
     targets: Iterable[str],
     language_code: str | None,
     text_lemmas: str | None,
     term_lemmas: Mapping[str, str] | None,
-) -> dict[str, int]:
-    """Occurrences of each target outside a longer target covering it, so one wording counts once."""
+) -> dict[str, list[str | None]]:
+    """Each target's occurrences as worded, outside a longer target covering it, so one wording counts once."""
     lemma_of = term_lemmas or {}
     found = {}
     for target in dict.fromkeys(targets):
-        count = count_occurrences(
+        occurrences = find_occurrences(
             text=text, term=target, language_code=language_code,
             text_lemmas=text_lemmas, term_lemmas=lemma_of.get(target),
         )
-        if count:
-            found[target] = count
+        if occurrences:
+            found[target] = occurrences
 
     # Longest first, so each target subtracts only what the longer ones kept for themselves.
-    owned: dict[str, int] = {}
+    owned: dict[str, list[str | None]] = {}
     for target in sorted(found, key=lambda t: len(normalize_text(t)), reverse=True):
         form = normalize_text(target)
         covered = sum(
-            kept * count_occurrences(
+            len(kept) * count_occurrences(
                 text=longer, term=target, language_code=language_code,
                 text_lemmas=lemma_of.get(longer), term_lemmas=lemma_of.get(target),
             )
             for longer, kept in owned.items() if normalize_text(longer) != form
         )
-        owned[target] = max(found[target] - covered, 0)
+        owned[target] = found[target][: max(len(found[target]) - covered, 0)]
     return owned
 
 
@@ -155,13 +164,14 @@ def score_glossary(
     result = Score()
     glossary_map = build_glossary_map(mappings)
     targets_here = [target for targets in glossary_map.values() for target in targets]
-    in_ref = _owned_counts(ref_text, targets_here, language_code, ref_lemmas, term_lemmas)
-    in_text = _owned_counts(text, targets_here, language_code, text_lemmas, term_lemmas)
+    in_ref = _owned(ref_text, targets_here, language_code, ref_lemmas, term_lemmas)
+    in_text = _owned(text, targets_here, language_code, text_lemmas, term_lemmas)
 
     for source, targets in glossary_map.items():
         expected_targets = sorted(targets)
-        expected_n = sum(in_ref.get(target, 0) for target in expected_targets)
-        rendered = sum(in_text.get(target, 0) for target in expected_targets)
+        ref_words = [w for target in expected_targets for w in in_ref.get(target, [])]
+        text_words = [w for target in expected_targets for w in in_text.get(target, [])]
+        expected_n, rendered = len(ref_words), len(text_words)
         # Neither the human nor this translation used the term: no denominator, nothing to score.
         if expected_n == 0 and rendered == 0:
             continue
@@ -170,10 +180,17 @@ def score_glossary(
         # Capped at the reference count so a translation cannot outscore its denominator.
         adherent_n = min(rendered, expected_n)
         missed = expected_n - adherent_n
+        # The same words as REF; the rest of the adherent ones matched on lemma only.
+        in_ref_words = Counter(w for w in ref_words if w)
+        exact_n = min(
+            sum(min(n, in_ref_words[w]) for w, n in Counter(w for w in text_words if w).items()),
+            adherent_n,
+        )
 
         for tally in (result, result.strict if strictness == "strict" else result.permissive):
             tally.expected += expected_n
             tally.adherent += adherent_n
+            tally.exact += exact_n
 
         # Bucketed on the counts: presence alone cannot tell "as often as the human" from "more".
         bucket = bucket_of(rendered, expected_n)
@@ -181,7 +198,7 @@ def score_glossary(
 
         result.term_scores.append(TermScore(
             source_content=source, expected_targets=expected_targets, strictness=strictness,
-            expected=expected_n, adherent=adherent_n, rendered=rendered,
+            expected=expected_n, adherent=adherent_n, rendered=rendered, exact=exact_n,
         ))
         if missed:
             result.violations.append(Violation(
@@ -205,6 +222,8 @@ class Aggregate:
     segments_scored: int
     segments_clean: int
     segment_adherence_rate: float | None
+    exact: int = 0
+    exact_rate: float | None = None
 
 
 def _combine(
@@ -234,6 +253,8 @@ def _combine(
         segments_scored=segments_scored,
         segments_clean=segments_clean,
         segment_adherence_rate=rate(segments_clean, segments_scored),
+        exact=total.exact,
+        exact_rate=total.exact_rate,
     )
 
 
@@ -310,7 +331,7 @@ def find_violations(
             or (known.get(target) and normalized_lemmas
                 and normalize_text(known[target]) in normalized_lemmas)
         ]
-        owned = _owned_counts(text, candidates, language_codes[index], lemmas, known)
+        owned = _owned(text, candidates, language_codes[index], lemmas, known)
 
         variants = {}
         for source in sources:
@@ -421,15 +442,12 @@ def check_reference(
 ) -> ReferenceCheck:
     """Indicative only: percolation also retrieves terms whose sense does not apply here."""
     check = ReferenceCheck()
-
     for index, text in enumerate(ref_texts):
-        language_code = language_codes[index]
-        known = (lemmas_by_language or {}).get(language_code) or {}
-        lemmas = known.get(text)
+        known = (lemmas_by_language or {}).get(language_codes[index]) or {}
         glossary_map = build_glossary_map(per_segment_mappings[index])
-        owned = _owned_counts(
+        owned = _owned(
             text, [target for targets in glossary_map.values() for target in targets],
-            language_code, lemmas, known,
+            language_codes[index], known.get(text), known,
         )
         for source, targets in glossary_map.items():
             expected_targets = sorted(targets)

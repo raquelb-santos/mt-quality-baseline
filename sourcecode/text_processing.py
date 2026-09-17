@@ -446,20 +446,98 @@ def count_surface(text: object, term: object, language_code: str | None, *, case
     return len(bounded_pattern(needle).findall(haystack))
 
 
-def count_lemma(text_lemmas: Sequence[str] | str, term_lemmas: Sequence[str] | str) -> int:
-    haystack = list(text_lemmas) if isinstance(text_lemmas, (list, tuple)) else tokenize(text_lemmas)
-    needle = list(term_lemmas) if isinstance(term_lemmas, (list, tuple)) else tokenize(term_lemmas)
+def _lemma_starts(haystack: list[str], needle: list[str]) -> list[int]:
+    starts: list[int] = []
     if not needle or len(needle) > len(haystack):
-        return 0
+        return starts
 
-    count = index = 0
+    index = 0
     while index <= len(haystack) - len(needle):
         if haystack[index : index + len(needle)] == needle:
-            count += 1
+            starts.append(index)
             index += len(needle)  # non-overlapping
         else:
             index += 1
-    return count
+    return starts
+
+
+def count_lemma(text_lemmas: Sequence[str] | str, term_lemmas: Sequence[str] | str) -> int:
+    haystack = list(text_lemmas) if isinstance(text_lemmas, (list, tuple)) else tokenize(text_lemmas)
+    needle = list(term_lemmas) if isinstance(term_lemmas, (list, tuple)) else tokenize(term_lemmas)
+    return len(_lemma_starts(haystack, needle))
+
+
+def _pairing_cost(word: str, lemma: str) -> float:
+    shared = next((k for k, (a, b) in enumerate(zip(word, lemma)) if a != b), min(len(word), len(lemma)))
+    return 1 - shared / max(len(word), len(lemma))
+
+
+@lru_cache(maxsize=4096)
+def _words_of_lemmas(text: str, text_lemmas: str) -> tuple[str, list[tuple[int, int]], dict[int, int]]:
+    """Each lemma token's word, paired on shared prefixes, a contraction's two lemmas sharing one word; punctuation ignored."""
+    normalized = normalize_text(text)
+    words = [match.span() for match in re.finditer(r"\w+", normalized)]
+    surface = [normalized[start:end] for start, end in words]
+    lemmas = [(index, token) for index, token in enumerate(tokenize(text_lemmas)) if re.search(r"\w", token)]
+
+    # Cheapest path from no words and no lemmas to all of both; a skipped word or lemma costs 1.
+    cost = {(0, 0): 0.0}
+    came_from: dict[tuple[int, int], tuple[int, int]] = {}
+    for i in range(len(surface) + 1):
+        for j in range(len(lemmas) + 1):
+            here = cost.get((i, j))
+            if here is None:
+                continue
+            moves = [(i + 1, j, 1.0), (i, j + 1, 1.0)]
+            if i < len(surface) and j < len(lemmas):
+                moves.append((i + 1, j + 1, _pairing_cost(surface[i], lemmas[j][1])))
+            if i < len(surface) and j + 1 < len(lemmas):
+                moves.append((i + 1, j + 2, 1.0))  # "du" → "de le"
+            for to_i, to_j, step in moves:
+                if to_i <= len(surface) and to_j <= len(lemmas) and here + step < cost.get((to_i, to_j), float("inf")):
+                    cost[(to_i, to_j)] = here + step
+                    came_from[(to_i, to_j)] = (i, j)
+
+    word_of: dict[int, int] = {}
+    at = (len(surface), len(lemmas))
+    while at in came_from:
+        before = came_from[at]
+        if at[0] - before[0] == 1:
+            word_of.update({lemmas[j][0]: before[0] for j in range(before[1], at[1])})
+        at = before
+    return normalized, words, word_of
+
+
+def find_occurrences(
+    *,
+    text: object,
+    term: object,
+    language_code: str | None,
+    text_lemmas: str | None = None,
+    term_lemmas: str | None = None,
+) -> list[str | None]:
+    """Each occurrence as worded in `text`; None where a lemma match's words cannot be pinned down."""
+    surface = count_surface(text, term, language_code)
+    if surface:
+        return [normalize_text(term)] * surface
+
+    if not (text_lemmas and term_lemmas) or is_unspaced_language(language_code):
+        return []
+
+    needle = tokenize(term_lemmas)
+    starts = _lemma_starts(tokenize(text_lemmas), needle)
+    if not starts:
+        return []
+
+    normalized, words, word_of = _words_of_lemmas(str(text), text_lemmas)
+    wordings: list[str | None] = []
+    for start in starts:
+        indices = [word_of.get(start + k) for k, token in enumerate(needle) if re.search(r"\w", token)]
+        if not indices or None in indices or any(b - a not in (0, 1) for a, b in zip(indices, indices[1:])):
+            wordings.append(None)
+        else:
+            wordings.append(normalized[words[indices[0]][0] : words[indices[-1]][1]])
+    return wordings
 
 
 def count_occurrences(
@@ -471,11 +549,7 @@ def count_occurrences(
     term_lemmas: str | None = None,
 ) -> int:
     """Surface first, lemma second; never summed, or uninflected matches count twice."""
-    surface = count_surface(text, term, language_code)
-    if surface:
-        return surface
-
-    if text_lemmas and term_lemmas and not is_unspaced_language(language_code):
-        return count_lemma(text_lemmas, term_lemmas)
-
-    return 0
+    return len(find_occurrences(
+        text=text, term=term, language_code=language_code,
+        text_lemmas=text_lemmas, term_lemmas=term_lemmas,
+    ))
